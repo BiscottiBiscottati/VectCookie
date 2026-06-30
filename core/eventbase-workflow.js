@@ -29,6 +29,7 @@ import { formatEventsForInjectionDetailed } from './eventbase-injection.js';
 import { isCollectionEnabled, isCollectionActiveForContextAnyKey, setCollectionLock, setCollectionMeta } from './collection-metadata.js';
 import { progressTracker } from '../ui/progress-tracker.js';
 import { log } from './log.js';
+import { expandILSMessages } from './ils-expander.js';
 
 /**
  * Resolve the auto-sync extraction window size in MESSAGES from the per-user
@@ -117,6 +118,10 @@ export function countUnfinishedWindows(result) {
 }
 
 export async function runEventBaseIngestion({ messages, chatUUID, settings, abortSignal = null, progressPlan = null, collectionIdOverride = null, parallelWindows = 3, isAutoSync = false, suppressAutoSyncPopup = false, skipTipFallback = false, windowSizeOverride = undefined, windowOverlapOverride = undefined }) {
+    // Expand InlineSummary collapsed messages so EventBase extracts from original content
+    const { expanded: expandedMessages } = expandILSMessages(messages);
+    messages = expandedMessages;
+    
     const uuid = chatUUID || getChatUUID();
 
     // Resolve the write target. Precedence:
@@ -1359,9 +1364,14 @@ export async function getChatAutoSyncStatus(settings, { shouldProbeBackend = tru
     if (!match) return { state: 'no-collection' };
 
     const ctx = getContext();
-    const messages = Array.isArray(ctx?.chat)
+    let messages = Array.isArray(ctx?.chat)
         ? ctx.chat.filter(m => m.mes && m.mes.trim().length > 0)
         : [];
+    
+    // Expand InlineSummary collapsed messages so auto-sync reflects actual message count
+    const { expanded: expandedMessages } = expandILSMessages(messages);
+    messages = expandedMessages;
+    
     const chatMessageCount = messages.length;
 
     // Read the auto-sync marker (per-chat message-index threshold). When this

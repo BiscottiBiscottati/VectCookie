@@ -11,6 +11,7 @@
  */
 
 import { log } from './log.js';
+import { expandILSMessages } from './ils-expander.js';
 
 // ============================================================================
 // COLLECTION & CHUNK CONDITION EVALUATORS (10 types)
@@ -635,11 +636,13 @@ export function filterChunksByConditions(chunks, baseContext) {
  * @returns {object} Search context
  */
 export function buildSearchContext(chat, contextWindow = 10, activeChunks = [], metadata = {}) {
-    const recentMessages = chat.slice(-contextWindow).map(m => m.mes || '');
-    const lastMessage = chat[chat.length - 1] || {};
+    // Expand InlineSummary collapsed messages so conditions evaluate against original content
+    const { expanded: expandedChat } = expandILSMessages(chat);
+    const recentMessages = expandedChat.slice(-contextWindow).map(m => m.mes || '');
+    const lastMessage = expandedChat[expandedChat.length - 1] || {};
 
     // Extract speakers from recent messages
-    const messageSpeakers = chat.slice(-contextWindow).map(m => {
+    const messageSpeakers = expandedChat.slice(-contextWindow).map(m => {
         if (m.name) return m.name;
         return m.is_user ? 'User' : 'Character';
     });
@@ -652,7 +655,7 @@ export function buildSearchContext(chat, contextWindow = 10, activeChunks = [], 
     return {
         recentMessages,
         lastSpeaker: lastMessage.name || (lastMessage.is_user ? 'User' : 'Character'),
-        messageCount: chat.length,
+        messageCount: expandedChat.length,
         activeChunks,
         messageSpeakers,           // Array of speaker names for characterPresent
         timestamp: new Date(),     // Current timestamp for timeOfDay

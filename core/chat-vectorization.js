@@ -38,6 +38,7 @@ import { runBoundedRetrieval } from './bounded-retrieval.js';
 import { resolveEventBaseRetrievalTimeoutMs } from './retrieval-budget.js';
 import { log } from './log.js';
 import { isVectFoxEnabled } from './feature-gate.js';
+import { expandILSMessages } from './ils-expander.js';
 // Import from collection-ids.js - single source of truth for collection ID operations
 import {
     getChatUUID,
@@ -431,7 +432,9 @@ function gatherCollectionsToQuery(settings) {
  * @returns {string} Query text
  */
 function buildSearchQuery(chat, settings) {
-    const recentMessages = chat
+    // Expand InlineSummary collapsed messages before building query
+    const { expanded: expandedChat } = expandILSMessages(chat);
+    const recentMessages = expandedChat
         .filter(x => !x.is_system)
         .reverse()
         .slice(0, settings.query)
@@ -453,9 +456,12 @@ async function queryAndMergeCollections(activeCollections, queryText, settings, 
     let chunksForVisualizer = [];
     const effectiveTopK = settings.top_k ?? settings.insert;
 
+    // Expand InlineSummary collapsed messages for fallback text lookup
+    const { expanded: expandedChat } = expandILSMessages(chat);
+
     // PERF: Build hash-to-message Map once for O(1) lookups instead of O(n) find() per chunk
     const chatHashMap = new Map();
-    for (const msg of chat) {
+    for (const msg of expandedChat) {
         if (msg.mes) {
             const hash = getStringHash(substituteParams(getTextWithoutAttachments(msg)));
             if (!chatHashMap.has(hash)) {
