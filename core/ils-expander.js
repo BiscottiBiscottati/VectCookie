@@ -29,7 +29,7 @@ import { chat_metadata } from '../../../../../script.js';
  * @returns {boolean} True if this is an ILS summary message
  */
 function isILSSummaryMessage(msg) {
-    const data = msg?.extra?.ILS_Data;
+    const data = getILSData(msg);
     return !!(data && (data.OriginalMessages || typeof data.Ref === 'string'));
 }
 
@@ -39,13 +39,25 @@ function isILSSummaryMessage(msg) {
  * @returns {object[]|null} Originals, or null if the ref is dangling
  */
 function getILSOriginals(msg) {
-    const data = msg?.extra?.ILS_Data;
+    const data = getILSData(msg);
     if (!data) return null;
     if (Array.isArray(data.OriginalMessages)) return data.OriginalMessages;
     if (typeof data.Ref === 'string') {
         const originals = chat_metadata?.ILS_Originals?.[data.Ref];
         return Array.isArray(originals) ? originals : null;
     }
+    return null;
+}
+
+/**
+ * Helper to read ILS data stored either on `msg.extra.ILS_Data` (legacy)
+ * or directly on `msg.ILS_Data` (some InlineSummary versions).
+ * @param {object} msg
+ */
+function getILSData(msg) {
+    if (!msg) return null;
+    if (msg?.extra && msg.extra.ILS_Data) return msg.extra.ILS_Data;
+    if (msg.ILS_Data) return msg.ILS_Data;
     return null;
 }
 
