@@ -287,6 +287,7 @@ const defaultSettings = {
     // tip is extracted before it could be wiped.
     eventbase_ghost_enabled: false,
     eventbase_ghost_keep_recent: 10,              // recent messages kept verbatim; everything older that's vectorized is wiped. range 0-100 (summarizer injects ~20 events to cover the wiped span)
+    eventbase_ghost_step: 1,                       // wipe boundary batch size in messages; 1 preserves rolling behavior
     // Per-chat marker: auto-sync only processes windows whose start >= marker.
     // Stamped at "max(source_window_end across existing events) + 1" when auto-sync
     // is enabled on a non-empty collection, or at current chat length when collection

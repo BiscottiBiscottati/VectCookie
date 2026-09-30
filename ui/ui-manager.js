@@ -1003,6 +1003,11 @@ export function renderSettings(containerId, settings, callbacks) {
                                         <input type="range" id="VectFox_eventbase_ghost_keep_recent" min="0" max="100" step="1" class="vectfox-slider" />
                                         <small class="VectFox_hint">Everything older than this that's been vectorized is wiped (never the recent un-synced tail). Lower = more aggressive (more tokens saved). Even at <strong>0</strong>, ghosting always keeps the current turn and your World Info scan window verbatim — so it never breaks keyword triggers and never sends an empty prompt. "<strong>0</strong>" means "wipe as much as is safe," not literally everything.</small>
                                     </div>
+                                    <div class="vectfox-form-group" id="VectFox_eventbase_ghost_step_group" style="margin-top: 8px;">
+                                        <label class="vectfox-label">Ghost in batches of <span id="VectFox_eventbase_ghost_step_val">1</span> message(s)</label>
+                                        <input type="range" id="VectFox_eventbase_ghost_step" min="1" max="100" step="1" class="vectfox-slider" />
+                                        <small class="VectFox_hint">1 keeps today's rolling behavior. Larger batches keep the wipe boundary stable longer for prompt-cache reuse; the raw window may grow up to Keep last N + batch size − 1 messages. Ensure SillyTavern's context can fit this larger window plus injections and response tokens. Suggested start for cache-enabled providers: 10–20.</small>
+                                    </div>
                                     <div id="VectFox_eventbase_ghost_readout" class="VectFox_hint" style="margin-top: 8px; display:block; padding: 6px 8px; border-radius: 6px; background: rgba(127,127,127,0.12);">Last turn: no generation yet.</div>
                                 </div>
                             </div>
@@ -3840,9 +3845,15 @@ function bindSettingsEvents(settings, callbacks) {
         if (!g || typeof g.wiped !== 'number') {
             $el.text('Last turn: no generation yet.');
         } else if (g.wiped === 0) {
-            $el.text('Last turn: 0 messages wiped (nothing vectorized below the recent tail yet).');
+            const countNote = (g.step && g.step > 1 && Number.isFinite(g.rawKept))
+                ? ` — raw window ${g.rawKept} message(s)${g.nextJumpIn !== null ? `; next jump in ${g.nextJumpIn}` : ''}`
+                : '';
+            $el.html(`Last turn: 0 messages wiped.${countNote}`);
         } else {
-            $el.html(`Last turn: wiped <strong>${g.wiped}</strong> message(s) — ~${g.charsRemoved.toLocaleString()} chars (<strong>~${g.approxTokens.toLocaleString()} tokens</strong>) saved.`);
+            const countNote = (g.step && g.step > 1 && Number.isFinite(g.rawKept))
+                ? ` — raw window ${g.rawKept} message(s)${g.nextJumpIn !== null ? `; next jump in ${g.nextJumpIn}` : ''}`
+                : '';
+            $el.html(`Last turn: wiped <strong>${g.wiped}</strong> message(s) — ~${g.charsRemoved.toLocaleString()} chars (<strong>~${g.approxTokens.toLocaleString()} tokens</strong>) saved${countNote}.`);
         }
     };
 
@@ -3853,6 +3864,7 @@ function bindSettingsEvents(settings, callbacks) {
         const ghostOn = !!settings.eventbase_ghost_enabled;
         $('#VectFox_eventbase_ghost_enabled').prop('disabled', !summOn);
         $('#VectFox_eventbase_ghost_keep_recent').prop('disabled', !summOn || !ghostOn);
+        $('#VectFox_eventbase_ghost_step').prop('disabled', !summOn || !ghostOn);
         const $group = $('#VectFox_eventbase_ghost_group');
         $group.css('opacity', summOn ? '1' : '0.5');
         if (!summOn) {
@@ -3886,6 +3898,18 @@ function bindSettingsEvents(settings, callbacks) {
             const val = Math.max(0, Math.min(100, parseInt(this.value, 10) || 0));
             settings.eventbase_ghost_keep_recent = val;
             $('#VectFox_eventbase_ghost_keep_recent_val').text(val);
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
+
+    const _ghostStep0 = Math.max(1, Math.min(100, parseInt(settings.eventbase_ghost_step ?? 1, 10) || 1));
+    $('#VectFox_eventbase_ghost_step_val').text(_ghostStep0);
+    $('#VectFox_eventbase_ghost_step')
+        .val(_ghostStep0)
+        .on('input', function() {
+            const val = Math.max(1, Math.min(100, parseInt(this.value, 10) || 1));
+            settings.eventbase_ghost_step = val;
+            $('#VectFox_eventbase_ghost_step_val').text(val);
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
