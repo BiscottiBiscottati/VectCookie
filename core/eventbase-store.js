@@ -453,10 +453,11 @@ export async function stampAutoSyncMarker(chatUUID, settings, options = {}) {
         return chatLength;
     }
 
-    // Resolve THE active EventBase collection for this chat (lock-aware), so the
-    // marker is computed from the collection the user is actually vectorizing —
-    // not an arbitrary per-persona sibling (the stale-import bug).
-    const active = resolveActiveEventBaseCollection(settings, chatUUID);
+    // Resolve the write target, so the marker is computed from the collection the
+    // user is actually vectorizing — not an arbitrary per-persona sibling (the
+    // stale-import bug). The marker is a message index into THIS chat, so it must
+    // never be derived from a foreign-UUID collection locked in for retrieval.
+    const active = resolveEventBaseWriteTarget(settings, chatUUID);
 
     let maxEnd = -1;
     if (active) {
@@ -817,11 +818,25 @@ export function findEventBaseCollectionsForChat(uuid, preferredBackend) {
  * is only for the rare case where you genuinely need every candidate (e.g.
  * pausing auto-sync on all of a chat's collections).
  *
+ * READ vs WRITE: the default (read) semantics honor a lock even when the locked
+ * collection belongs to another conversation — that is the documented way to
+ * share an older chat's EventBase with the current one. Ingestion must NOT use
+ * those semantics: writing this chat's events into another conversation's
+ * collection mixes two `source_window_end` index spaces in one sort frame and
+ * corrupts chronology (see `_orderEventsForPresentation` in
+ * eventbase-injection.js). Write callers go through
+ * {@link resolveEventBaseWriteTarget}, which passes `requireUuidMatch`.
+ *
  * @param {object} settings - extension_settings.vectfox
  * @param {string} [chatUUID] - defaults to the current chat's UUID
+ * @param {{ requireUuidMatch?: boolean, shouldLogResolution?: boolean }} [options]
+ *   `requireUuidMatch` — reject collections whose embedded chat UUID differs
+ *   from this chat, so a foreign lock can never become a write target.
+ *   `shouldLogResolution` — false skips the `[EventBase][resolve]` lifecycle
+ *   diagnostics, for passive UI refreshes while VectFox is disabled.
  * @returns {{ collectionId: string, registryKey: string } | null}
  */
-export function resolveActiveEventBaseCollection(settings, chatUUID) {
+export function resolveActiveEventBaseCollection(settings, chatUUID, { requireUuidMatch = false, shouldLogResolution = true } = {}) {
     const uuid = chatUUID || getChatUUID();
     if (!uuid) return null;
 
@@ -835,10 +850,18 @@ export function resolveActiveEventBaseCollection(settings, chatUUID) {
 
     // Match by UUID (stable across legacy ID formats and character renames).
     const patterns = buildChatSearchPatterns(null, uuid);
+    const hasUuidMatch = (entry) =>
+        matchesPatterns(entry.collectionId, patterns) || matchesPatterns(entry.registryKey, patterns);
     const isEbMatch = (entry) => {
-        const { collectionId, registryKey } = entry;
+        const { collectionId } = entry;
         const idLower = String(collectionId || '').toLowerCase();
         if (!idLower.startsWith('vf_eventbase_') && !idLower.includes('eventbase_')) return false;
+        // Write mode: the UUID match is mandatory, so a lock can widen ownership
+        // but never redirect ingestion into another conversation's collection.
+        // Returning null here is the correct outcome on a chat's first ingestion —
+        // runEventBaseIngestion then falls through to buildEventBaseCollectionId
+        // and creates this chat's own collection.
+        if (requireUuidMatch) return hasUuidMatch(entry) && (isLocked(entry) || entry.isOwn);
         // An explicit per-chat lock is a deliberate user override: the collection
         // is eligible regardless of ownership AND regardless of whether its
         // embedded UUID still matches this chat. The UUID can drift from the lock
@@ -852,7 +875,7 @@ export function resolveActiveEventBaseCollection(settings, chatUUID) {
         // Auto-association (no lock): must be owned by the current persona AND its
         // embedded UUID must match the current chat.
         if (!entry.isOwn) return false;
-        return matchesPatterns(collectionId, patterns) || matchesPatterns(registryKey, patterns);
+        return hasUuidMatch(entry);
     };
     const listing = getCollectionListing(settings);
     const ebMatches = listing.filter(isEbMatch);
@@ -860,29 +883,59 @@ export function resolveActiveEventBaseCollection(settings, chatUUID) {
     // Diagnostic: why each EventBase collection was/ wasn't picked. Surfaces the
     // exact reason auto-sync sees "no collection" (e.g. lock missing, or UUID
     // drifted after a re-vectorize and no lock to override it).
-    if (log.enabled('lifecycle')) {
+    const logResolution = shouldLogResolution ? log.lifecycle : () => {};
+    if (shouldLogResolution && log.enabled('lifecycle')) {
         const ebAll = listing.filter(e => {
             const il = String(e.collectionId || '').toLowerCase();
             return il.startsWith('vf_eventbase_') || il.includes('eventbase_');
         });
-        const rows = ebAll.map(e => {
-            const uuidMatch = matchesPatterns(e.collectionId, patterns) || matchesPatterns(e.registryKey, patterns);
-            return `${e.collectionId} [own=${e.isOwn} locked=${isLocked(e)} uuidMatch=${uuidMatch} eligible=${isEbMatch(e)}]`;
-        });
-        log.lifecycle(`[EventBase][resolve] chatUUID=${uuid} chatId=${chatId || '(none)'}: ${ebAll.length} eb collection(s), ${ebMatches.length} eligible`);
-        for (const r of rows) log.lifecycle(`[EventBase][resolve]   ${r}`);
+        const rows = ebAll.map(e =>
+            `${e.collectionId} [own=${e.isOwn} locked=${isLocked(e)} uuidMatch=${hasUuidMatch(e)} eligible=${isEbMatch(e)}]`);
+        logResolution(`[EventBase][resolve] chatUUID=${uuid} chatId=${chatId || '(none)'} requireUuidMatch=${requireUuidMatch}: ${ebAll.length} eb collection(s), ${ebMatches.length} eligible`);
+        for (const r of rows) logResolution(`[EventBase][resolve]   ${r}`);
     }
 
     if (ebMatches.length === 0) {
-        log.lifecycle('[EventBase][resolve] → no eligible collection (auto-sync will report "no-collection")');
+        logResolution('[EventBase][resolve] → no eligible collection (auto-sync will report "no-collection")');
         return null;
     }
 
+    // Ranking tiers, most significant first: lock, then own-UUID, then current
+    // backend. The UUID tier matters when a chat has BOTH its own collection and
+    // a foreign one locked in for cross-chat retrieval — without it both score 0
+    // and the winner is decided by registry insertion order, which silently flips
+    // if a collection is ever deleted and re-registered.
     const wantBackend = getRegistryBackend(settings?.vector_backend);
-    const rank = (m) => (isLocked(m) ? 0 : 10) + (m.backend === wantBackend ? 0 : 1);
+    const rank = (m) => (isLocked(m) ? 0 : 10)
+        + (hasUuidMatch(m) ? 0 : 4)
+        + (m.backend === wantBackend ? 0 : 1);
     const active = ebMatches.slice().sort((a, b) => rank(a) - rank(b))[0];
-    log.lifecycle(`[EventBase][resolve] → picked ${active.collectionId} (locked=${isLocked(active)})`);
+    logResolution(`[EventBase][resolve] → picked ${active.collectionId} (locked=${isLocked(active)} uuidMatch=${hasUuidMatch(active)})`);
     return { collectionId: active.collectionId, registryKey: active.registryKey };
+}
+
+/**
+ * Resolve the EventBase collection that ingestion may WRITE to for this chat.
+ *
+ * Same resolution as {@link resolveActiveEventBaseCollection} except a foreign
+ * lock is not enough: the collection's embedded chat UUID must match. A lock is
+ * a read-side sharing mechanism (lock an older chat's EventBase into this chat
+ * so its events are retrieved here). Honoring it on the write side put this
+ * chat's events into that older collection, where the two chats' independent
+ * `source_window_end` values collide inside one sort frame — the injected
+ * timeline then interleaves both conversations, and Resume reads the foreign
+ * collection's tip and skips every window ("0 events extracted").
+ *
+ * Returns null when this chat has no collection of its own yet; the caller is
+ * expected to fall back to `buildEventBaseCollectionId` and create one.
+ *
+ * @param {object} settings - extension_settings.vectfox
+ * @param {string} [chatUUID] - defaults to the current chat's UUID
+ * @param {{ shouldLogResolution?: boolean }} [options] - see resolveActiveEventBaseCollection
+ * @returns {{ collectionId: string, registryKey: string } | null}
+ */
+export function resolveEventBaseWriteTarget(settings, chatUUID, { shouldLogResolution = true } = {}) {
+    return resolveActiveEventBaseCollection(settings, chatUUID, { requireUuidMatch: true, shouldLogResolution });
 }
 
 /**
@@ -915,8 +968,8 @@ async function _resolveEventBaseCollectionIdForRead(settings, chatUUID) {
         try {
             const hashes = await getSavedHashes(collectionId, settings);
             if (hashes?.length > 0) return collectionId;
-        } catch {
-            // Try next candidate.
+        } catch (error) {
+            log.warn(`[EventBase] Could not read ${collectionId} — trying the next candidate:`, error);
         }
     }
 

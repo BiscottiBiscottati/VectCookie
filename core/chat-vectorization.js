@@ -33,7 +33,7 @@ import { getChunkMetadata, getCollectionMeta } from './collection-metadata.js';
 import { createDebugData, setLastSearchDebug, addTrace, recordChunkFate } from '../ui/search-debug.js';
 import { Queue, LRUCache } from '../utils/data-structures.js';
 import { getRequestHeaders } from '../../../../../script.js';
-import { EXTENSION_PROMPT_TAG, HASH_CACHE_SIZE } from './constants.js';
+import { EXTENSION_PROMPT_TAG, EVENTBASE_PROMPT_TAG, SUMMARIZER_PROMPT_TAG, HASH_CACHE_SIZE } from './constants.js';
 import { runBoundedRetrieval } from './bounded-retrieval.js';
 import { resolveEventBaseRetrievalTimeoutMs } from './retrieval-budget.js';
 import { log } from './log.js';
@@ -298,7 +298,7 @@ export async function synchronizeChat(settings, batchSize = 5, triggerEvent = nu
     }
 
     // Find EventBase collections registered for this chat and check the per-collection auto-sync flag
-    const { findEventBaseCollectionsForChat, resolveActiveEventBaseCollection } = await import('./eventbase-store.js');
+    const { findEventBaseCollectionsForChat, resolveEventBaseWriteTarget } = await import('./eventbase-store.js');
     const { isCollectionAutoSyncEnabled } = await import('./collection-metadata.js');
     const backend = getRegistryBackend(settings?.vector_backend);
     const eventbaseCollections = findEventBaseCollectionsForChat(uuid, backend);
@@ -310,12 +310,12 @@ export async function synchronizeChat(settings, batchSize = 5, triggerEvent = nu
     }
     // Gate on the ACTIVE (lock-aware, ownership-filtered) collection ONLY — the same
     // one the AutoSync checkbox reflects (refreshAutoSyncCheckbox → getChatAutoSyncStatus
-    // → resolveActiveEventBaseCollection). Using `.some()` across ALL of the chat's
+    // → resolveEventBaseWriteTarget). Using `.some()` across ALL of the chat's
     // collections meant a leftover autoSync=true on a non-active collection (a different
     // persona/backend enabled earlier) fired auto-sync even though the visible toggle was
     // off — and then ingested into the current-backend collection whose own flag was false.
     // Resolving the active collection keeps the toggle and the behavior in lockstep.
-    const activeCollection = resolveActiveEventBaseCollection(settings, uuid);
+    const activeCollection = resolveEventBaseWriteTarget(settings, uuid);
     const autoSyncEnabled = !!activeCollection && isCollectionAutoSyncEnabled(activeCollection.registryKey);
 
     if (!autoSyncEnabled) {
@@ -346,9 +346,9 @@ export async function synchronizeChat(settings, batchSize = 5, triggerEvent = nu
             // speaking on this trigger, so each speaker's turn would manufacture and
             // lock a NEW per-character EventBase collection for the same chat —
             // scattering events across siblings the summarizer (which reads only the
-            // single resolveActiveEventBaseCollection) never sees. The resolved
+            // single resolveEventBaseWriteTarget) never sees. The resolved
             // active collection IS the documented auto-sync write target
-            // (see Doc/collection_helper.md — resolveActiveEventBaseCollection).
+            // (see Doc/collection_helper.md — resolveEventBaseWriteTarget).
             // activeCollection is guaranteed non-null here: the autoSyncEnabled gate
             // above bails when it's null.
             collectionIdOverride: activeCollection.collectionId,
@@ -1102,7 +1102,7 @@ function resolveChunkInjectionPosition(chunk, settings) {
     const collMeta = getCollectionMeta(chunk.collectionId) || {};
 
     // Cascade: chunk (backend payload → ext_settings fallback) → collection → global
-    const position = dbMeta.position ?? chunkMeta.position ?? collMeta.position ?? settings.position ?? 0;
+    const position = dbMeta.position ?? chunkMeta.position ?? collMeta.position ?? settings.position;
     const depth = dbMeta.depth ?? chunkMeta.depth ?? collMeta.depth ?? settings.depth ?? 2;
 
     return { position, depth };
@@ -1272,6 +1272,28 @@ function injectChunksIntoPrompt(chunksToInject, settings, debugData) {
 // ============================================================================
 
 /**
+ * Empty every prompt block the generation interceptor owns: the chunk block, its
+ * per-position variants, EventBase memory and Summarizer Injection. ST keeps an
+ * extension prompt until it is overwritten, so a block that is not cleared keeps
+ * reaching the model on every later generation — including turns VectFox skips.
+ * The lorebook block is not included: the GENERATION_STARTED handler owns it and
+ * fills it before the interceptor runs (see clearLorebookPrompt).
+ *
+ * @param {object} settings VECTFOX settings
+ */
+export function clearInterceptorPrompts(settings) {
+    setExtensionPrompt(EXTENSION_PROMPT_TAG, '', settings.position, settings.depth, false);
+    const positionTagPrefix = `${EXTENSION_PROMPT_TAG}_pos`;
+    for (const tag of Object.keys(extension_prompts)) {
+        if (tag.startsWith(positionTagPrefix)) {
+            setExtensionPrompt(tag, '', 0, 0, false);
+        }
+    }
+    setExtensionPrompt(EVENTBASE_PROMPT_TAG, '', settings.position, settings.depth, false);
+    setExtensionPrompt(SUMMARIZER_PROMPT_TAG, '', settings.position, settings.depth, false);
+}
+
+/**
  * Searches for and injects relevant past messages from ALL enabled collections
  * This includes chat collections (if enabled_chats is true) AND any other
  * enabled collections like lorebooks, documents, character files, etc.
@@ -1281,8 +1303,6 @@ function injectChunksIntoPrompt(chunksToInject, settings, debugData) {
  * @param {string} type Generation type
  */
 export async function rearrangeChat(chat, settings, type, { dryRun = false, testMessage = null } = {}) {
-    log.lifecycle(`🐰 VectFox: rearrangeChat called (type: ${type}, chat length: ${chat?.length || 0}${dryRun ? ', dryRun=true' : ''})`);
-
     try {
         // === EARLY EXITS ===
         if (!dryRun && type === 'quiet') {
@@ -1290,24 +1310,22 @@ export async function rearrangeChat(chat, settings, type, { dryRun = false, test
             return;
         }
 
-        // Clear extension prompts (main + any position-specific tags from previous run)
+        // Empty the previous generation's blocks before any other exit, so a turn that
+        // injects nothing (master switch off, chat too short, retrieval timed out) never
+        // sends the last turn's memory instead.
         if (!dryRun) {
-            setExtensionPrompt(EXTENSION_PROMPT_TAG, '', settings.position, settings.depth, false);
-            for (let i = 0; i < 10; i++) {
-                const posTag = `${EXTENSION_PROMPT_TAG}_pos${i}`;
-                if (extension_prompts[posTag]) {
-                    setExtensionPrompt(posTag, '', 0, 0, false);
-                }
-            }
+            clearInterceptorPrompts(settings);
         }
 
-        // Master switch: inject nothing into live generation when disabled. Any
-        // stale injection was just cleared above. The dry-run query tester stays
-        // functional so users can still inspect retrieval while VectFox is off.
+        // Master switch: inject nothing into live generation when disabled. The dry-run
+        // query tester stays functional so users can still inspect retrieval while
+        // VectFox is off.
         if (!dryRun && !isVectFoxEnabled(settings)) {
-            log.lifecycle('VectFox: master switch OFF — skipping retrieval/injection');
+            log.trace('VectFox: master switch OFF — skipping retrieval/injection');
             return;
         }
+
+        log.lifecycle(`🐰 VectFox: rearrangeChat called (type: ${type}, chat length: ${chat?.length || 0}${dryRun ? ', dryRun=true' : ''})`);
 
         if (!getCurrentChatId() || !Array.isArray(chat)) {
             log.trace('VectFox: No chat selected');
@@ -1349,11 +1367,6 @@ export async function rearrangeChat(chat, settings, type, { dryRun = false, test
                         timeoutMs: resolveEventBaseRetrievalTimeoutMs(settings),
                     },
                 );
-            } else {
-                // Empty query — clear any stale injection from a previous generation.
-                const { setExtensionPrompt } = await import('../../../../../script.js');
-                const { EXTENSION_PROMPT_TAG } = await import('./constants.js');
-                setExtensionPrompt(`${EXTENSION_PROMPT_TAG}_eventbase`, '', settings.position, settings.depth, false);
             }
 
             // Feature B — Summarizer Injection: inject the most recent N EventBase

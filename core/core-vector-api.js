@@ -23,7 +23,7 @@
  */
 
 import { getRequestHeaders } from '../../../../../script.js';
-import { extension_settings, modules } from '../../../../extensions.js';
+import { extension_settings } from '../../../../extensions.js';
 import { secret_state } from '../../../../secrets.js';
 import { textgen_types, textgenerationwebui_settings } from '../../../../textgen-settings.js';
 // Embedding-side: no key helpers needed here. vLLM, Ollama, and other
@@ -552,7 +552,7 @@ async function createKoboldCppEmbeddings(items, settings, onProgress = null) {
 
                 // OpenAI format: { data: [{ embedding: [], index: 0, ... }, ...], model: "..." }
                 if (!data.data || !Array.isArray(data.data) || data.data.length !== batchItems.length) {
-                     throw new Error('Invalid response from KoboldCpp embeddings (OpenAI format)');
+                    throw new Error('Invalid response from KoboldCpp embeddings (OpenAI format)');
                 }
 
                 // Sort by index to ensure order matches items
@@ -638,11 +638,6 @@ export function throwIfSourceInvalid(settings) {
         if (modelField && !settings[modelField]) {
             throw new Error('VectFox: API model missing', { cause: 'api_model_missing' });
         }
-    }
-
-    // Special case: extras requires embeddings module
-    if (source === 'extras' && !modules.includes('embeddings')) {
-        throw new Error('VectFox: Embeddings module missing', { cause: 'extras_module_missing' });
     }
 
     // Special case: WebLLM requires browser support
