@@ -51,6 +51,87 @@ function contextWith(n) {
     });
 }
 
+/** Enabled ghosting settings with the batch size under test. */
+function ghostSettings(step, overrides = {}) {
+    return {
+        eventbase_ghost_enabled: true,
+        summarizer_injection_enabled: true,
+        eventbase_ghost_keep_recent: 10,
+        eventbase_ghost_step: step,
+        ...overrides,
+    };
+}
+
+/**
+ * Replay consecutive generations: each turn appends a user + AI message, then runs
+ * applyGhosting on a fresh prompt copy (ST hands the interceptor a working copy, not
+ * the live chat). Returns the outgoing prompt text and published boundary per turn.
+ */
+function replayTurns(step, turns, overrides = {}) {
+    const history = [];
+    const chat = makeChat(12);
+    for (let t = 0; t < turns; t++) {
+        chat.push({ mes: `User ${t}`, extra: {} }, { mes: `AI ${t}`, extra: {} });
+        contextWith(chat.length);
+        mocks.getVectorizationTip.mockReturnValue(chat.length);
+        const prompt = chat.map(m => ({ ...m, extra: { ...m.extra } }));
+        applyGhosting(prompt, ghostSettings(step, overrides));
+        history.push({
+            text: prompt.map(m => m.mes).join('\n'),
+            cutoff: window.VectFox_LastGhost.cutoff,
+        });
+    }
+    return history;
+}
+
+describe('applyGhosting — cache-friendliness across turns', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        vi.stubGlobal('window', {});
+        mocks.getWorldInfoSettings.mockReturnValue({});
+    });
+
+    it('keeps the whole previous prompt as a prefix between batch jumps', () => {
+        // 25 turns of two messages, starting at 12: boundaries land on 20/30/40/50/60.
+        const turns = replayTurns(10, 25);
+
+        const shared = turns.slice(1).filter((t, i) => t.text.startsWith(turns[i].text)).length;
+        // 24 transitions, 5 jumps, so 19 turns reuse the entire previous prompt.
+        expect(shared).toBe(19);
+        for (const t of turns) expect(t.cutoff % 10).toBe(0);
+    });
+
+    it('moves the first raw message every turn at batch size 1', () => {
+        const turns = replayTurns(1, 25);
+
+        const shared = turns.slice(1).filter((t, i) => t.text.startsWith(turns[i].text)).length;
+        expect(shared).toBe(0);
+        const cutoffs = turns.map(t => t.cutoff);
+        for (let i = 1; i < cutoffs.length; i++) expect(cutoffs[i]).toBeGreaterThan(cutoffs[i - 1]);
+    });
+});
+
+describe('applyGhosting — batch size bounds', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        vi.stubGlobal('window', {});
+        mocks.getWorldInfoSettings.mockReturnValue({});
+    });
+
+    it('clamps a stored batch size above the slider maximum', () => {
+        const chat = makeChat(500);
+        contextWith(500);
+        mocks.getVectorizationTip.mockReturnValue(500);
+
+        applyGhosting(chat, ghostSettings(1000));
+
+        // keepFloor 10 -> rolling boundary 490 -> snapped down to the 100-message grid.
+        expect(window.VectFox_LastGhost).toMatchObject({ step: 100, cutoff: 400, rawKept: 100 });
+        expect(chat.slice(0, 400).every(m => m.mes === '')).toBe(true);
+        expect(chat.slice(400).every((m, i) => m.mes === `Message ${i + 400}`)).toBe(true);
+    });
+});
+
 describe('applyGhosting — batching regression (step = 1)', () => {
     beforeEach(() => {
         vi.clearAllMocks();
