@@ -32,7 +32,7 @@ import { runNetworkStartup } from '../core/network-startup.js';
 import { isVectFoxEnabled } from '../core/feature-gate.js';
 import { clearInterceptorPrompts } from '../core/chat-vectorization.js';
 import { clearLorebookPrompt } from '../core/world-info-integration.js';
-import { refreshWorldInfoEntryDepthCache } from '../core/summarizer-injection.js';
+import { refreshWorldInfoEntryDepthCache, normalizeGhostStep, GHOST_STEP_MAX } from '../core/summarizer-injection.js';
 import { getHealthIndicatorHtml, getHealthModalHtml, initializeHealthDashboard, refreshIndicator as refreshHealthIndicator } from './health-dashboard.js';
 import { doesChatHaveVectors, getCollectionRegistry, getCollectionListing, checkPluginAvailable } from '../core/collection-loader.js';
 import { getCollectionMeta } from '../core/collection-metadata.js';
@@ -1001,7 +1001,7 @@ export function renderSettings(containerId, settings, callbacks) {
                                     </div>
                                     <div class="vectfox-form-group" id="VectFox_eventbase_ghost_step_group" style="margin-top: 8px;">
                                         <label class="vectfox-label">Ghost in batches of <span id="VectFox_eventbase_ghost_step_val">1</span> message(s)</label>
-                                        <input type="range" id="VectFox_eventbase_ghost_step" min="1" max="100" step="1" class="vectfox-slider" />
+                                        <input type="range" id="VectFox_eventbase_ghost_step" min="1" max="${GHOST_STEP_MAX}" step="1" class="vectfox-slider" />
                                         <small class="VectFox_hint">1 keeps today's rolling behavior. Larger batches keep the wipe boundary stable longer for prompt-cache reuse; the raw window may grow up to Keep last N + batch size − 1 messages. Ensure SillyTavern's context can fit this larger window plus injections and response tokens. Suggested start for cache-enabled providers: 10–20.</small>
                                     </div>
                                     <div id="VectFox_eventbase_ghost_readout" class="VectFox_hint" style="margin-top: 8px; display:block; padding: 6px 8px; border-radius: 6px; background: rgba(127,127,127,0.12);">Last turn: no generation yet.</div>
@@ -3992,12 +3992,12 @@ function bindSettingsEvents(settings, callbacks) {
             saveSettingsDebounced();
         });
 
-    const _ghostStep0 = Math.max(1, Math.min(100, parseInt(settings.eventbase_ghost_step ?? 1, 10) || 1));
+    const _ghostStep0 = normalizeGhostStep(settings.eventbase_ghost_step);
     $('#VectFox_eventbase_ghost_step_val').text(_ghostStep0);
     $('#VectFox_eventbase_ghost_step')
         .val(_ghostStep0)
         .on('input', function() {
-            const val = Math.max(1, Math.min(100, parseInt(this.value, 10) || 1));
+            const val = normalizeGhostStep(this.value);
             settings.eventbase_ghost_step = val;
             $('#VectFox_eventbase_ghost_step_val').text(val);
             Object.assign(extension_settings.vectfox, settings);

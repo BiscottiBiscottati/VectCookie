@@ -139,16 +139,21 @@ function blankPromptClone(m) {
     return clone;
 }
 
+/** Slider range for the ghost batch size; the wipe grid can never exceed it. */
+export const GHOST_STEP_MAX = 100;
+
 /**
- * Normalize the ghost batch size to a whole number of messages, minimum 1.
- * Missing, non-numeric, zero, negative, fractional or non-finite values → 1 (rolling),
- * so a corrupt settings value can never disable ghosting or break prompt assembly.
+ * Normalize the ghost batch size to a whole number of messages in the slider's
+ * 1..GHOST_STEP_MAX range. Missing, non-numeric, zero, negative, fractional or
+ * non-finite values → 1 (rolling), so a corrupt settings value can never disable
+ * ghosting or break prompt assembly. Values above the maximum clamp down to it, so
+ * a hand-edited settings.json can never put the wipe on a grid the UI cannot show.
  * @param {*} v
  * @returns {number}
  */
-function normalizeGhostStep(v) {
+export function normalizeGhostStep(v) {
     const n = Math.floor(Number(v));
-    return Number.isFinite(n) && n >= 1 ? n : 1;
+    return Number.isFinite(n) && n >= 1 ? Math.min(n, GHOST_STEP_MAX) : 1;
 }
 
 /**
