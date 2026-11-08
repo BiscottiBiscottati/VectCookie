@@ -30,6 +30,7 @@
 @import url('./ui/search-debug.css');
 @import url('./ui/text-cleaning-manager.css');
 @import url('./ui/health-dashboard.css');
+@import url('./ui/usage-panel.css');
 
 /* Mobile responsive styles - must be last to override */
 /* Tab navigation styles */
