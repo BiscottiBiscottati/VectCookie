@@ -20,6 +20,20 @@ function jsonResponse(body, { status = 200 } = {}) {
     });
 }
 
+function sseResponse(parts, { status = 200 } = {}) {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+        start(controller) {
+            for (const part of parts) controller.enqueue(encoder.encode(part));
+            controller.close();
+        },
+    });
+    return new Response(stream, {
+        status,
+        headers: { 'Content-Type': 'text/event-stream' },
+    });
+}
+
 function chatBody(overrides = {}) {
     return {
         chat_completion_source: 'openrouter',
@@ -106,6 +120,256 @@ describe('usage pipeline — non-streamed capture', () => {
     });
 });
 
+describe('usage pipeline — streamed capture', () => {
+    it('captures the terminal usage chunk of a streamed reply', async () => {
+        const chunks = [
+            'data: {"id":"gen-9","model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\n',
+            'data: {"id":"gen-9","model":"deepseek-chat","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":1200,"completion_tokens":80,"total_tokens":1280,"prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":300,"prompt_tokens_details":{"cached_tokens":900}}}\n\n',
+            'data: [DONE]\n\n',
+        ];
+        const response = sseResponse(chunks);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+        const secret = 'PROMPT-TEXT-MARKER';
+
+        const returned = await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({
+                stream: true,
+                chat_completion_source: 'deepseek',
+                model: 'deepseek-chat',
+                messages: [{ role: 'user', content: secret }],
+            })),
+        });
+
+        expect(returned).toBe(response);
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        const [record] = ledger.recordsFor('chat-1');
+        expect(record).toMatchObject({
+            chatId: 'chat-1',
+            provider: 'deepseek',
+            model: 'deepseek-chat',
+            responseId: 'gen-9',
+            stream: true,
+            status: 'ok',
+            httpStatus: 200,
+            promptTokens: 1200,
+            hitTokens: 900,
+            missTokens: 300,
+            completionTokens: 80,
+            totalTokens: 1280,
+            usageSource: 'measured',
+        });
+        expect(record).not.toHaveProperty('messages');
+        expect(JSON.stringify(record)).not.toContain(secret);
+
+        // The caller's body is still the provider's bytes, untouched.
+        await expect(returned.text()).resolves.toBe(chunks.join(''));
+    });
+
+    it('keeps OpenRouter cache-write tokens and its reported cost', async () => {
+        const chunks = [
+            'data: {"id":"gen-11","choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n',
+            'data: {"id":"gen-11","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":194,"completion_tokens":2,"total_tokens":196,"prompt_tokens_details":{"cached_tokens":80,"cache_write_tokens":100},"cost":0.95}}\n\n',
+            'data: [DONE]\n\n',
+        ];
+        const response = sseResponse(chunks);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true, chat_completion_source: 'openrouter' })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'ok',
+            hitTokens: 80,
+            missTokens: 114,
+            cacheWriteTokens: 100,
+            cost: 0.95,
+            usageSource: 'measured',
+        });
+    });
+
+    it('returns the streamed response before the stream ends', async () => {
+        const encoder = new TextEncoder();
+        let controller;
+        const stream = new ReadableStream({
+            start(streamController) {
+                controller = streamController;
+                controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n'));
+            },
+        });
+        const response = new Response(stream, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+        });
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        const returned = await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true })),
+        });
+
+        expect(returned).toBe(response);
+        expect(ledger.recordsFor('chat-1')).toEqual([]);
+
+        controller.enqueue(encoder.encode('data: {"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10}}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'ok',
+            promptTokens: 9,
+            completionTokens: 1,
+            totalTokens: 10,
+        });
+    });
+
+    it('records a completed stream without usage as no-usage', async () => {
+        const response = sseResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\n',
+            'data: [DONE]\n\n',
+        ]);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'no-usage',
+            usageSource: 'unavailable',
+            promptTokens: null,
+            hitTokens: null,
+        });
+    });
+
+    it('records a stream that ends without a terminal marker as error', async () => {
+        const response = sseResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\n',
+        ]);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'error',
+            usageSource: 'unavailable',
+        });
+    });
+
+    it('records an error frame as error', async () => {
+        const response = sseResponse([
+            'data: {"error":{"message":"upstream failed"}}\n\n',
+            'data: [DONE]\n\n',
+        ]);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'error',
+            usageSource: 'unavailable',
+        });
+    });
+
+    it('records a malformed SSE payload as error while keeping a later usage', async () => {
+        const response = sseResponse([
+            'data: not-json\n\n',
+            'data: {"usage":{"prompt_tokens":10,"total_tokens":10}}\n\n',
+            'data: [DONE]\n\n',
+        ]);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'error',
+            promptTokens: 10,
+            usageSource: 'measured',
+        });
+    });
+
+    it('keeps the last non-null usage chunk', async () => {
+        const response = sseResponse([
+            'data: {"usage":{"prompt_tokens":10,"total_tokens":10}}\n\n',
+            'data: {"usage":null}\n\n',
+            'data: {"usage":{"prompt_tokens":20,"total_tokens":20}}\n\n',
+            'data: [DONE]\n\n',
+        ]);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'ok',
+            promptTokens: 20,
+            totalTokens: 20,
+        });
+    });
+
+    it('parses a usage event split across chunks', async () => {
+        const full = [
+            'data: {"id":"gen-10","model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\n',
+            'data: {"id":"gen-10","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":5,"total_tokens":55,"prompt_tokens_details":{"cached_tokens":20}}}\n\n',
+            'data: [DONE]\n\n',
+        ].join('');
+        const cuts = [17, 61, 140];
+        const chunks = [
+            full.slice(0, cuts[0]),
+            full.slice(cuts[0], cuts[1]),
+            full.slice(cuts[1], cuts[2]),
+            full.slice(cuts[2]),
+        ];
+        const response = sseResponse(chunks);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true, chat_completion_source: 'deepseek', model: 'deepseek-chat' })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'ok',
+            promptTokens: 50,
+            hitTokens: 20,
+            missTokens: 30,
+            totalTokens: 55,
+        });
+    });
+});
+
 describe('usage pipeline — what the observer ignores', () => {
     it('leaves a non-chat-completion URL alone', async () => {
         const response = jsonResponse({ usage: { prompt_tokens: 10 } });
@@ -115,23 +379,6 @@ describe('usage pipeline — what the observer ignores', () => {
         const returned = await target.fetch('/api/backends/text-completions/generate', {
             method: 'POST',
             body: JSON.stringify(chatBody()),
-        });
-
-        expect(returned).toBe(response);
-        await settle();
-        expect(ledger.recordsFor('chat-1')).toEqual([]);
-    });
-
-    it('skips a streamed request so the later ticket owns SSE parsing', async () => {
-        const response = new Response('data: {"choices":[]}\n\ndata: [DONE]\n\n', {
-            headers: { 'Content-Type': 'text/event-stream' },
-        });
-        const fetchMock = vi.fn(async () => response);
-        const { target, ledger } = installOver(fetchMock);
-
-        const returned = await target.fetch(ENDPOINT, {
-            method: 'POST',
-            body: JSON.stringify(chatBody({ stream: true })),
         });
 
         expect(returned).toBe(response);
@@ -149,6 +396,127 @@ describe('usage pipeline — what the observer ignores', () => {
         expect(fetchMock).toHaveBeenCalledTimes(1);
         await settle();
         expect(ledger.recordsFor('chat-1')).toEqual([]);
+    });
+});
+
+describe('usage pipeline — failed requests', () => {
+    it('records a JSON error body as error', async () => {
+        const response = jsonResponse({ error: { message: 'upstream failed' } });
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody()),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'error',
+            httpStatus: 200,
+            usageSource: 'unavailable',
+        });
+    });
+
+    it('records an aborted request and hands the caller the original rejection', async () => {
+        const abortError = new DOMException('The user aborted a request.', 'AbortError');
+        const fetchMock = vi.fn(async () => {
+            throw abortError;
+        });
+        const target = { fetch: fetchMock };
+        const ledger = new UsageLedger();
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: (record) => ledger.add(record),
+        });
+        const controller = new AbortController();
+        controller.abort();
+
+        await expect(target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody()),
+            signal: controller.signal,
+        })).rejects.toBe(abortError);
+
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'aborted',
+            httpStatus: null,
+            promptTokens: null,
+            hitTokens: null,
+            missTokens: null,
+            usageSource: 'unavailable',
+            stream: false,
+        });
+    });
+});
+
+describe('usage pipeline — HTTP errors', () => {
+    it('records an HTTP error as a status and leaves the response untouched', async () => {
+        const payload = { error: { message: 'rate limited' } };
+        const response = jsonResponse(payload, { status: 429 });
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        const returned = await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody()),
+        });
+
+        expect(returned).toBe(response);
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'error',
+            httpStatus: 429,
+            stream: false,
+            promptTokens: null,
+            hitTokens: null,
+            usageSource: 'unavailable',
+        });
+        await expect(returned.json()).resolves.toEqual(payload);
+    });
+});
+
+describe('usage pipeline — aborted stream', () => {
+    it('records an aborted stream as aborted and keeps what was measured', async () => {
+        const encoder = new TextEncoder();
+        const controller = new AbortController();
+        const stream = new ReadableStream({
+            start(streamController) {
+                streamController.enqueue(encoder.encode('data: {"usage":{"prompt_tokens":10,"total_tokens":10}}\n\n'));
+                // Abort after the usage chunk has been read, as a stop button would.
+                setTimeout(() => {
+                    controller.abort();
+                    streamController.error(new DOMException('The user aborted a request.', 'AbortError'));
+                }, 5);
+            },
+        });
+        const response = new Response(stream, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+        });
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        const returned = await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true })),
+            signal: controller.signal,
+        });
+
+        expect(returned).toBe(response);
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'aborted',
+            stream: true,
+            httpStatus: 200,
+            promptTokens: 10,
+            totalTokens: 10,
+            usageSource: 'measured',
+        });
     });
 });
 

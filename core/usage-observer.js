@@ -62,19 +62,46 @@ export function installUsageObserver({
         // Chat ownership is decided when the request is sent, not when its
         // response lands — a chat switch mid-flight must not move the record.
         const chatId = readChatId(sink);
-        const response = await originalFetch(input, init);
+        let response;
+        try {
+            response = await originalFetch(input, init);
+        } catch (error) {
+            startCapture(() => captureRejectedRequest({ sink, input, init, chatId, startedAt, error }));
+            throw error;
+        }
         const latencyMs = Math.max(0, sink.now() - startedAt);
 
         try {
             if (!isChatCompletionRequest(input)) return response;
-            // SSE capture is its own slice; a streamed response must not
-            // surface as a "no usage" row that looks like a provider failure.
-            if (isEventStream(response)) return response;
+            if (!response.ok) {
+                startCapture(() => captureHttpErrorRecord({
+                    sink,
+                    init,
+                    chatId,
+                    httpStatus: response.status,
+                    startedAt,
+                    latencyMs,
+                }));
+                return response;
+            }
             // Clone before returning: the caller's body must stay untouched.
             // Everything else (including parsing the request body) runs in the
             // floating continuation, after the caller has its response.
             const clone = response.clone();
-            captureRecord({ sink, input, init, chatId, response, clone, startedAt, latencyMs }).catch(() => {});
+            const captured = {
+                sink,
+                init,
+                chatId,
+                clone,
+                startedAt,
+                latencyMs,
+                httpStatus: response.status,
+            };
+            if (isEventStream(response)) {
+                startCapture(() => captureStreamedRecord(captured));
+            } else {
+                startCapture(() => captureJsonRecord(captured));
+            }
         } catch {
             /* observer must never replace or delay the caller's response */
         }
@@ -92,6 +119,57 @@ function readChatId(sink) {
     } catch {
         return null;
     }
+}
+
+/**
+ * Defers capture to the next macrotask: the caller's response continuation
+ * must run before any capture work, including parsing the request body.
+ * Capture errors are swallowed — the observer never surfaces them.
+ */
+function startCapture(run) {
+    const start = () => {
+        try {
+            Promise.resolve(run()).catch(() => {});
+        } catch {
+            /* observer must never surface its own errors */
+        }
+    };
+    try {
+        setTimeout(start, 0);
+    } catch {
+        start();
+    }
+}
+
+function captureRejectedRequest({ sink, input, init, chatId, startedAt, error }) {
+    if (!isChatCompletionRequest(input)) return;
+    const body = readChatCompletionBody(init);
+    if (!body) return;
+
+    sink.handleRecord(buildRecord({
+        body,
+        chatId,
+        httpStatus: null,
+        usage: null,
+        status: usageStatus({ aborted: isAbortError(error, init?.signal), error: true }),
+        startedAt,
+        latencyMs: Math.max(0, sink.now() - startedAt),
+    }));
+}
+
+function usageStatus({ aborted = false, error = false, usage = null } = {}) {
+    if (aborted) return 'aborted';
+    if (error) return 'error';
+    return usage && typeof usage === 'object' ? 'ok' : 'no-usage';
+}
+
+function isAbortError(error, signal) {
+    try {
+        if (signal?.aborted) return true;
+    } catch {
+        /* an unreadable signal is treated as not aborted */
+    }
+    return error?.name === 'AbortError';
 }
 
 function isChatCompletionRequest(input) {
@@ -115,7 +193,7 @@ function isEventStream(response) {
 
 /**
  * Reads the request shape the observer needs, without keeping the prompt.
- * Only a JSON string body; a Request object or a stream request is skipped.
+ * Only a JSON string body; a Request object or a non-string body is skipped.
  */
 function readChatCompletionBody(init) {
     const rawBody = init?.body;
@@ -128,16 +206,36 @@ function readChatCompletionBody(init) {
         return null;
     }
     if (!body || typeof body !== 'object') return null;
-    if (body.stream === true) return null;
 
     return body;
 }
 
-async function captureRecord({ sink, input, init, chatId, response, clone, startedAt, latencyMs }) {
+/**
+ * Records a non-2xx request without reading the response body: the caller's
+ * error response must stay untouched, and there is no usage to find there.
+ */
+async function captureHttpErrorRecord({ sink, init, chatId, httpStatus, startedAt, latencyMs }) {
+    const body = readChatCompletionBody(init);
+    if (!body) return;
+
+    sink.handleRecord(buildRecord({
+        body,
+        chatId,
+        httpStatus,
+        usage: null,
+        status: usageStatus({ error: true }),
+        startedAt,
+        latencyMs,
+    }));
+}
+
+/**
+ * Reads a non-streamed response's JSON usage. Runs after the caller has the
+ * response; a parse failure or provider error is a status, never a throw.
+ */
+async function captureJsonRecord({ sink, init, chatId, clone, startedAt, latencyMs, httpStatus }) {
     let data = null;
     try {
-        // Await the clone before parsing the prompt body: the response promise
-        // resolves first, so the caller is never held up by capture work.
         data = await clone.json();
     } catch {
         data = null;
@@ -147,14 +245,149 @@ async function captureRecord({ sink, input, init, chatId, response, clone, start
     if (!body) return;
 
     const usage = data && typeof data === 'object' ? data.usage : null;
-    sink.handleRecord(buildRecord({ body, chatId, response, data, usage, startedAt, latencyMs }));
+    sink.handleRecord(buildRecord({
+        body,
+        chatId,
+        httpStatus,
+        responseModel: data?.model ?? null,
+        responseId: data?.id ?? null,
+        cacheDiscount: toCount(data?.cache_discount),
+        usage,
+        status: usageStatus({ error: !!data?.error, usage }),
+        startedAt,
+        latencyMs,
+    }));
 }
 
-function buildRecord({ body, chatId, response, data, usage, startedAt, latencyMs }) {
+/**
+ * Decodes a cloned SSE body incrementally, keeping only the last non-null
+ * usage and stopping at `[DONE]`. The caller's branch of the cloned stream is
+ * never awaited here.
+ */
+async function captureStreamedRecord({ sink, init, chatId, clone, startedAt, latencyMs, httpStatus }) {
+    const body = readChatCompletionBody(init);
+    if (!body) {
+        // Nothing to attribute: release the cloned branch instead of letting
+        // the tee buffer the rest of the stream for an unread reader.
+        cancelReader(clone?.body?.getReader?.());
+        return;
+    }
+
+    const { reader, ...result } = await readSseCapture(clone, init?.signal);
+    try {
+        sink.handleRecord(buildRecord({
+            body,
+            chatId,
+            httpStatus,
+            responseId: result.responseId,
+            cacheDiscount: result.cacheDiscount,
+            usage: result.usage,
+            status: usageStatus(result),
+            startedAt,
+            latencyMs,
+        }));
+    } finally {
+        // Record first, then cancel: cancelling is fire-and-forget because a
+        // tee-branch cancel can stay pending until the caller's branch drains.
+        if (reader) cancelReader(reader);
+    }
+}
+
+const MAX_SSE_CARRY = 1_000_000;
+
+async function readSseCapture(clone, signal) {
+    const result = { usage: null, responseId: null, cacheDiscount: null, sawDone: false, aborted: false, error: false, reader: null };
+    const body = clone?.body;
+    if (!body || typeof body.getReader !== 'function') {
+        result.error = true;
+        return result;
+    }
+
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let carry = '';
+
+    try {
+        while (!result.sawDone) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            carry += decoder.decode(value, { stream: true });
+            carry = drainSseLines(carry, result);
+            if (carry.length > MAX_SSE_CARRY) carry = '';
+        }
+    } catch (error) {
+        if (isAbortError(error, signal)) result.aborted = true;
+        else result.error = true;
+    }
+
+    // A stream that ends without its terminal marker and without usage was
+    // cut off; do not let it pass as a completed request with no usage.
+    if (!result.sawDone && !result.usage && !result.aborted) result.error = true;
+
+    if (result.sawDone) result.reader = reader;
+
+    return result;
+}
+
+function cancelReader(reader) {
+    try {
+        reader.cancel().catch(() => {});
+    } catch {
+        /* already closed */
+    }
+}
+
+function drainSseLines(carry, result) {
+    let newline;
+    while ((newline = carry.indexOf('\n')) >= 0) {
+        const line = carry.slice(0, newline).replace(/\r$/, '');
+        carry = carry.slice(newline + 1);
+        if (!line.startsWith('data:')) continue;
+
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') {
+            result.sawDone = true;
+            break;
+        }
+        if (!payload) continue;
+
+        let chunk;
+        try {
+            chunk = JSON.parse(payload);
+        } catch {
+            result.error = true;
+            continue;
+        }
+        if (!chunk || typeof chunk !== 'object') continue;
+
+        if (chunk.error) result.error = true;
+        if (chunk.usage && typeof chunk.usage === 'object') result.usage = chunk.usage;
+        if (typeof chunk.id === 'string') result.responseId = chunk.id;
+        const discount = toCount(chunk.cache_discount);
+        if (discount != null) result.cacheDiscount = discount;
+    }
+    return carry;
+}
+
+function buildRecord({
+    body,
+    chatId,
+    httpStatus,
+    responseModel = null,
+    responseId = null,
+    cacheDiscount = null,
+    usage = null,
+    status,
+    startedAt,
+    latencyMs,
+}) {
     const hasUsage = !!usage && typeof usage === 'object';
     const promptTokens = toCount(usage?.prompt_tokens);
     const completionTokens = toCount(usage?.completion_tokens);
-    const hitTokens = toCount(usage?.prompt_tokens_details?.cached_tokens);
+    const reportedHit = toCount(usage?.prompt_cache_hit_tokens);
+    const cachedTokens = toCount(usage?.prompt_tokens_details?.cached_tokens);
+    const hitTokens = reportedHit ?? cachedTokens;
+    const reportedMiss = toCount(usage?.prompt_cache_miss_tokens);
     const reportedTotal = toCount(usage?.total_tokens);
     const totalTokens = reportedTotal ?? (
         promptTokens != null && completionTokens != null ? promptTokens + completionTokens : null
@@ -165,19 +398,25 @@ function buildRecord({ body, chatId, response, data, usage, startedAt, latencyMs
         timestamp: startedAt,
         chatId,
         provider: body.chat_completion_source || 'unknown',
-        model: body.model || data?.model || 'unknown',
+        model: body.model || responseModel || 'unknown',
+        responseId,
         stream: body.stream === true,
-        status: hasUsage ? 'ok' : 'no-usage',
-        httpStatus: response?.status ?? null,
+        status,
+        httpStatus,
         latencyMs,
         messageCount: Array.isArray(body.messages) ? body.messages.length : null,
         promptTokens,
         hitTokens,
-        missTokens: promptTokens != null && hitTokens != null
-            ? Math.max(0, promptTokens - hitTokens)
-            : null,
+        missTokens: reportedMiss ?? (
+            promptTokens != null && hitTokens != null ? Math.max(0, promptTokens - hitTokens) : null
+        ),
+        cacheWriteTokens: toCount(usage?.prompt_tokens_details?.cache_write_tokens)
+            ?? toCount(usage?.cache_write_tokens),
         completionTokens,
+        reasoningTokens: toCount(usage?.completion_tokens_details?.reasoning_tokens),
         totalTokens,
+        cost: toCount(usage?.cost),
+        cacheDiscount: cacheDiscount ?? toCount(usage?.cache_discount),
         usageSource: hasUsage ? 'measured' : 'unavailable',
     };
 }
