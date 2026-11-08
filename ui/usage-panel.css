@@ -1,0 +1,85 @@
+/* ============================================================================
+ * VECTFOX - USAGE TAB
+ * ============================================================================
+ * Token and cache usage table, empty state and source badges.
+ * ============================================================================ */
+
+.vectfox-usage-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.vectfox-usage-empty {
+    padding: 14px;
+    border: 1px dashed var(--SmartThemeBorderColor, rgba(255,255,255,0.18));
+    border-radius: 6px;
+    color: var(--SmartThemeBodyColor);
+    opacity: 0.8;
+    font-size: 0.85em;
+}
+
+.vectfox-usage-table-wrap {
+    overflow-x: auto;
+}
+
+.vectfox-usage-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82em;
+}
+
+.vectfox-usage-table th,
+.vectfox-usage-table td {
+    padding: 5px 6px;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.08));
+    text-align: left;
+    vertical-align: middle;
+}
+
+.vectfox-usage-table th {
+    font-weight: 600;
+    opacity: 0.8;
+    white-space: nowrap;
+}
+
+.vectfox-usage-table tbody tr:hover {
+    background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.15));
+}
+
+.vectfox-usage-table .num {
+    text-align: right;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+
+.vectfox-usage-time {
+    white-space: nowrap;
+    opacity: 0.85;
+    font-variant-numeric: tabular-nums;
+}
+
+.vectfox-usage-model {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.vectfox-usage-source {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 9px;
+    font-size: 0.85em;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15));
+    white-space: nowrap;
+}
+
+.vectfox-usage-source-measured {
+    color: var(--vectfox-success, #10b981);
+    border-color: var(--vectfox-success, #10b981);
+}
+
+.vectfox-usage-source-unavailable {
+    opacity: 0.7;
+}

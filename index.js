@@ -14,10 +14,12 @@ import {
     eventSource,
     event_types,
     extension_prompt_types,
+    saveSettingsDebounced,
 } from '../../../../script.js';
 import {
     ModuleWorkerWrapper,
     extension_settings,
+    getContext,
 } from '../../../extensions.js';
 import { debounce } from '../../../utils.js';
 import { debounce_timeout } from '../../../constants.js';
@@ -48,6 +50,9 @@ import { initializeDatabaseBrowser } from './ui/database-browser.js';
 import { initializeWorldInfoIntegration } from './core/world-info-integration.js';
 import { refreshWorldInfoEntryDepthCache } from './core/summarizer-injection.js';
 import { CJK_TOKENIZER_MODES, setCjkTokenizerMode, ensureJiebaTokenizerLoaded, ensureJiebaTwLoaded } from './core/bm25-scorer.js';
+import { installUsageObserver } from './core/usage-observer.js';
+import { UsageLedger } from './core/usage-ledger.js';
+import { initializeUsagePanel } from './ui/usage-panel.js';
 
 // SillyTavern display label — NOT the settings key. For settings, use 'vectfox' (lowercase).
 const MODULE_NAME = 'VectFox';
@@ -290,6 +295,11 @@ const defaultSettings = {
     eventbase_ghost_enabled: false,
     eventbase_ghost_keep_recent: 10,              // recent messages kept verbatim; everything older that's vectorized is wiped. range 0-100 (summarizer injects ~20 events to cover the wiped span)
     eventbase_ghost_step: 1,                       // wipe boundary batch size in messages; 1 preserves rolling behavior
+
+    // Usage tab — page-lifetime observer of chat-completion usage. Off by
+    // default; while off, window.fetch is not wrapped at all. While on, the
+    // wrapper only clones and reads the response. See core/usage-observer.js.
+    usage_tracking_enabled: false,
     // Per-chat marker: auto-sync only processes windows whose start >= marker.
     // Stamped at "max(source_window_end across existing events) + 1" when auto-sync
     // is enabled on a non-empty collection, or at current chat length when collection
@@ -743,6 +753,32 @@ jQuery(async () => {
         onRunDiagnostics: onRunDiagnosticsClick,
     });
 
+    // Usage telemetry — one page-lifetime observer, installed only while
+    // tracking is on. Installing again (a re-enable) swaps the sink instead of
+    // wrapping fetch a second time. Off at startup means no wrapper at all.
+    const usageLedger = new UsageLedger();
+    const getActiveChatId = () => getContext()?.chatId ?? null;
+    let refreshUsagePanel = () => {};
+    const installUsageTelemetry = () => installUsageObserver({
+        isEnabled: () => !!settings.usage_tracking_enabled,
+        getChatId: getActiveChatId,
+        handleRecord: (record) => {
+            usageLedger.add(record);
+            refreshUsagePanel();
+        },
+    });
+    refreshUsagePanel = initializeUsagePanel({
+        settings,
+        ledger: usageLedger,
+        getChatId: getActiveChatId,
+        onTrackingChange: (enabled) => {
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+            if (enabled) installUsageTelemetry();
+        },
+    });
+    if (settings.usage_tracking_enabled) installUsageTelemetry();
+
     // Initialize auto-sync checkbox state for current chat (if any)
     refreshAutoSyncCheckbox(settings);
 
@@ -797,6 +833,7 @@ jQuery(async () => {
             log.lifecycle('VectFox: Chat changed, refreshing UI state');
         }
         refreshAutoSyncCheckbox(settings);
+        refreshUsagePanel();
     });
 
     // Keep the ghosting WI-scan floor accurate: refresh the cached deepest per-entry World

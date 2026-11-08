@@ -110,6 +110,7 @@ export function renderSettings(containerId, settings, callbacks) {
                             <button class="vectfox-tab-btn" data-tab="worldinfo">WorldInfo</button>
                             <button class="vectfox-tab-btn" data-tab="rag">RAG</button>
                             <button class="vectfox-tab-btn" data-tab="agentmode">AgentMode</button>
+                            <button class="vectfox-tab-btn" data-tab="usage">Usage</button>
                         </div>
                     </div>
 
@@ -1397,6 +1398,20 @@ export function renderSettings(containerId, settings, callbacks) {
                                 </small>
                             </div>
 
+                        </div>
+                    </div>
+
+                    <!-- Usage Card -->
+                    <div class="vectfox-card" data-vectfox-tab="usage">
+                        <div class="vectfox-card-header">
+                            <h3 class="vectfox-card-title">
+                                <span class="vectfox-icon"><i class="fa-solid fa-chart-column"></i></span>
+                                Usage — Token &amp; Cache Telemetry
+                            </h3>
+                            <p class="vectfox-card-subtitle">Provider-reported prompt, cached and missed tokens for chat-completion requests this browser made. Off by default; measuring never changes a request or a response.</p>
+                        </div>
+                        <div class="vectfox-card-body">
+                            <div id="VectFox_usage_panel"></div>
                         </div>
                     </div>
 
