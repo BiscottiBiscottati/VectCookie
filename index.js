@@ -14,6 +14,7 @@ import {
     eventSource,
     event_types,
     extension_prompt_types,
+    saveMetadata,
     saveSettingsDebounced,
 } from '../../../../script.js';
 import {
@@ -21,7 +22,7 @@ import {
     extension_settings,
     getContext,
 } from '../../../extensions.js';
-import { debounce } from '../../../utils.js';
+import { debounce, getSanitizedFilename } from '../../../utils.js';
 import { debounce_timeout } from '../../../constants.js';
 
 // VectFox modules - Core
@@ -53,6 +54,7 @@ import { CJK_TOKENIZER_MODES, setCjkTokenizerMode, ensureJiebaTokenizerLoaded, e
 import { installUsageObserver, getUsageObserverHealth } from './core/usage-observer.js';
 import { noteGenerationStarted, noteGenerationEnded } from './core/usage-attribution.js';
 import { UsageLedger } from './core/usage-ledger.js';
+import { normalizeUsageConfiguration } from './core/usage-configuration.js';
 import { createDefaultUsagePrices } from './core/usage-stats.js';
 import { createPromptTokenEstimator } from './core/usage-estimator.js';
 import { initializeUsagePanel } from './ui/usage-panel.js';
@@ -759,12 +761,32 @@ jQuery(async () => {
     // Usage telemetry — one page-lifetime observer, installed only while
     // tracking is on. Installing again (a re-enable) swaps the sink instead of
     // wrapping fetch a second time. Off at startup means no wrapper at all.
-    const usageLedger = new UsageLedger();
     const getActiveChatId = () => getContext()?.chatId ?? null;
+    // The id open before the most recent CHAT_CHANGED. A rename reloads the
+    // open chat under the server-sanitized name before CHAT_RENAMED fires, so
+    // this pair tells the ledger which id the renamed chat actually got.
+    let activeUsageChatId = getActiveChatId();
+    let previousUsageChatId = activeUsageChatId;
+    // One durable ledger for the page: the active chat's records live in its
+    // chat metadata, and the all-time aggregate spans chats in local storage.
+    // The ledger owns the debounce; the panel only reads from it.
+    const usageLedger = new UsageLedger({
+        getChatId: getActiveChatId,
+        getMetadata: () => getContext()?.chatMetadata ?? null,
+        saveMetadata: () => saveMetadata(),
+        storage: typeof localStorage !== 'undefined' ? localStorage : null,
+        getPrices: () => settings.usage_prices,
+        // Renames of a chat that is not open have no reloaded id; SillyTavern's
+        // own sanitizer tells us the file name the server actually created.
+        sanitizeChatFileName: getSanitizedFilename,
+    });
+    usageLedger.loadChat(getActiveChatId());
     // What ghosting was actually doing when the request went out. Ghosting is
     // gated on Summarizer Injection, so the raw checkbox alone would report
     // "on" for requests nothing wiped.
-    const readUsageConfiguration = () => ({
+    // The snapshot shape has one owner: core/usage-configuration.js. Reading
+    // settings and normalizing the persisted shape both go through it.
+    const readUsageConfiguration = () => normalizeUsageConfiguration({
         ghostEnabled: !!(settings.eventbase_ghost_enabled && settings.summarizer_injection_enabled),
         ghostBatchSize: normalizeGhostStep(settings.eventbase_ghost_step),
         ghostKeepRecent: Math.max(0, Math.min(100, Math.floor(Number(settings.eventbase_ghost_keep_recent) || 0))),
@@ -874,9 +896,37 @@ jQuery(async () => {
         if (isVectFoxEnabled(settings)) {
             log.lifecycle('VectFox: Chat changed, refreshing UI state');
         }
+        // Flush a pending usage save before adopting the new chat, so a switch
+        // cannot strand the all-time aggregate.
+        const nextChatId = getActiveChatId();
+        previousUsageChatId = activeUsageChatId;
+        activeUsageChatId = nextChatId;
+        usageLedger.handleChatChanged(nextChatId);
         refreshAutoSyncCheckbox(settings);
         refreshUsagePanel();
     });
+
+    // Usage lifecycle follows the chat even while tracking is off: the all-time
+    // aggregate must lose a deleted chat's bucket and follow a rename.
+    const handleUsageChatDeleted = (deletedChatId) => {
+        usageLedger.handleChatDeleted(deletedChatId ?? null);
+        refreshUsagePanel();
+    };
+    eventSource.on(event_types.CHAT_DELETED, handleUsageChatDeleted);
+    eventSource.on(event_types.GROUP_CHAT_DELETED, handleUsageChatDeleted);
+    eventSource.on(event_types.CHAT_RENAMED, async (eventData) => {
+        // The ledger normalizes SillyTavern's 'name.jsonl' file names to the
+        // extension-less chat ids it keys everything by. It uses the reloaded
+        // id for the open chat and the server-sanitized name otherwise.
+        await usageLedger.handleChatRenamed(eventData?.oldFileName, eventData?.newFileName, {
+            previousChatId: previousUsageChatId,
+            currentChatId: activeUsageChatId,
+        });
+        refreshUsagePanel();
+    });
+    if (typeof window !== 'undefined') {
+        window.addEventListener('pagehide', () => usageLedger.flush());
+    }
 
     // Keep the ghosting WI-scan floor accurate: refresh the cached deepest per-entry World
     // Info scanDepth whenever the active books or WI settings change (off the hot path, so

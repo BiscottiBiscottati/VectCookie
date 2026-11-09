@@ -282,3 +282,21 @@
     font-weight: 600;
     white-space: nowrap;
 }
+
+/* Durable totals ---------------------------------------------------------- */
+
+.vectfox-usage-alltime {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.vectfox-usage-card-alltime {
+    border-style: dashed;
+}
+
+.vectfox-usage-retention {
+    font-size: 0.82em;
+    opacity: 0.75;
+    padding: 0 2px;
+}

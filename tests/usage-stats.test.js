@@ -9,7 +9,11 @@
 import { describe, it, expect } from 'vitest';
 
 import {
+    addRecordToUsageAccumulator,
     createDefaultUsagePrices,
+    createUsageAccumulator,
+    mergeUsageSummaries,
+    summarizeAccumulator,
     summarizeUsage,
     summarizeByConfiguration,
     summarizeByOrigin,
@@ -292,5 +296,72 @@ describe('usage statistics — by configuration', () => {
         expect(summary.costedRequests).toBe(1);
         expect(summary.costPerRequest).toBeCloseTo(summary.cost, 10);
         expect(summary.costPerRequestSource).toBe('estimated');
+    });
+});
+
+
+describe('usage statistics — archived counters', () => {
+    it('summarizes evicted rows with the same weighted maths as live rows', () => {
+        const prices = createDefaultUsagePrices();
+        const accumulator = createUsageAccumulator();
+        addRecordToUsageAccumulator(accumulator, record({
+            promptTokens: 1000,
+            hitTokens: 500,
+            missTokens: 500,
+            completionTokens: 100,
+        }), prices);
+        addRecordToUsageAccumulator(accumulator, record({
+            recordId: 'rec-2',
+            status: 'no-usage',
+            usageSource: 'estimated',
+            promptTokens: null,
+            hitTokens: null,
+            missTokens: null,
+            completionTokens: null,
+            totalTokens: null,
+            estimatedPromptTokens: 500,
+        }), prices);
+
+        const summary = summarizeAccumulator(accumulator);
+
+        expect(summary).toMatchObject({
+            requests: 2,
+            measuredRequests: 1,
+            estimatedRequests: 1,
+            promptTokens: 1000,
+            estimatedPromptTokens: 500,
+            hitTokens: 500,
+            ratedPromptTokens: 1000,
+            hitRate: 0.5,
+            coverage: 1000 / 1500,
+            costSource: 'estimated',
+            savingSource: 'estimated',
+        });
+        // 1,000 prompt of which 500 hit, plus 100 output at the seeded rates.
+        expect(summary.cost).toBeCloseTo((500 * 0.003 + 500 * 0.15 + 100 * 0.6) / 1_000_000, 12);
+        expect(summary.saving).toBeCloseTo(500 * (0.15 - 0.003) / 1_000_000, 12);
+    });
+
+    it('merging two summaries matches one summary of both record sets', () => {
+        const prices = createDefaultUsagePrices();
+        const first = record({ promptTokens: 1000, hitTokens: 100, missTokens: 900 });
+        const second = record({ recordId: 'rec-2', promptTokens: 10, hitTokens: 10, missTokens: 0 });
+        const merged = mergeUsageSummaries(
+            summarizeUsage([first], { prices }),
+            summarizeUsage([second], { prices }),
+        );
+        const combined = summarizeUsage([first, second], { prices });
+
+        expect(merged).toMatchObject({
+            requests: combined.requests,
+            promptTokens: combined.promptTokens,
+            hitTokens: combined.hitTokens,
+            ratedPromptTokens: combined.ratedPromptTokens,
+            hitRate: combined.hitRate,
+            coverage: combined.coverage,
+        });
+        expect(merged.cost).toBeCloseTo(combined.cost, 12);
+        expect(merged.saving).toBeCloseTo(combined.saving, 12);
+        expect(merged.hitRate).toBeCloseTo(110 / 1010, 10);
     });
 });
