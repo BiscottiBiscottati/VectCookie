@@ -9,7 +9,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
 import { installUsageObserver, getUsageObserverHealth } from '../core/usage-observer.js';
-import { UsageLedger } from '../core/usage-ledger.js';
+import { UsageLedger, USAGE_CHAT_METADATA_KEY, USAGE_ALL_TIME_STORAGE_KEY } from '../core/usage-ledger.js';
 import {
     noteGenerationStarted,
     noteGenerationEnded,
@@ -1122,5 +1122,48 @@ describe('usage pipeline — estimate fallback', () => {
             estimatedPromptTokens: null,
             hitTokens: null,
         });
+    });
+});
+
+
+describe('usage pipeline — durable ledger', () => {
+    it('writes a captured record into the chat metadata and the all-time ledger', async () => {
+        const metadata = {};
+        const items = new Map();
+        const storage = {
+            getItem: (key) => (items.has(key) ? items.get(key) : null),
+            setItem: (key, value) => items.set(key, value),
+        };
+        const saveMetadata = vi.fn(async () => {});
+        const ledger = new UsageLedger({
+            getChatId: () => 'chat-1',
+            getMetadata: () => metadata,
+            saveMetadata,
+            storage,
+        });
+        ledger.loadChat('chat-1');
+
+        const target = { fetch: vi.fn(async () => jsonResponse({
+            id: 'gen-1',
+            usage: { prompt_tokens: 1200, completion_tokens: 100, prompt_cache_hit_tokens: 900 },
+        })) };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: (record) => ledger.add(record),
+            now: () => 1_700_000_000_000,
+        });
+
+        await target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        ledger.flush();
+
+        expect(metadata[USAGE_CHAT_METADATA_KEY].records).toHaveLength(1);
+        expect(metadata[USAGE_CHAT_METADATA_KEY].records[0].promptTokens).toBe(1200);
+        expect(saveMetadata).toHaveBeenCalledTimes(1);
+        const allTime = JSON.parse(items.get(USAGE_ALL_TIME_STORAGE_KEY));
+        expect(allTime.totals.requests).toBe(1);
+        expect(allTime.chats['chat-1'].promptTokens).toBe(1200);
     });
 });

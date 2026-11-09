@@ -14,6 +14,7 @@ import {
     createDefaultUsagePrices,
     normalizeUsagePrices,
     resolveUsageCost,
+    summarizeAccumulator,
     summarizeByConfiguration,
     summarizeByOrigin,
 } from '../core/usage-stats.js';
@@ -57,7 +58,9 @@ const CARD_TITLES = {
  *
  * The optional run filter narrows every results surface (cards, configuration
  * comparison and rows) to one measurement run while the run bar still lists
- * every old run.
+ * every old run. Archived counters keep the cards counting after the 500-row
+ * cap has evicted a row; a run filter cannot attribute those rows to a run, so
+ * it falls back to the retained rows.
  *
  * @param {object} [options]
  * @param {object[]} [options.records] Newest-first records for the active chat.
@@ -67,7 +70,10 @@ const CARD_TITLES = {
  * @param {object[]} [options.runs] Newest-first measurement-run markers.
  * @param {string} [options.currentRunId] Run id owned by the ledger.
  * @param {string} [options.selectedRunId] Run to show; '' means all runs.
- * @returns {{empty: boolean, emptyMessage: string, trackingEnabled: boolean, health: object, run: object, cards: object[], configurations: object[], rows: object[], prices: object}}
+ * @param {object|null} [options.archived] Counters of the rows the cap evicted.
+ * @param {object|null} [options.allTime] All-time counters and chat count.
+ * @param {object|null} [options.retention] Retained/total row counts for the cap note.
+ * @returns {{empty: boolean, emptyMessage: string, trackingEnabled: boolean, health: object, run: object, cards: object[], configurations: object[], rows: object[], prices: object, retention: object|null, allTime: object|null}}
  */
 export function buildUsageView({
     records = [],
@@ -77,6 +83,9 @@ export function buildUsageView({
     runs = [],
     currentRunId = '',
     selectedRunId = '',
+    archived = null,
+    allTime = null,
+    retention = null,
 } = {}) {
     const priceTable = normalizeUsagePrices(prices ?? createDefaultUsagePrices());
     const allRecords = Array.isArray(records) ? records : [];
@@ -87,9 +96,18 @@ export function buildUsageView({
     const visibleRecords = selected
         ? allRecords.filter((record) => record?.runId === selected)
         : allRecords;
-    const { combined, origins } = summarizeByOrigin(visibleRecords, { prices: priceTable });
-    const configurations = summarizeByConfiguration(visibleRecords, { prices: priceTable })
-        .map((entry) => buildConfigurationRow(entry, priceTable));
+    // Evicted rows span runs and chats, so a single-run view cannot include
+    // them without lying about which run they belong to.
+    const archivedCounters = selected ? null : archived;
+    const { combined, origins } = summarizeByOrigin(visibleRecords, {
+        prices: priceTable,
+        archived: archivedCounters,
+    });
+    const configurations = summarizeByConfiguration(visibleRecords, {
+        prices: priceTable,
+        archived: archivedCounters,
+    }).map((entry) => buildConfigurationRow(entry, priceTable));
+    const retentionNote = buildRetention(retention, { selectedRunId: selected });
 
     return {
         trackingEnabled,
@@ -104,6 +122,48 @@ export function buildUsageView({
         configurations,
         rows: visibleRecords.map((record) => buildRow(record, priceTable)),
         prices: priceTable,
+        retention: retentionNote,
+        allTime: buildAllTime(allTime, priceTable),
+    };
+}
+
+function buildRetention(retention, { selectedRunId = '' } = {}) {
+    if (!retention || !Number.isFinite(retention.limit) || !Number.isFinite(retention.retained)) return null;
+    const limit = Math.max(0, Math.floor(retention.limit));
+    const retained = Math.max(0, Math.floor(retention.retained));
+    const total = Math.max(retained, Math.floor(Number(retention.total) || 0));
+    const capped = total > retained;
+    // Under a run filter the cards and table use retained rows only, so the
+    // all-record counters must not be claimed as the totals above.
+    if (selectedRunId) {
+        return {
+            limit,
+            retained,
+            total,
+            capped: false,
+            // Archived counters cannot be attributed to a run, so this view
+            // cannot include rows the cap evicted. Say so instead of letting
+            // the comparison look complete.
+            label: `Showing this measurement run only; records the ${formatCount(limit)}-record cap evicted are not included. Each chat keeps its newest ${formatCount(limit)} records.`,
+        };
+    }
+    // `total` counts every retained/evicted record, including failed and
+    // aborted attempts, while the cards count completed requests only.
+    const label = capped
+        ? `Showing the newest ${formatCount(limit)} of ${formatCount(total)} records. Request totals above exclude failed and aborted rows.`
+        : `Showing all ${formatCount(total)} records. Each chat keeps its newest ${formatCount(limit)}.`;
+    return { limit, retained, total, capped, label };
+}
+
+function buildAllTime(allTime, prices) {
+    const totals = allTime?.totals;
+    const chats = Math.max(0, Math.floor(Number(allTime?.chats) || 0));
+    if (!totals || chats === 0) return null;
+    const card = buildCard('all-time', summarizeAccumulator(totals), prices);
+    return {
+        ...card,
+        title: 'All time · all chats',
+        detailLabel: `${formatCountLabel(chats, 'chat')} · ${card.requestsLabel}`,
     };
 }
 
@@ -377,7 +437,15 @@ function formatTime(timestamp) {
  *
  * @param {object} [options]
  * @param {object} [options.settings] VectFox settings object.
- * @param {{recordsFor: (chatId: string|null) => object[]}} [options.ledger]
+ * @param {object} [options.ledger] Durable ledger. The panel reads records,
+ *   runs, current run, archived counters, retention counts and all-time totals;
+ *   it never writes to it.
+ * @param {(chatId: string|null) => object[]} [options.ledger.recordsFor]
+ * @param {(chatId: string|null) => object[]} [options.ledger.runsFor]
+ * @param {(chatId: string|null) => (string|null)} [options.ledger.currentRunIdFor]
+ * @param {(chatId: string|null) => object} [options.ledger.archivedFor]
+ * @param {(chatId: string|null) => object} [options.ledger.retentionFor]
+ * @param {() => object} [options.ledger.allTimeForView]
  * @param {() => (string|null)} [options.getChatId]
  * @param {() => (object|null)} [options.getHealth] Observer health counters.
  * @param {(enabled: boolean) => void} [options.onTrackingChange] Persists the
@@ -425,6 +493,9 @@ export function initializeUsagePanel({
             runs: ledger?.runsFor?.(chatId) ?? [],
             currentRunId: ledger?.currentRunIdFor?.(chatId) ?? '',
             selectedRunId,
+            archived: ledger?.archivedFor?.(chatId) ?? null,
+            retention: ledger?.retentionFor?.(chatId) ?? null,
+            allTime: ledger?.allTimeForView?.() ?? null,
         });
     };
     const refresh = () => {
@@ -538,6 +609,7 @@ function renderPanel(view) {
             <div class="vectfox-usage-health vectfox-usage-health-${StringUtils.escapeHtml(view.health.state)}" role="status">
                 ${StringUtils.escapeHtml(view.health.label)}
             </div>
+            ${renderAllTime(view.allTime)}
             ${renderRunBar(view.run)}
             <div class="vectfox-usage-results">
                 ${renderResults(view)}
@@ -572,8 +644,18 @@ function renderRunBar(run) {
 }
 
 function renderResults(view) {
-    if (view.empty) return renderEmpty(view);
-    return `${renderCards(view.cards)}${renderConfigurationTable(view.configurations)}${renderTable(view.rows)}`;
+    if (view.empty) return `${renderRetention(view.retention)}${renderEmpty(view)}`;
+    return `${renderCards(view.cards)}${renderRetention(view.retention)}${renderConfigurationTable(view.configurations)}${renderTable(view.rows)}`;
+}
+
+function renderRetention(retention) {
+    if (!retention) return '';
+    return `<div class="vectfox-usage-retention" data-usage-retention>${StringUtils.escapeHtml(retention.label)}</div>`;
+}
+
+function renderAllTime(allTime) {
+    if (!allTime) return '';
+    return `<div class="vectfox-usage-alltime" data-usage-alltime>${renderCard(allTime, 'vectfox-usage-card-alltime')}</div>`;
 }
 
 function renderConfigurationTable(rows) {
@@ -633,12 +715,12 @@ function renderCards(cards) {
     return `<div class="vectfox-usage-cards">${cards.map(renderCard).join('')}</div>`;
 }
 
-function renderCard(card) {
+function renderCard(card, className = '') {
     return `
-        <section class="vectfox-usage-card" data-usage-card="${StringUtils.escapeHtml(card.scope)}">
+        <section class="vectfox-usage-card ${className}" data-usage-card="${StringUtils.escapeHtml(card.scope)}">
             <header class="vectfox-usage-card-header">
                 <h4>${StringUtils.escapeHtml(card.title)}</h4>
-                <span>${StringUtils.escapeHtml(card.requestsLabel)}</span>
+                <span>${StringUtils.escapeHtml(card.detailLabel ?? card.requestsLabel)}</span>
             </header>
             <dl class="vectfox-usage-card-metrics">
                 ${renderMetric('prompt', 'Prompt', card.promptLabel, card.promptSource)}

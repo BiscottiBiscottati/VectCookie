@@ -11,6 +11,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 import { buildUsageView, initializeUsagePanel } from '../ui/usage-panel.js';
+import { createUsageAccumulator } from '../core/usage-stats.js';
 
 function measuredRecord(overrides = {}) {
     return {
@@ -822,5 +823,347 @@ describe('usage panel — measurement runs smoke', () => {
 
         expect(panel.querySelector('[data-usage-run-select]').value).toBe('run-new');
         expect(panel.textContent).toMatch(/no requests in this measurement run/i);
+    });
+});
+
+function accumulator(overrides = {}) {
+    return { ...createUsageAccumulator(), ...overrides };
+}
+
+describe('usage view model — durable totals', () => {
+    it('adds the archived counters of capped rows to the cards and configurations', () => {
+        const archived = {
+            total: accumulator({
+                requests: 1,
+                measuredRequests: 1,
+                ratedRequests: 1,
+                coveredRequests: 1,
+                promptTokens: 2000,
+                hitTokens: 1000,
+                ratedPromptTokens: 2000,
+            }),
+            byOrigin: {
+                story: accumulator({
+                    requests: 1,
+                    measuredRequests: 1,
+                    ratedRequests: 1,
+                    coveredRequests: 1,
+                    promptTokens: 2000,
+                    hitTokens: 1000,
+                    ratedPromptTokens: 2000,
+                }),
+            },
+            byConfiguration: {
+                'ghost:on:batch:30:keep:10': {
+                    configuration: batchThirty,
+                    accumulator: accumulator({
+                        requests: 1,
+                        measuredRequests: 1,
+                        ratedRequests: 1,
+                        coveredRequests: 1,
+                        promptTokens: 2000,
+                        hitTokens: 1000,
+                        ratedPromptTokens: 2000,
+                    }),
+                },
+            },
+        };
+
+        const view = buildUsageView({
+            records: [deepseekRecord({ recordId: 'retained', promptTokens: 1000, hitTokens: 500, configuration: batchOne })],
+            trackingEnabled: true,
+            prices: deepseekPrices,
+            archived,
+        });
+
+        expect(view.cards[0]).toMatchObject({
+            requestsLabel: '2 requests',
+            promptLabel: '3,000',
+            hitLabel: '1,500',
+            hitRateLabel: '50.0%',
+        });
+        expect(view.configurations.map((entry) => entry.label)).toEqual([
+            'Ghosting on · batch 1 · keep 10',
+            'Ghosting on · batch 30 · keep 10',
+        ]);
+        expect(view.configurations[1]).toMatchObject({ requestsLabel: '1 request', hitRateLabel: '50.0%' });
+    });
+
+    it('states the 500-record cap and that the totals include the dropped rows', () => {
+        const view = buildUsageView({
+            records: [measuredRecord()],
+            trackingEnabled: true,
+            retention: { limit: 500, retained: 1, total: 640 },
+        });
+
+        expect(view.retention).toMatchObject({ limit: 500, retained: 1, total: 640, capped: true });
+        expect(view.retention.label).toMatch(/newest 500 of 640 records/i);
+        expect(view.retention.label).toMatch(/exclude failed and aborted rows/i);
+    });
+
+    it('states the cap even when nothing has been dropped yet', () => {
+        const view = buildUsageView({
+            records: [measuredRecord()],
+            trackingEnabled: true,
+            retention: { limit: 500, retained: 1, total: 1 },
+        });
+
+        expect(view.retention.capped).toBe(false);
+        expect(view.retention.label).toMatch(/newest 500/i);
+    });
+
+    it('shows the all-time total across chats from the stored buckets', () => {
+        const view = buildUsageView({
+            records: [measuredRecord()],
+            trackingEnabled: true,
+            prices: deepseekPrices,
+            allTime: {
+                totals: accumulator({
+                    requests: 3,
+                    measuredRequests: 3,
+                    ratedRequests: 3,
+                    coveredRequests: 3,
+                    promptTokens: 3000,
+                    hitTokens: 1500,
+                    ratedPromptTokens: 3000,
+                }),
+                chats: 2,
+            },
+        });
+
+        expect(view.allTime).toMatchObject({
+            title: 'All time · all chats',
+            requestsLabel: '3 requests',
+            detailLabel: '2 chats · 3 requests',
+            hitRateLabel: '50.0%',
+        });
+    });
+
+    it('ignores archived rows under a single-run filter because they cannot be attributed to a run', () => {
+        const view = buildUsageView({
+            records: [measuredRecord({ recordId: 'rec-a', runId: 'run-a' })],
+            trackingEnabled: true,
+            runs: runsFixture,
+            selectedRunId: 'run-a',
+            archived: {
+                total: accumulator({ requests: 1, measuredRequests: 1, coveredRequests: 1, promptTokens: 2000 }),
+                byOrigin: {},
+                byConfiguration: {},
+            },
+        });
+
+        expect(view.cards[0].requestsLabel).toBe('1 request');
+        expect(view.cards[0].promptLabel).toBe('1,200');
+    });
+});
+
+describe('usage view model — durable metric labels', () => {
+    it('labels an estimated-only all-time card without inventing a hit rate or a cost', () => {
+        const view = buildUsageView({
+            records: [],
+            trackingEnabled: true,
+            allTime: {
+                totals: accumulator({
+                    requests: 1,
+                    estimatedRequests: 1,
+                    estimatedPromptRequests: 1,
+                    estimatedPromptTokens: 480,
+                }),
+                chats: 1,
+            },
+        });
+
+        expect(view.allTime).toMatchObject({
+            requestsLabel: '1 request',
+            promptLabel: '~480',
+            promptSource: 'estimated',
+            hitLabel: '—',
+            hitSource: 'unavailable',
+            hitRateLabel: '—',
+            hitRateSource: 'unavailable',
+            coverageLabel: '0.0%',
+            coverageSource: 'estimated',
+            costLabel: '—',
+            costSource: 'unavailable',
+            savingLabel: '—',
+            savingSource: 'unavailable',
+        });
+    });
+
+    it('labels an unavailable-only all-time card with no prompt and no coverage source', () => {
+        const view = buildUsageView({
+            records: [],
+            trackingEnabled: true,
+            allTime: {
+                totals: accumulator({ requests: 1, unavailableRequests: 1 }),
+                chats: 1,
+            },
+        });
+
+        expect(view.allTime).toMatchObject({
+            promptLabel: '—',
+            promptSource: 'unavailable',
+            coverageLabel: '0.0%',
+            coverageSource: 'unavailable',
+            hitRateSource: 'unavailable',
+        });
+    });
+
+    it('mixes measured and estimated archived rows and keeps every source honest', () => {
+        const view = buildUsageView({
+            records: [],
+            trackingEnabled: true,
+            prices: deepseekPrices,
+            allTime: {
+                totals: accumulator({
+                    requests: 2,
+                    measuredRequests: 1,
+                    estimatedRequests: 1,
+                    ratedRequests: 1,
+                    coveredRequests: 1,
+                    estimatedPromptRequests: 1,
+                    promptTokens: 1000,
+                    estimatedPromptTokens: 500,
+                    hitTokens: 500,
+                    ratedPromptTokens: 1000,
+                    costMeasured: 0.0001,
+                    costMeasuredRequests: 1,
+                    costEstimated: 0.0002,
+                    costEstimatedRequests: 1,
+                    savingMeasured: 0.00005,
+                    savingMeasuredRequests: 1,
+                    savingEstimated: 0.00001,
+                    savingEstimatedRequests: 1,
+                }),
+                chats: 1,
+            },
+        });
+
+        expect(view.allTime).toMatchObject({
+            promptLabel: '1,000 + ~500',
+            promptSource: 'estimated',
+            hitRateLabel: '50.0%',
+            hitRateSource: 'measured',
+            coverageLabel: '66.7%',
+            coverageSource: 'estimated',
+            costLabel: '$0.00030000',
+            costSource: 'estimated',
+            savingLabel: '$0.00006000',
+            savingSource: 'estimated',
+        });
+    });
+});
+
+describe('usage view model — cap note under a run filter', () => {
+    it('does not claim the all-record totals when one run is selected', () => {
+        const view = buildUsageView({
+            records: [measuredRecord({ recordId: 'rec-a', runId: 'run-a' })],
+            trackingEnabled: true,
+            runs: runsFixture,
+            selectedRunId: 'run-a',
+            retention: { limit: 500, retained: 1, total: 640 },
+        });
+
+        expect(view.retention).toMatchObject({ capped: false });
+        expect(view.retention.label).toMatch(/measurement run only/i);
+        expect(view.retention.label).toMatch(/cap evicted are not included/i);
+        expect(view.retention.label).toMatch(/newest 500/i);
+        expect(view.retention.label).not.toMatch(/640/);
+    });
+
+    it('still shows the empty-run message when the chat is over the cap', () => {
+        const view = buildUsageView({
+            records: [measuredRecord({ recordId: 'rec-a', runId: 'run-a' })],
+            trackingEnabled: true,
+            runs: runsFixture,
+            selectedRunId: 'run-b',
+            retention: { limit: 500, retained: 1, total: 640 },
+        });
+
+        expect(view.empty).toBe(true);
+        expect(view.emptyMessage).toMatch(/no requests in this measurement run/i);
+    });
+});
+
+describe('usage panel — empty run with a capped chat', () => {
+    beforeEach(() => {
+        document.body.innerHTML = '';
+    });
+
+    it('keeps the cap disclosure when the selected run has no retained rows', () => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+        const settings = { usage_tracking_enabled: true };
+        const ledger = {
+            recordsFor: () => [measuredRecord({ recordId: 'rec-a', runId: 'run-a' })],
+            runsFor: () => runsFixture,
+            currentRunIdFor: () => 'run-b',
+            retentionFor: () => ({ limit: 500, retained: 500, total: 640 }),
+        };
+
+        initializeUsagePanel({ settings, ledger, getChatId: () => 'chat-1' });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        const select = panel.querySelector('[data-usage-run-select]');
+        select.value = 'run-b';
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+
+        expect(panel.textContent).toMatch(/no requests in this measurement run/i);
+        expect(panel.textContent).toMatch(/cap evicted are not included/i);
+    });
+});
+
+describe('usage panel — durable totals smoke', () => {
+    beforeEach(() => {
+        document.body.innerHTML = '';
+    });
+
+    it('renders the retention note, the all-time card and archived totals', () => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+        const settings = { usage_tracking_enabled: true };
+        const ledger = {
+            recordsFor: () => [measuredRecord()],
+            runsFor: () => [],
+            currentRunIdFor: () => '',
+            archivedFor: () => ({
+                total: accumulator({
+                    requests: 1,
+                    measuredRequests: 1,
+                    ratedRequests: 1,
+                    coveredRequests: 1,
+                    promptTokens: 1000,
+                    hitTokens: 500,
+                    ratedPromptTokens: 1000,
+                }),
+                byOrigin: {},
+                byConfiguration: {},
+            }),
+            retentionFor: () => ({ limit: 500, retained: 500, total: 640 }),
+            allTimeForView: () => ({
+                totals: accumulator({
+                    requests: 2,
+                    measuredRequests: 2,
+                    ratedRequests: 2,
+                    coveredRequests: 2,
+                    promptTokens: 2000,
+                    hitTokens: 1000,
+                    ratedPromptTokens: 2000,
+                }),
+                chats: 1,
+            }),
+        };
+
+        initializeUsagePanel({
+            settings,
+            ledger,
+            getChatId: () => 'chat-1',
+            getHealth: () => ({ matched: 2, captured: 2, skipped: 0, errors: 0 }),
+        });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        expect(panel.textContent).toMatch(/newest 500 of 640 records/i);
+        expect(panel.querySelector('[data-usage-alltime]')).not.toBeNull();
+        expect(panel.textContent).toMatch(/All time · all chats/);
+        expect(panel.textContent).toMatch(/2 requests/);
+        expect(panel.querySelector('[data-usage-card="all"]').textContent).toMatch(/2 requests/);
     });
 });
