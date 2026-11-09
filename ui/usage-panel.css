@@ -112,3 +112,125 @@
 .vectfox-usage-source-unavailable {
     opacity: 0.7;
 }
+
+
+/* Summary cards ------------------------------------------------------------ */
+
+.vectfox-usage-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+}
+
+.vectfox-usage-card {
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.12));
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.12));
+}
+
+.vectfox-usage-card-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.vectfox-usage-card-header h4 {
+    margin: 0;
+    font-size: 0.9em;
+    font-weight: 600;
+}
+
+.vectfox-usage-card-header span {
+    font-size: 0.78em;
+    opacity: 0.7;
+    white-space: nowrap;
+}
+
+.vectfox-usage-card-metrics {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 12px;
+    margin: 0;
+}
+
+.vectfox-usage-metric dt {
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.6;
+}
+
+.vectfox-usage-metric dd {
+    margin: 0;
+    font-size: 0.88em;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.vectfox-usage-metric small {
+    font-size: 0.78em;
+    opacity: 0.75;
+    margin-left: 2px;
+}
+
+.vectfox-usage-metric-note {
+    display: block;
+    margin-left: 0;
+    opacity: 0.55;
+}
+
+.vectfox-usage-source-estimated {
+    color: var(--vectfox-warning, #f59e0b);
+}
+
+/* Price table -------------------------------------------------------------- */
+
+.vectfox-usage-prices {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.vectfox-usage-prices h4 {
+    margin: 0;
+}
+
+.vectfox-usage-price-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    font-size: 0.85em;
+}
+
+.vectfox-usage-price-meta label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.vectfox-usage-price-meta input {
+    width: 110px;
+}
+
+.vectfox-usage-price-table input {
+    width: 84px;
+    padding: 3px 5px;
+}
+
+.vectfox-usage-price-table input[data-usage-price-field="provider"],
+.vectfox-usage-price-table input[data-usage-price-field="model"] {
+    width: 140px;
+}
+
+.vectfox-usage-price-table button {
+    white-space: nowrap;
+}
+
+.vectfox-usage-table .num small {
+    font-size: 0.8em;
+    opacity: 0.75;
+    margin-left: 2px;
+}

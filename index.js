@@ -53,6 +53,8 @@ import { CJK_TOKENIZER_MODES, setCjkTokenizerMode, ensureJiebaTokenizerLoaded, e
 import { installUsageObserver, getUsageObserverHealth } from './core/usage-observer.js';
 import { noteGenerationStarted, noteGenerationEnded } from './core/usage-attribution.js';
 import { UsageLedger } from './core/usage-ledger.js';
+import { createDefaultUsagePrices } from './core/usage-stats.js';
+import { createPromptTokenEstimator } from './core/usage-estimator.js';
 import { initializeUsagePanel } from './ui/usage-panel.js';
 
 // SillyTavern display label — NOT the settings key. For settings, use 'vectfox' (lowercase).
@@ -297,6 +299,10 @@ const defaultSettings = {
     // default; while off, window.fetch is not wrapped at all. While on, the
     // wrapper only clones and reads the response. See core/usage-observer.js.
     usage_tracking_enabled: false,
+    // Editable price table for providers that do not report cost. Seeded with
+    // documented DeepSeek Flash rates; output is priced for display but never
+    // counted in the cache saving. See core/usage-stats.js.
+    usage_prices: createDefaultUsagePrices(),
     // Per-chat marker: auto-sync only processes windows whose start >= marker.
     // Stamped at "max(source_window_end across existing events) + 1" when auto-sync
     // is enabled on a non-empty collection, or at current chat length when collection
@@ -773,13 +779,25 @@ jQuery(async () => {
         eventSource.on(event_types.GENERATION_ENDED, () => noteGenerationEnded());
         eventSource.on(event_types.GENERATION_STOPPED, () => noteGenerationEnded());
     };
+    // Prompt-token estimate for providers that omit usage. The tokenizer is
+    // imported lazily, so an unavailable one leaves the row "unavailable"
+    // instead of breaking the extension.
+    const estimatePromptTokens = createPromptTokenEstimator({
+        loadTokenizer: () => import('../../../../scripts/tokenizers.js'),
+    });
+
     let refreshUsagePanel = () => {};
+    const persistUsageSettings = () => {
+        Object.assign(extension_settings.vectfox, settings);
+        saveSettingsDebounced();
+    };
     const installUsageTelemetry = () => {
         bindUsageGenerationState();
         return installUsageObserver({
             isEnabled: () => !!settings.usage_tracking_enabled,
             getChatId: getActiveChatId,
             getConfig: readUsageConfiguration,
+            estimatePromptTokens,
             handleRecord: (record) => usageLedger.add(record),
             // Refresh on settle, not on record: a skipped body or a failed
             // capture writes no record but still changes the health line.
@@ -795,10 +813,10 @@ jQuery(async () => {
         getChatId: getActiveChatId,
         getHealth: () => getUsageObserverHealth(),
         onTrackingChange: (enabled) => {
-            Object.assign(extension_settings.vectfox, settings);
-            saveSettingsDebounced();
+            persistUsageSettings();
             if (enabled) installUsageTelemetry();
         },
+        onPricesChange: persistUsageSettings,
     });
 
     // Initialize auto-sync checkbox state for current chat (if any)
