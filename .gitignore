@@ -7,6 +7,9 @@ docs/*.md
 VECTOR_LIST.md
 .mcp.json
 
+# Local issue tracker, specs and handoffs — intentionally not committed
+.scratch/
+
 node_modules/
 .playwright-auth.json
 docs/

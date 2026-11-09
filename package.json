@@ -4,6 +4,9 @@
   "description": "Automated tests for VectFox RAG extension",
   "type": "module",
   "scripts": {
+    "check": "npm run check:syntax && vitest run",
+    "check:syntax": "node scripts/check-syntax.mjs",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
