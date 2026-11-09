@@ -14,6 +14,7 @@ import {
     createDefaultUsagePrices,
     normalizeUsagePrices,
     resolveUsageCost,
+    summarizeByConfiguration,
     summarizeByOrigin,
 } from '../core/usage-stats.js';
 
@@ -21,6 +22,7 @@ const EMPTY_OFF =
     'Tracking is off. Turn on "Track token usage" to start measuring provider-reported tokens and caching.';
 const EMPTY_ON =
     'Tracking is on. Send a message and the next chat-completion request will appear here.';
+const EMPTY_RUN = 'No requests in this measurement run yet.';
 const PLACEHOLDER = '—';
 const NUMBER_FORMAT = new Intl.NumberFormat('en-US');
 const PERCENT_FORMAT = new Intl.NumberFormat('en-US', {
@@ -53,29 +55,145 @@ const CARD_TITLES = {
 /**
  * Turns ledger records into the labels the tab renders.
  *
+ * The optional run filter narrows every results surface (cards, configuration
+ * comparison and rows) to one measurement run while the run bar still lists
+ * every old run.
+ *
  * @param {object} [options]
  * @param {object[]} [options.records] Newest-first records for the active chat.
  * @param {boolean} [options.trackingEnabled] Whether the observer is capturing.
  * @param {object|null} [options.health] Observer health counters, when installed.
  * @param {object|null} [options.prices] Editable price table.
- * @returns {{empty: boolean, emptyMessage: string, trackingEnabled: boolean, health: object, cards: object[], rows: object[], prices: object}}
+ * @param {object[]} [options.runs] Newest-first measurement-run markers.
+ * @param {string} [options.currentRunId] Run id owned by the ledger.
+ * @param {string} [options.selectedRunId] Run to show; '' means all runs.
+ * @returns {{empty: boolean, emptyMessage: string, trackingEnabled: boolean, health: object, run: object, cards: object[], configurations: object[], rows: object[], prices: object}}
  */
-export function buildUsageView({ records = [], trackingEnabled = false, health = null, prices = null } = {}) {
+export function buildUsageView({
+    records = [],
+    trackingEnabled = false,
+    health = null,
+    prices = null,
+    runs = [],
+    currentRunId = '',
+    selectedRunId = '',
+} = {}) {
     const priceTable = normalizeUsagePrices(prices ?? createDefaultUsagePrices());
-    const { combined, origins } = summarizeByOrigin(records, { prices: priceTable });
+    const allRecords = Array.isArray(records) ? records : [];
+    const runList = (Array.isArray(runs) ? runs : [])
+        .filter((run) => run && typeof run.runId === 'string' && run.runId);
+    const selected = typeof selectedRunId === 'string' ? selectedRunId : '';
+    const current = typeof currentRunId === 'string' ? currentRunId : '';
+    const visibleRecords = selected
+        ? allRecords.filter((record) => record?.runId === selected)
+        : allRecords;
+    const { combined, origins } = summarizeByOrigin(visibleRecords, { prices: priceTable });
+    const configurations = summarizeByConfiguration(visibleRecords, { prices: priceTable })
+        .map((entry) => buildConfigurationRow(entry, priceTable));
 
     return {
         trackingEnabled,
         health: describeObserverHealth({ trackingEnabled, health }),
-        empty: records.length === 0,
-        emptyMessage: trackingEnabled ? EMPTY_ON : EMPTY_OFF,
+        empty: visibleRecords.length === 0,
+        emptyMessage: describeEmpty({ trackingEnabled, selectedRunId: selected, allRecords }),
+        run: buildRunBar({ runs: runList, records: allRecords, currentRunId: current, selectedRunId: selected }),
         cards: [
             buildCard('all', combined, priceTable),
             ...origins.map((summary) => buildCard(summary.origin, summary, priceTable)),
         ],
-        rows: records.map((record) => buildRow(record, priceTable)),
+        configurations,
+        rows: visibleRecords.map((record) => buildRow(record, priceTable)),
         prices: priceTable,
     };
+}
+
+function describeEmpty({ trackingEnabled, selectedRunId, allRecords }) {
+    if (selectedRunId && allRecords.length > 0) return EMPTY_RUN;
+    return trackingEnabled ? EMPTY_ON : EMPTY_OFF;
+}
+
+function buildRunBar({ runs, records, currentRunId, selectedRunId }) {
+    const requestCounts = new Map();
+    for (const record of records) {
+        if (!record?.runId) continue;
+        requestCounts.set(record.runId, (requestCounts.get(record.runId) ?? 0) + 1);
+    }
+
+    const current = runs.find((run) => run.runId === currentRunId) ?? null;
+    return {
+        currentRunId: current?.runId ?? '',
+        currentLabel: current?.label ?? 'No measurement run',
+        selectedRunId,
+        options: [
+            buildRunOption({
+                runId: '',
+                label: 'All runs',
+                startedLabel: '',
+                requestCount: records.length,
+                selected: selectedRunId === '',
+            }),
+            ...runs.map((run) => buildRunOption({
+                runId: run.runId,
+                label: run.label || run.runId,
+                startedLabel: formatLocalTime(run.startedAt, { includeDate: true }),
+                requestCount: requestCounts.get(run.runId) ?? 0,
+                selected: run.runId === selectedRunId,
+            })),
+        ],
+    };
+}
+
+function buildRunOption({ runId, label, startedLabel, requestCount, selected }) {
+    const detail = [
+        startedLabel,
+        formatCountLabel(requestCount, 'record'),
+    ].filter(Boolean).join(' · ');
+    return {
+        runId,
+        label,
+        selected,
+        optionLabel: `${label} · ${detail}`,
+    };
+}
+
+function formatLocalTime(timestamp, { includeDate = false, includeSeconds = false } = {}) {
+    if (!Number.isFinite(timestamp)) return '';
+    const date = new Date(timestamp);
+    const pad = (part) => String(part).padStart(2, '0');
+    const clock = `${pad(date.getHours())}:${pad(date.getMinutes())}${includeSeconds ? `:${pad(date.getSeconds())}` : ''}`;
+    return includeDate ? `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${clock}` : clock;
+}
+
+function buildConfigurationRow(entry, prices) {
+    const requests = Number(entry.requests) || 0;
+    return {
+        key: entry.key,
+        label: formatConfigurationLabel(entry.configuration),
+        requestsLabel: formatRequests(requests),
+        averagePromptLabel: entry.averagePromptTokens == null
+            ? PLACEHOLDER
+            : formatCount(Math.round(entry.averagePromptTokens)),
+        averagePromptSource: entry.averagePromptSource ?? 'unavailable',
+        hitRateLabel: formatPercent(entry.hitRate),
+        hitRateSource: entry.hitRate == null ? 'unavailable' : 'measured',
+        hitRateNote: formatHitRateNote(entry),
+        costPerRequestLabel: formatCost(entry.costPerRequest, prices.currency, entry.costPerRequestSource),
+        costPerRequestSource: usageSourceLabel(entry.costPerRequestSource),
+        savingLabel: formatCost(entry.saving, prices.currency, entry.savingSource),
+        savingSource: usageSourceLabel(entry.savingSource),
+    };
+}
+
+function formatConfigurationLabel(configuration) {
+    if (!configuration) return 'Configuration unknown';
+    const state = configuration.ghostEnabled ? 'Ghosting on' : 'Ghosting off';
+    const batch = Number.isFinite(configuration.ghostBatchSize)
+        ? `batch ${configuration.ghostBatchSize}`
+        : 'batch unknown';
+    const keep = Number.isFinite(configuration.ghostKeepRecent)
+        ? `keep ${configuration.ghostKeepRecent}`
+        : 'keep unknown';
+    return `${state} · ${batch} · ${keep}`;
 }
 
 /**
@@ -129,7 +247,7 @@ function buildCard(scope, summary, prices) {
     return {
         scope,
         title: CARD_TITLES[scope] ?? scope,
-        requestsLabel: `${NUMBER_FORMAT.format(requests)} request${requests === 1 ? '' : 's'}`,
+        requestsLabel: formatRequests(requests),
         promptLabel: formatCardPrompt(summary),
         promptSource,
         hitLabel: formatCount(summary.hitTokens),
@@ -140,9 +258,9 @@ function buildCard(scope, summary, prices) {
         coverageLabel: formatPercent(summary.coverage),
         coverageSource,
         costLabel: formatCost(summary.cost, prices.currency, summary.costSource),
-        costSource: SOURCE_LABELS[summary.costSource] ?? SOURCE_LABELS.unavailable,
+        costSource: usageSourceLabel(summary.costSource),
         savingLabel: formatCost(summary.saving, prices.currency, summary.savingSource),
-        savingSource: SOURCE_LABELS[summary.savingSource] ?? SOURCE_LABELS.unavailable,
+        savingSource: usageSourceLabel(summary.savingSource),
     };
 }
 
@@ -165,10 +283,10 @@ function buildRow(record, prices) {
         missLabel: formatCount(record.missTokens),
         totalLabel: formatCount(record.totalTokens),
         costLabel: formatCost(cost.cost, prices.currency, cost.costSource),
-        costSource: SOURCE_LABELS[cost.costSource] ?? SOURCE_LABELS.unavailable,
+        costSource: usageSourceLabel(cost.costSource),
         savingLabel: formatCost(cost.saving, prices.currency, cost.savingSource),
-        savingSource: SOURCE_LABELS[cost.savingSource] ?? SOURCE_LABELS.unavailable,
-        sourceLabel: SOURCE_LABELS[record.usageSource] ?? SOURCE_LABELS.unavailable,
+        savingSource: usageSourceLabel(cost.savingSource),
+        sourceLabel: usageSourceLabel(record.usageSource),
     };
 }
 
@@ -180,7 +298,9 @@ function formatOrigin(record) {
 }
 
 function formatHitRateNote(summary) {
-    const promptTokens = Number(summary.promptTokens) || 0;
+    // Estimated prompt tokens count as uncovered prompt, so a group with a
+    // measured rate over part of its prompt must disclose the whole scope.
+    const promptTokens = (Number(summary.promptTokens) || 0) + (Number(summary.estimatedPromptTokens) || 0);
     const ratedPromptTokens = Number(summary.ratedPromptTokens) || 0;
     if (ratedPromptTokens > 0 && ratedPromptTokens < promptTokens) {
         return `${NUMBER_FORMAT.format(ratedPromptTokens)} of ${NUMBER_FORMAT.format(promptTokens)} prompt tokens`;
@@ -206,6 +326,18 @@ function formatHitRate(record) {
 
 function formatPercent(value) {
     return Number.isFinite(value) ? PERCENT_FORMAT.format(value) : PLACEHOLDER;
+}
+
+function usageSourceLabel(source) {
+    return SOURCE_LABELS[source] ?? SOURCE_LABELS.unavailable;
+}
+
+function formatRequests(count) {
+    return formatCountLabel(count, 'request');
+}
+
+function formatCountLabel(count, noun) {
+    return `${NUMBER_FORMAT.format(count)} ${noun}${count === 1 ? '' : 's'}`;
 }
 
 function formatCost(value, currency, source = 'estimated') {
@@ -237,9 +369,7 @@ function formatCount(value) {
 
 function formatTime(timestamp) {
     if (!Number.isFinite(timestamp)) return PLACEHOLDER;
-    const date = new Date(timestamp);
-    const pad = (part) => String(part).padStart(2, '0');
-    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    return formatLocalTime(timestamp, { includeSeconds: true });
 }
 
 /**
@@ -254,6 +384,7 @@ function formatTime(timestamp) {
  *   toggle and installs the observer when it turns on.
  * @param {(prices: object) => void} [options.onPricesChange] Persists the
  *   edited price table.
+ * @param {() => void} [options.onRunStart] Opens a new measurement run.
  * @returns {() => void} Refresh callback.
  */
 export function initializeUsagePanel({
@@ -263,6 +394,7 @@ export function initializeUsagePanel({
     getHealth = () => null,
     onTrackingChange,
     onPricesChange,
+    onRunStart,
 } = {}) {
     const container = document.getElementById('VectFox_usage_panel');
     if (!container) return () => {};
@@ -273,12 +405,28 @@ export function initializeUsagePanel({
     };
     ensurePrices();
 
-    const buildView = () => buildUsageView({
-        records: ledger?.recordsFor?.(getChatId()) ?? [],
-        trackingEnabled: !!settings.usage_tracking_enabled,
-        health: getHealth?.() ?? null,
-        prices: settings.usage_prices,
-    });
+    // Run filter lives in the panel, not in settings: it is a view choice, not
+    // a persisted preference, and '' means "show every run". Runs are per chat,
+    // so a chat switch resets the filter instead of showing an empty table for
+    // a run that belongs to the previous chat.
+    let selectedRunId = '';
+    let lastChatId = getChatId();
+    const buildView = () => {
+        const chatId = getChatId();
+        if (chatId !== lastChatId) {
+            lastChatId = chatId;
+            selectedRunId = '';
+        }
+        return buildUsageView({
+            records: ledger?.recordsFor?.(chatId) ?? [],
+            trackingEnabled: !!settings.usage_tracking_enabled,
+            health: getHealth?.() ?? null,
+            prices: settings.usage_prices,
+            runs: ledger?.runsFor?.(chatId) ?? [],
+            currentRunId: ledger?.currentRunIdFor?.(chatId) ?? '',
+            selectedRunId,
+        });
+    };
     const refresh = () => {
         container.innerHTML = renderPanel(buildView());
     };
@@ -290,10 +438,7 @@ export function initializeUsagePanel({
             refresh();
             return;
         }
-        const view = buildView();
-        results.innerHTML = view.empty
-            ? renderEmpty(view)
-            : `${renderCards(view.cards)}${renderTable(view.rows)}`;
+        results.innerHTML = renderResults(buildView());
     };
 
     if (container.dataset.usagePanelBound !== '1') {
@@ -304,6 +449,13 @@ export function initializeUsagePanel({
                 settings.usage_tracking_enabled = enabled;
                 onTrackingChange?.(enabled);
                 refresh();
+                return;
+            }
+            if (target?.matches?.('[data-usage-run-select]')) {
+                selectedRunId = target.value || '';
+                // Filtering only changes the results: leave the select the
+                // user just operated in place instead of rebuilding it.
+                refreshResults();
                 return;
             }
             if (!target?.dataset) return;
@@ -329,6 +481,17 @@ export function initializeUsagePanel({
 
         container.addEventListener('click', (event) => {
             const target = event.target;
+            if (target?.closest?.('[data-usage-run-start]')) {
+                onRunStart?.();
+                // With a run filtered, point the table at the new run or its
+                // first records would be invisible; under All runs the new
+                // records already show.
+                if (selectedRunId) {
+                    selectedRunId = ledger?.currentRunIdFor?.(getChatId()) ?? selectedRunId;
+                }
+                refresh();
+                return;
+            }
             if (target?.closest?.('[data-usage-price-add]')) {
                 ensurePrices().entries.push({ provider: '', model: '', hit: null, miss: null, output: null, cacheWrite: null });
                 onPricesChange?.(settings.usage_prices);
@@ -375,12 +538,95 @@ function renderPanel(view) {
             <div class="vectfox-usage-health vectfox-usage-health-${StringUtils.escapeHtml(view.health.state)}" role="status">
                 ${StringUtils.escapeHtml(view.health.label)}
             </div>
+            ${renderRunBar(view.run)}
             <div class="vectfox-usage-results">
-                ${view.empty ? renderEmpty(view) : `${renderCards(view.cards)}${renderTable(view.rows)}`}
+                ${renderResults(view)}
             </div>
             ${renderPriceEditor(view.prices)}
         </div>
     `;
+}
+
+function renderRunBar(run) {
+    const options = run.options.map((option) => (
+        `<option value="${StringUtils.escapeHtml(option.runId)}" ${option.selected ? 'selected' : ''}>${StringUtils.escapeHtml(option.optionLabel)}</option>`
+    )).join('');
+
+    return `
+        <div class="vectfox-usage-runs">
+            <span class="vectfox-usage-run-current">
+                Current run: <b>${StringUtils.escapeHtml(run.currentLabel)}</b>
+            </span>
+            <button type="button" class="menu_button" data-usage-run-start>Start new measurement</button>
+            <label class="vectfox-usage-run-filter">
+                Show
+                <select class="text_pole" data-usage-run-select>${options}</select>
+            </label>
+            <small class="VectFox_hint">
+                Starting a run keeps earlier runs available, so a batch-size change can be compared
+                before and after without exporting. Requests captured before the first run stay
+                under All runs.
+            </small>
+        </div>
+    `;
+}
+
+function renderResults(view) {
+    if (view.empty) return renderEmpty(view);
+    return `${renderCards(view.cards)}${renderConfigurationTable(view.configurations)}${renderTable(view.rows)}`;
+}
+
+function renderConfigurationTable(rows) {
+    const body = rows.map((row) => `
+        <tr data-usage-configuration="${StringUtils.escapeHtml(row.key)}">
+            <td class="vectfox-usage-configuration-name">${StringUtils.escapeHtml(row.label)}</td>
+            <td class="num">${StringUtils.escapeHtml(row.requestsLabel)}</td>
+            <td class="num">${StringUtils.escapeHtml(row.averagePromptLabel)} ${renderSource(row.averagePromptSource)}</td>
+            <td class="num">
+                ${StringUtils.escapeHtml(row.hitRateLabel)} ${renderSource(row.hitRateSource)}
+                ${row.hitRateNote ? `<small class="vectfox-usage-metric-note">${StringUtils.escapeHtml(row.hitRateNote)}</small>` : ''}
+            </td>
+            <td class="num">${StringUtils.escapeHtml(row.costPerRequestLabel)} ${renderSource(row.costPerRequestSource)}</td>
+            <td class="num">${StringUtils.escapeHtml(row.savingLabel)} ${renderSource(row.savingSource)}</td>
+        </tr>
+    `).join('');
+
+    const table = rows.length === 0
+        ? '<div class="vectfox-usage-empty">No requests to compare yet.</div>'
+        : `
+            <div class="vectfox-usage-table-wrap">
+                <table class="vectfox-usage-table vectfox-usage-configurations-table">
+                    <thead>
+                        <tr>
+                            <th>Configuration</th>
+                            <th class="num">Requests</th>
+                            <th class="num">Avg prompt</th>
+                            <th class="num">Hit %</th>
+                            <th class="num">Cost / request</th>
+                            <th class="num">Saving</th>
+                        </tr>
+                    </thead>
+                    <tbody>${body}</tbody>
+                </table>
+            </div>
+        `;
+
+    return `
+        <section class="vectfox-usage-configurations">
+            <h4>By configuration</h4>
+            <small class="VectFox_hint">
+                Grouped by ghosting state, batch size and keep-recent, so a run at batch size 1 and
+                a run at batch size 30 are directly comparable. Cost and saving are totalled per
+                configuration; cost is divided by the requests that had a price.
+            </small>
+            ${table}
+        </section>
+    `;
+}
+
+function renderSource(source) {
+    const safe = StringUtils.escapeHtml(source);
+    return `<small class="vectfox-usage-source-${safe}">${safe}</small>`;
 }
 
 function renderCards(cards) {
@@ -407,14 +653,13 @@ function renderCard(card) {
 }
 
 function renderMetric(key, label, value, source, note = '') {
-    const safeSource = StringUtils.escapeHtml(source);
     const safeNote = note ? `<small class="vectfox-usage-metric-note">${StringUtils.escapeHtml(note)}</small>` : '';
     return `
         <div class="vectfox-usage-metric">
             <dt>${StringUtils.escapeHtml(label)}</dt>
             <dd data-usage-metric="${StringUtils.escapeHtml(key)}">
                 ${StringUtils.escapeHtml(value)}
-                <small class="vectfox-usage-source-${safeSource}">${safeSource}</small>
+                ${renderSource(source)}
                 ${safeNote}
             </dd>
         </div>
@@ -436,8 +681,8 @@ function renderTable(rows) {
             <td class="num">${StringUtils.escapeHtml(row.hitRateLabel)}</td>
             <td class="num">${StringUtils.escapeHtml(row.missLabel)}</td>
             <td class="num">${StringUtils.escapeHtml(row.totalLabel)}</td>
-            <td class="num">${StringUtils.escapeHtml(row.costLabel)} <small class="vectfox-usage-source-${StringUtils.escapeHtml(row.costSource)}">${StringUtils.escapeHtml(row.costSource)}</small></td>
-            <td class="num">${StringUtils.escapeHtml(row.savingLabel)} <small class="vectfox-usage-source-${StringUtils.escapeHtml(row.savingSource)}">${StringUtils.escapeHtml(row.savingSource)}</small></td>
+            <td class="num">${StringUtils.escapeHtml(row.costLabel)} ${renderSource(row.costSource)}</td>
+            <td class="num">${StringUtils.escapeHtml(row.savingLabel)} ${renderSource(row.savingSource)}</td>
             <td><span class="vectfox-usage-source vectfox-usage-source-${StringUtils.escapeHtml(row.sourceLabel)}">${StringUtils.escapeHtml(row.sourceLabel)}</span></td>
         </tr>
     `).join('');

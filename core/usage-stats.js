@@ -86,6 +86,7 @@ export function summarizeUsage(records = [], { prices = null } = {}) {
     const tokenCoverage = promptTotal > 0 ? measuredPromptTokens / promptTotal : 0;
     const requestCoverage = completed.length > 0 ? coveredRequests / completed.length : 1;
     const costs = completed.map((record) => resolveUsageCost(record, prices));
+    const costedRequests = costs.filter((entry) => Number.isFinite(entry.cost)).length;
 
     return {
         requests: completed.length,
@@ -107,6 +108,7 @@ export function summarizeUsage(records = [], { prices = null } = {}) {
         coveredRequests,
         cost: sumPresent(costs.map((entry) => entry.cost)),
         costSource: mergeSources(costs.map((entry) => entry.costSource)),
+        costedRequests,
         saving: sumPresent(costs.map((entry) => entry.saving)),
         savingSource: mergeSources(costs.map((entry) => entry.savingSource)),
     };
@@ -134,6 +136,89 @@ export function summarizeByOrigin(records = [], options = {}) {
             .filter((origin) => groups.has(origin))
             .map((origin) => ({ origin, ...summarizeUsage(groups.get(origin), options) })),
     };
+}
+
+/**
+ * One row per ghosting configuration that has records, ordered so a before /
+ * after batch-size comparison reads top to bottom. A record with no snapshot
+ * gets its own trailing group rather than being merged into a measured one.
+ *
+ * Average prompt and cost per request divide by the requests that had the
+ * required count, never by all requests: a request without a token count or a
+ * price must not be silently averaged in as zero.
+ *
+ * @param {object[]} [records]
+ * @param {object} [options] Same options as {@link summarizeUsage}.
+ * @returns {object[]}
+ */
+export function summarizeByConfiguration(records = [], options = {}) {
+    const all = Array.isArray(records) ? records : [];
+    const groups = new Map();
+    for (const record of all) {
+        // The configuration snapshot's shape is owned by the wiring; grouping
+        // only needs to read its three fields, never to re-normalize them.
+        const configuration = record?.configuration && typeof record.configuration === 'object'
+            ? record.configuration
+            : null;
+        const key = configurationKey(configuration);
+        if (!groups.has(key)) groups.set(key, { key, configuration, records: [] });
+        groups.get(key).records.push(record);
+    }
+
+    return [...groups.values()]
+        .sort(compareConfigurationGroups)
+        .map(({ key, configuration, records: groupRecords }) => {
+            const summary = summarizeUsage(groupRecords, options);
+            const measuredPrompt = summary.promptTokens ?? 0;
+            const estimatedPrompt = summary.estimatedPromptTokens ?? 0;
+            const estimatedCount = groupRecords.filter((record) => (
+                isCompleted(record) && !isMeasured(record) && isEstimated(record)
+                && isFiniteCount(record.estimatedPromptTokens)
+            )).length;
+            const promptRequests = summary.coveredRequests + estimatedCount;
+
+            return {
+                key,
+                configuration,
+                ...summary,
+                averagePromptTokens: promptRequests > 0 ? (measuredPrompt + estimatedPrompt) / promptRequests : null,
+                averagePromptSource: promptRequests === 0 ? 'unavailable' : (estimatedCount > 0 ? 'estimated' : 'measured'),
+                costPerRequest: summary.cost != null && summary.costedRequests > 0
+                    ? summary.cost / summary.costedRequests
+                    : null,
+                costPerRequestSource: summary.costedRequests > 0 ? summary.costSource : 'unavailable',
+            };
+        })
+        // A group made only of failed or aborted requests has nothing to
+        // compare; leaving it as a zero-request row would look like data.
+        .filter((group) => group.requests > 0);
+}
+
+function configurationKey(configuration) {
+    if (!configuration) return 'configuration-unknown';
+    const batch = configuration.ghostBatchSize ?? 'none';
+    const keep = configuration.ghostKeepRecent ?? 'none';
+    return `ghost:${configuration.ghostEnabled ? 'on' : 'off'}:batch:${batch}:keep:${keep}`;
+}
+
+function compareConfigurationGroups(left, right) {
+    if (!left.configuration) return 1;
+    if (!right.configuration) return -1;
+    if (left.configuration.ghostEnabled !== right.configuration.ghostEnabled) {
+        return left.configuration.ghostEnabled ? 1 : -1;
+    }
+    const batch = compareFinite(left.configuration.ghostBatchSize, right.configuration.ghostBatchSize);
+    if (batch !== 0) return batch;
+    return compareFinite(left.configuration.ghostKeepRecent, right.configuration.ghostKeepRecent);
+}
+
+function compareFinite(left, right) {
+    const leftValue = Number.isFinite(left) ? left : null;
+    const rightValue = Number.isFinite(right) ? right : null;
+    if (leftValue == null && rightValue == null) return 0;
+    if (leftValue == null) return 1;
+    if (rightValue == null) return -1;
+    return leftValue - rightValue;
 }
 
 /**

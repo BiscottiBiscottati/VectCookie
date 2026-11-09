@@ -194,7 +194,8 @@
     gap: 8px;
 }
 
-.vectfox-usage-prices h4 {
+.vectfox-usage-prices h4,
+.vectfox-usage-configurations h4 {
     margin: 0;
 }
 
@@ -233,4 +234,51 @@
     font-size: 0.8em;
     opacity: 0.75;
     margin-left: 2px;
+}
+
+/* Measurement runs --------------------------------------------------------- */
+
+.vectfox-usage-runs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 14px;
+    padding: 8px 10px;
+    border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.12));
+    border-radius: 6px;
+    background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.1));
+}
+
+.vectfox-usage-runs .VectFox_hint {
+    flex-basis: 100%;
+    margin: 0;
+}
+
+.vectfox-usage-run-current {
+    font-size: 0.85em;
+    opacity: 0.9;
+}
+
+.vectfox-usage-run-filter {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.85em;
+}
+
+.vectfox-usage-run-filter select {
+    max-width: 320px;
+}
+
+/* Configuration comparison ------------------------------------------------- */
+
+.vectfox-usage-configurations {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.vectfox-usage-configuration-name {
+    font-weight: 600;
+    white-space: nowrap;
 }

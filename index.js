@@ -800,6 +800,7 @@ jQuery(async () => {
         return installUsageObserver({
             isEnabled: () => !!settings.usage_tracking_enabled,
             getChatId: getActiveChatId,
+            getRunId: () => usageLedger.currentRunIdFor(getActiveChatId()),
             getConfig: readUsageConfiguration,
             estimatePromptTokens,
             handleRecord: (record) => usageLedger.add(record),
@@ -821,6 +822,7 @@ jQuery(async () => {
             if (enabled) installUsageTelemetry();
         },
         onPricesChange: persistUsageSettings,
+        onRunStart: () => usageLedger.startRun(getActiveChatId()),
     });
 
     // Initialize auto-sync checkbox state for current chat (if any)
