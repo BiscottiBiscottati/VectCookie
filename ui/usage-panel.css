@@ -19,6 +19,30 @@
     font-size: 0.85em;
 }
 
+.vectfox-usage-health {
+    padding: 6px 10px;
+    border-left: 3px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.2));
+    border-radius: 3px;
+    font-size: 0.82em;
+    color: var(--SmartThemeBodyColor);
+    opacity: 0.85;
+}
+
+.vectfox-usage-health-ok {
+    border-left-color: var(--vectfox-success, #10b981);
+}
+
+.vectfox-usage-health-error {
+    border-left-color: var(--vectfox-danger, #ef4444);
+    color: var(--vectfox-danger, #ef4444);
+    opacity: 1;
+}
+
+.vectfox-usage-health-idle,
+.vectfox-usage-health-not-installed {
+    border-left-color: var(--vectfox-warning, #f59e0b);
+}
+
 .vectfox-usage-table-wrap {
     overflow-x: auto;
 }
@@ -64,6 +88,11 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.vectfox-usage-origin {
+    white-space: nowrap;
+    opacity: 0.9;
 }
 
 .vectfox-usage-source {

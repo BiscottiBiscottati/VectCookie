@@ -10,6 +10,8 @@
  * ============================================================================
  */
 
+import { resolveUsageOrigin } from './usage-attribution.js';
+
 export const USAGE_CHAT_COMPLETION_PATH = '/api/backends/chat-completions/generate';
 export const USAGE_OBSERVER_MARKER = '__vectfox_usage_observer__';
 export const USAGE_SINK_KEY = '__vectfox_usage_sink__';
@@ -30,6 +32,15 @@ let _recordSequence = 0;
  *   was sent.
  * @param {(record: object) => void} [options.handleRecord] Sink that receives
  *   one normalized record per observed request.
+ * @param {() => ({origin: string, featureLabel: string|null})} [options.getOrigin]
+ *   Origin attribution, read synchronously when the request is sent. Passed
+ *   through the sink so a reloaded module instance keeps the old wrapper
+ *   reading the new attribution state.
+ * @param {() => (object|null)} [options.getConfig] Ghosting configuration
+ *   snapshot, read synchronously when the request is sent.
+ * @param {() => void} [options.onSettle] Called after every observed request's
+ *   capture attempt finishes, including a skipped body or a capture failure, so
+ *   the health line can refresh without a record.
  * @param {() => number} [options.now] Clock, injected for tests.
  * @returns {Function|null} The installed fetch wrapper, or null when the
  *   target has no fetch to wrap.
@@ -39,11 +50,25 @@ export function installUsageObserver({
     isEnabled = () => false,
     getChatId = () => null,
     handleRecord = () => {},
+    getOrigin = resolveUsageOrigin,
+    getConfig = () => null,
+    onSettle = () => {},
     now = () => Date.now(),
 } = {}) {
     if (!target || typeof target.fetch !== 'function') return null;
 
-    target[USAGE_SINK_KEY] = { isEnabled, getChatId, handleRecord, now };
+    // Health belongs to the sink, so a re-enable starts from a clean baseline
+    // while a reloaded module instance replaces it without wrapping fetch twice.
+    target[USAGE_SINK_KEY] = {
+        isEnabled,
+        getChatId,
+        handleRecord,
+        getOrigin,
+        getConfig,
+        onSettle,
+        now,
+        health: createHealth(),
+    };
 
     if (target[USAGE_OBSERVER_MARKER]) return target.fetch;
 
@@ -58,6 +83,22 @@ export function installUsageObserver({
         }
         if (!enabled) return originalFetch(input, init);
 
+        // Only chat-completion requests are observed; leaving every other fetch
+        // on the original path keeps the wrapper invisible to the extension.
+        let isTarget = false;
+        try {
+            isTarget = isChatCompletionRequest(input);
+        } catch {
+            isTarget = false;
+        }
+        if (!isTarget) return originalFetch(input, init);
+
+        // Origin and configuration are decided when the request is sent, not
+        // when its (deferred) capture runs: a generation can end in between.
+        const origin = readOrigin(sink);
+        const configuration = readConfiguration(sink);
+        noteHealth(sink, 'matched');
+
         const startedAt = sink.now();
         // Chat ownership is decided when the request is sent, not when its
         // response lands — a chat switch mid-flight must not move the record.
@@ -66,18 +107,27 @@ export function installUsageObserver({
         try {
             response = await originalFetch(input, init);
         } catch (error) {
-            startCapture(() => captureRejectedRequest({ sink, input, init, chatId, startedAt, error }));
+            startCapture(sink, () => captureRejectedRequest({
+                sink,
+                init,
+                chatId,
+                origin,
+                configuration,
+                startedAt,
+                error,
+            }));
             throw error;
         }
         const latencyMs = Math.max(0, sink.now() - startedAt);
 
         try {
-            if (!isChatCompletionRequest(input)) return response;
             if (!response.ok) {
-                startCapture(() => captureHttpErrorRecord({
+                startCapture(sink, () => captureHttpErrorRecord({
                     sink,
                     init,
                     chatId,
+                    origin,
+                    configuration,
                     httpStatus: response.status,
                     startedAt,
                     latencyMs,
@@ -92,17 +142,20 @@ export function installUsageObserver({
                 sink,
                 init,
                 chatId,
+                origin,
+                configuration,
                 clone,
                 startedAt,
                 latencyMs,
                 httpStatus: response.status,
             };
             if (isEventStream(response)) {
-                startCapture(() => captureStreamedRecord(captured));
+                startCapture(sink, () => captureStreamedRecord(captured));
             } else {
-                startCapture(() => captureJsonRecord(captured));
+                startCapture(sink, () => captureJsonRecord(captured));
             }
         } catch {
+            noteHealth(sink, 'errors');
             /* observer must never replace or delay the caller's response */
         }
 
@@ -111,6 +164,43 @@ export function installUsageObserver({
     target[USAGE_OBSERVER_MARKER] = true;
 
     return target.fetch;
+}
+
+/**
+ * Health of the installed observer, or null when none is installed.
+ *
+ * @param {object} [target] Object owning fetch (window in production).
+ * @returns {{matched: number, captured: number, skipped: number, errors: number}|null}
+ */
+export function getUsageObserverHealth(target = globalThis) {
+    try {
+        const health = target?.[USAGE_SINK_KEY]?.health;
+        return health ? { ...health } : null;
+    } catch {
+        return null;
+    }
+}
+
+function createHealth() {
+    return { matched: 0, captured: 0, skipped: 0, errors: 0 };
+}
+
+function noteHealth(sink, field) {
+    try {
+        if (sink?.health && typeof sink.health[field] === 'number') sink.health[field] += 1;
+    } catch {
+        /* health reporting must never affect capture */
+    }
+}
+
+/**
+ * Where the request body carries no JSON string, the request is uncapturable.
+ * Counted in the health line rather than guessed at.
+ */
+function readBodyOrCountSkipped(sink, init) {
+    const body = readChatCompletionBody(init);
+    if (!body) noteHealth(sink, 'skipped');
+    return body;
 }
 
 function readChatId(sink) {
@@ -122,17 +212,51 @@ function readChatId(sink) {
 }
 
 /**
+ * Attribution is read through the sink so the wrapper installed by an earlier
+ * module instance uses the reloaded instance's generation state.
+ */
+function readOrigin(sink) {
+    try {
+        const origin = sink.getOrigin?.();
+        if (origin && typeof origin === 'object') return origin;
+    } catch {
+        /* attribution must never break capture */
+    }
+    return { origin: 'unknown', featureLabel: null };
+}
+
+/**
+ * Snapshots the configuration the extension was running when the request went
+ * out. The wiring owns the shape and normalization; the observer stores the
+ * values opaquely so it cannot disagree with the ghosting code about them.
+ */
+function readConfiguration(sink) {
+    try {
+        const config = sink.getConfig?.();
+        return config && typeof config === 'object' ? { ...config } : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Defers capture to the next macrotask: the caller's response continuation
  * must run before any capture work, including parsing the request body.
  * Capture errors are swallowed — the observer never surfaces them.
  */
-function startCapture(run) {
+function startCapture(sink, run) {
     const start = () => {
+        let pending;
         try {
-            Promise.resolve(run()).catch(() => {});
+            pending = Promise.resolve(run());
         } catch {
-            /* observer must never surface its own errors */
+            noteHealth(sink, 'errors');
+            notifySettled(sink);
+            return;
         }
+        pending
+            .catch(() => noteHealth(sink, 'errors'))
+            .finally(() => notifySettled(sink));
     };
     try {
         setTimeout(start, 0);
@@ -141,20 +265,38 @@ function startCapture(run) {
     }
 }
 
-function captureRejectedRequest({ sink, input, init, chatId, startedAt, error }) {
-    if (!isChatCompletionRequest(input)) return;
-    const body = readChatCompletionBody(init);
+/**
+ * Tells the wiring the capture attempt is over, so the health line refreshes
+ * even when no record was written (skipped body, failed capture).
+ */
+function notifySettled(sink) {
+    try {
+        sink.onSettle?.();
+    } catch {
+        /* a UI refresh must never affect capture */
+    }
+}
+
+function captureRejectedRequest({ sink, init, chatId, origin, configuration, startedAt, error }) {
+    const body = readBodyOrCountSkipped(sink, init);
     if (!body) return;
 
-    sink.handleRecord(buildRecord({
+    emitRecord(sink, buildRecord({
         body,
         chatId,
+        origin,
+        configuration,
         httpStatus: null,
         usage: null,
         status: usageStatus({ aborted: isAbortError(error, init?.signal), error: true }),
         startedAt,
         latencyMs: Math.max(0, sink.now() - startedAt),
     }));
+}
+
+function emitRecord(sink, record) {
+    sink.handleRecord(record);
+    noteHealth(sink, 'captured');
 }
 
 function usageStatus({ aborted = false, error = false, usage = null } = {}) {
@@ -214,13 +356,15 @@ function readChatCompletionBody(init) {
  * Records a non-2xx request without reading the response body: the caller's
  * error response must stay untouched, and there is no usage to find there.
  */
-async function captureHttpErrorRecord({ sink, init, chatId, httpStatus, startedAt, latencyMs }) {
-    const body = readChatCompletionBody(init);
+async function captureHttpErrorRecord({ sink, init, chatId, origin, configuration, httpStatus, startedAt, latencyMs }) {
+    const body = readBodyOrCountSkipped(sink, init);
     if (!body) return;
 
-    sink.handleRecord(buildRecord({
+    emitRecord(sink, buildRecord({
         body,
         chatId,
+        origin,
+        configuration,
         httpStatus,
         usage: null,
         status: usageStatus({ error: true }),
@@ -233,7 +377,7 @@ async function captureHttpErrorRecord({ sink, init, chatId, httpStatus, startedA
  * Reads a non-streamed response's JSON usage. Runs after the caller has the
  * response; a parse failure or provider error is a status, never a throw.
  */
-async function captureJsonRecord({ sink, init, chatId, clone, startedAt, latencyMs, httpStatus }) {
+async function captureJsonRecord({ sink, init, chatId, origin, configuration, clone, startedAt, latencyMs, httpStatus }) {
     let data = null;
     try {
         data = await clone.json();
@@ -241,13 +385,15 @@ async function captureJsonRecord({ sink, init, chatId, clone, startedAt, latency
         data = null;
     }
 
-    const body = readChatCompletionBody(init);
+    const body = readBodyOrCountSkipped(sink, init);
     if (!body) return;
 
     const usage = data && typeof data === 'object' ? data.usage : null;
-    sink.handleRecord(buildRecord({
+    emitRecord(sink, buildRecord({
         body,
         chatId,
+        origin,
+        configuration,
         httpStatus,
         responseModel: data?.model ?? null,
         responseId: data?.id ?? null,
@@ -264,8 +410,8 @@ async function captureJsonRecord({ sink, init, chatId, clone, startedAt, latency
  * usage and stopping at `[DONE]`. The caller's branch of the cloned stream is
  * never awaited here.
  */
-async function captureStreamedRecord({ sink, init, chatId, clone, startedAt, latencyMs, httpStatus }) {
-    const body = readChatCompletionBody(init);
+async function captureStreamedRecord({ sink, init, chatId, origin, configuration, clone, startedAt, latencyMs, httpStatus }) {
+    const body = readBodyOrCountSkipped(sink, init);
     if (!body) {
         // Nothing to attribute: release the cloned branch instead of letting
         // the tee buffer the rest of the stream for an unread reader.
@@ -275,9 +421,11 @@ async function captureStreamedRecord({ sink, init, chatId, clone, startedAt, lat
 
     const { reader, ...result } = await readSseCapture(clone, init?.signal);
     try {
-        sink.handleRecord(buildRecord({
+        emitRecord(sink, buildRecord({
             body,
             chatId,
+            origin,
+            configuration,
             httpStatus,
             responseId: result.responseId,
             cacheDiscount: result.cacheDiscount,
@@ -372,6 +520,8 @@ function drainSseLines(carry, result) {
 function buildRecord({
     body,
     chatId,
+    origin,
+    configuration,
     httpStatus,
     responseModel = null,
     responseId = null,
@@ -397,6 +547,9 @@ function buildRecord({
         recordId: createRecordId(),
         timestamp: startedAt,
         chatId,
+        origin: origin?.origin ?? 'unknown',
+        featureLabel: origin?.featureLabel ?? null,
+        configuration: configuration ?? null,
         provider: body.chat_completion_source || 'unknown',
         model: body.model || responseModel || 'unknown',
         responseId,
