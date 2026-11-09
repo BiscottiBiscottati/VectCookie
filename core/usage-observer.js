@@ -30,6 +30,8 @@ let _recordSequence = 0;
  *   the wrapper a pass-through.
  * @param {() => (string|null)} [options.getChatId] Chat active when the request
  *   was sent.
+ * @param {() => (string|null)} [options.getRunId] Measurement run open when the
+ *   request was sent.
  * @param {(record: object) => void} [options.handleRecord] Sink that receives
  *   one normalized record per observed request.
  * @param {() => ({origin: string, featureLabel: string|null})} [options.getOrigin]
@@ -52,6 +54,7 @@ export function installUsageObserver({
     target = globalThis,
     isEnabled = () => false,
     getChatId = () => null,
+    getRunId = () => null,
     handleRecord = () => {},
     getOrigin = resolveUsageOrigin,
     getConfig = () => null,
@@ -66,6 +69,7 @@ export function installUsageObserver({
     target[USAGE_SINK_KEY] = {
         isEnabled,
         getChatId,
+        getRunId,
         handleRecord,
         getOrigin,
         getConfig,
@@ -107,7 +111,8 @@ export function installUsageObserver({
         const startedAt = sink.now();
         // Chat ownership is decided when the request is sent, not when its
         // response lands — a chat switch mid-flight must not move the record.
-        const chatId = readChatId(sink);
+        const chatId = readIdentifier(sink, 'getChatId');
+        const runId = readRunId(sink);
         let response;
         try {
             response = await originalFetch(input, init);
@@ -116,6 +121,7 @@ export function installUsageObserver({
                 sink,
                 init,
                 chatId,
+                runId,
                 origin,
                 configuration,
                 startedAt,
@@ -131,6 +137,7 @@ export function installUsageObserver({
                     sink,
                     init,
                     chatId,
+                    runId,
                     origin,
                     configuration,
                     httpStatus: response.status,
@@ -147,6 +154,7 @@ export function installUsageObserver({
                 sink,
                 init,
                 chatId,
+                runId,
                 origin,
                 configuration,
                 clone,
@@ -208,12 +216,21 @@ function readBodyOrCountSkipped(sink, init) {
     return body;
 }
 
-function readChatId(sink) {
+function readIdentifier(sink, getter) {
     try {
-        return sink.getChatId?.() ?? null;
+        return sink?.[getter]?.() ?? null;
     } catch {
         return null;
     }
+}
+
+/**
+ * The open measurement run is read when the request is sent, like chat
+ * ownership: a run started while the response is in flight must not claim it.
+ */
+function readRunId(sink) {
+    const runId = readIdentifier(sink, 'getRunId');
+    return typeof runId === 'string' ? runId : null;
 }
 
 /**
@@ -282,13 +299,15 @@ function notifySettled(sink) {
     }
 }
 
-function captureRejectedRequest({ sink, init, chatId, origin, configuration, startedAt, error }) {
+function captureRejectedRequest(context) {
+    const { sink, init, chatId, runId, origin, configuration, startedAt, error } = context;
     const body = readBodyOrCountSkipped(sink, init);
     if (!body) return;
 
     emitRecord(sink, buildRecord({
         body,
         chatId,
+        runId,
         origin,
         configuration,
         httpStatus: null,
@@ -361,13 +380,15 @@ function readChatCompletionBody(init) {
  * Records a non-2xx request without reading the response body: the caller's
  * error response must stay untouched, and there is no usage to find there.
  */
-async function captureHttpErrorRecord({ sink, init, chatId, origin, configuration, httpStatus, startedAt, latencyMs }) {
+async function captureHttpErrorRecord(context) {
+    const { sink, init, chatId, runId, origin, configuration, httpStatus, startedAt, latencyMs } = context;
     const body = readBodyOrCountSkipped(sink, init);
     if (!body) return;
 
     emitRecord(sink, buildRecord({
         body,
         chatId,
+        runId,
         origin,
         configuration,
         httpStatus,
@@ -382,7 +403,8 @@ async function captureHttpErrorRecord({ sink, init, chatId, origin, configuratio
  * Reads a non-streamed response's JSON usage. Runs after the caller has the
  * response; a parse failure or provider error is a status, never a throw.
  */
-async function captureJsonRecord({ sink, init, chatId, origin, configuration, clone, startedAt, latencyMs, httpStatus }) {
+async function captureJsonRecord(context) {
+    const { sink, init, chatId, runId, origin, configuration, clone, startedAt, latencyMs, httpStatus } = context;
     let data = null;
     try {
         data = await clone.json();
@@ -401,6 +423,7 @@ async function captureJsonRecord({ sink, init, chatId, origin, configuration, cl
     emitRecord(sink, buildRecord({
         body,
         chatId,
+        runId,
         origin,
         configuration,
         httpStatus,
@@ -420,7 +443,8 @@ async function captureJsonRecord({ sink, init, chatId, origin, configuration, cl
  * usage and stopping at `[DONE]`. The caller's branch of the cloned stream is
  * never awaited here.
  */
-async function captureStreamedRecord({ sink, init, chatId, origin, configuration, clone, startedAt, latencyMs, httpStatus }) {
+async function captureStreamedRecord(context) {
+    const { sink, init, chatId, runId, origin, configuration, clone, startedAt, latencyMs, httpStatus } = context;
     const body = readBodyOrCountSkipped(sink, init);
     if (!body) {
         // Nothing to attribute: release the cloned branch instead of letting
@@ -438,6 +462,7 @@ async function captureStreamedRecord({ sink, init, chatId, origin, configuration
         emitRecord(sink, buildRecord({
             body,
             chatId,
+            runId,
             origin,
             configuration,
             httpStatus,
@@ -551,6 +576,7 @@ async function estimatePrompt(sink, body) {
 function buildRecord({
     body,
     chatId,
+    runId,
     origin,
     configuration,
     httpStatus,
@@ -579,6 +605,7 @@ function buildRecord({
         recordId: createRecordId(),
         timestamp: startedAt,
         chatId,
+        runId,
         origin: origin?.origin ?? 'unknown',
         featureLabel: origin?.featureLabel ?? null,
         configuration: configuration ?? null,

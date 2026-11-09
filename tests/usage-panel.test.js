@@ -1,8 +1,9 @@
 /**
  * Usage panel — the view-model seam.
  *
- * Pure formatting is tested directly; one jsdom smoke proves the panel mounts,
- * renders a row and reflects the toggle. Layout stays manually verified.
+ * Pure formatting is tested directly; thin jsdom smokes prove the panel mounts,
+ * renders rows and reflects the toggle, run filter and price editor. Layout
+ * stays manually verified.
  *
  * @vitest-environment jsdom
  */
@@ -441,5 +442,385 @@ describe('usage panel — editable price table', () => {
         const savingAfter = panel.querySelector('[data-usage-card="all"] [data-usage-metric="saving"]').textContent;
         expect(savingAfter).not.toBe(savingBefore);
         expect(savingAfter).toContain('$0.00004500');
+    });
+});
+
+const runsFixture = [
+    { runId: 'run-b', label: 'Run 2', startedAt: 1_700_000_060_000, endedAt: null },
+    { runId: 'run-a', label: 'Run 1', startedAt: 1_700_000_000_000, endedAt: 1_700_000_060_000 },
+];
+const batchOne = { ghostEnabled: true, ghostBatchSize: 1, ghostKeepRecent: 10 };
+const batchThirty = { ghostEnabled: true, ghostBatchSize: 30, ghostKeepRecent: 10 };
+
+describe('usage view model — measurement runs', () => {
+    it('filters rows, cards and configurations to the selected run, keeping every run selectable', () => {
+        const records = [
+            measuredRecord({ recordId: 'rec-b', runId: 'run-b', configuration: batchThirty, promptTokens: 1000, hitTokens: 900, missTokens: 100 }),
+            measuredRecord({ recordId: 'rec-a2', runId: 'run-a', configuration: batchOne, promptTokens: 1000, hitTokens: 500, missTokens: 500 }),
+            measuredRecord({ recordId: 'rec-a1', runId: 'run-a', configuration: batchOne, promptTokens: 1000, hitTokens: 500, missTokens: 500 }),
+        ];
+
+        const view = buildUsageView({
+            records,
+            trackingEnabled: true,
+            runs: runsFixture,
+            currentRunId: 'run-b',
+            selectedRunId: 'run-a',
+            prices: deepseekPrices,
+        });
+
+        expect(view.rows.map((row) => row.recordId)).toEqual(['rec-a2', 'rec-a1']);
+        expect(view.cards[0]).toMatchObject({ requestsLabel: '2 requests', hitRateLabel: '50.0%' });
+        expect(view.configurations).toHaveLength(1);
+        expect(view.configurations[0]).toMatchObject({ requestsLabel: '2 requests', hitRateLabel: '50.0%' });
+        expect(view.run).toMatchObject({
+            currentRunId: 'run-b',
+            currentLabel: 'Run 2',
+            selectedRunId: 'run-a',
+        });
+        expect(view.run.options.map((option) => option.runId)).toEqual(['', 'run-b', 'run-a']);
+        expect(view.run.options.find((option) => option.runId === 'run-a').selected).toBe(true);
+        expect(view.run.options[0].optionLabel).toMatch(/All runs · 3 records$/);
+        expect(view.run.options[1].optionLabel).toMatch(/Run 2 · .* \u00b7 1 record$/);
+        expect(view.run.options[2].optionLabel).toMatch(/Run 1 · .* \u00b7 2 records$/);
+    });
+
+    it('explains an empty selected run instead of showing the tracking empty state', () => {
+        const view = buildUsageView({
+            records: [measuredRecord({ recordId: 'rec-a', runId: 'run-a' })],
+            trackingEnabled: true,
+            runs: runsFixture,
+            selectedRunId: 'run-b',
+        });
+
+        expect(view.empty).toBe(true);
+        expect(view.emptyMessage).toMatch(/no requests in this measurement run/i);
+    });
+
+    it('shows an empty run bar when the chat has no measurement runs', () => {
+        const view = buildUsageView({ records: [], trackingEnabled: true, runs: [] });
+
+        expect(view.run).toMatchObject({
+            currentRunId: '',
+            currentLabel: 'No measurement run',
+            selectedRunId: '',
+        });
+        expect(view.run.options).toHaveLength(1);
+        expect(view.run.options[0]).toMatchObject({ runId: '', selected: true });
+        expect(view.run.options[0].optionLabel).toBe('All runs · 0 records');
+    });
+
+    it('shows every run together by default so old runs stay available', () => {
+        const records = [
+            measuredRecord({ recordId: 'rec-b', runId: 'run-b' }),
+            measuredRecord({ recordId: 'rec-a', runId: 'run-a' }),
+        ];
+
+        const view = buildUsageView({ records, trackingEnabled: true, runs: runsFixture, currentRunId: 'run-b' });
+
+        expect(view.run.selectedRunId).toBe('');
+        expect(view.rows).toHaveLength(2);
+        expect(view.run.currentLabel).toBe('Run 2');
+        expect(view.run.options.find((option) => option.runId === '')).toMatchObject({
+            label: 'All runs',
+            selected: true,
+        });
+        expect(view.run.options.map((option) => option.label)).toEqual(['All runs', 'Run 2', 'Run 1']);
+    });
+});
+
+describe('usage view model — by configuration', () => {
+    it('groups requests by ghosting state, batch size and keep-recent', () => {
+        const view = buildUsageView({
+            records: [
+                deepseekRecord({ recordId: 'b2', configuration: batchThirty, promptTokens: 1000, hitTokens: 900, missTokens: 100, completionTokens: 100 }),
+                deepseekRecord({ recordId: 'b1', configuration: batchThirty, promptTokens: 1000, hitTokens: 900, missTokens: 100, completionTokens: 100 }),
+                deepseekRecord({ recordId: 'a2', configuration: batchOne, promptTokens: 1000, hitTokens: 500, missTokens: 500, completionTokens: 100 }),
+                deepseekRecord({ recordId: 'a1', configuration: batchOne, promptTokens: 1000, hitTokens: 500, missTokens: 500, completionTokens: 100 }),
+            ],
+            trackingEnabled: true,
+            prices: deepseekPrices,
+        });
+
+        expect(view.configurations.map((entry) => entry.label)).toEqual([
+            'Ghosting on · batch 1 · keep 10',
+            'Ghosting on · batch 30 · keep 10',
+        ]);
+
+        expect(view.configurations[0]).toMatchObject({
+            requestsLabel: '2 requests',
+            averagePromptLabel: '1,000',
+            averagePromptSource: 'measured',
+            hitRateLabel: '50.0%',
+            costPerRequestLabel: '$0.00013650',
+            costPerRequestSource: 'estimated',
+            savingLabel: '$0.00014700',
+            savingSource: 'estimated',
+        });
+        expect(view.configurations[1]).toMatchObject({
+            hitRateLabel: '90.0%',
+            costPerRequestLabel: '$0.00007770',
+            savingLabel: '$0.00026460',
+        });
+    });
+
+    it('compares two measurement runs at batch size 1 and batch size 30 without export', () => {
+        const records = [
+            measuredRecord({
+                recordId: 'rec-b',
+                runId: 'run-b',
+                configuration: batchThirty,
+                provider: 'deepseek',
+                model: 'deepseek-v4-flash',
+                promptTokens: 1000,
+                hitTokens: 900,
+                missTokens: 100,
+                completionTokens: 100,
+            }),
+            measuredRecord({
+                recordId: 'rec-a',
+                runId: 'run-a',
+                configuration: batchOne,
+                provider: 'deepseek',
+                model: 'deepseek-v4-flash',
+                promptTokens: 1000,
+                hitTokens: 500,
+                missTokens: 500,
+                completionTokens: 100,
+            }),
+        ];
+
+        const allRuns = buildUsageView({ records, trackingEnabled: true, runs: runsFixture, prices: deepseekPrices });
+        expect(allRuns.configurations.map((entry) => [entry.label, entry.hitRateLabel])).toEqual([
+            ['Ghosting on · batch 1 · keep 10', '50.0%'],
+            ['Ghosting on · batch 30 · keep 10', '90.0%'],
+        ]);
+
+        const onlyFirstRun = buildUsageView({
+            records,
+            trackingEnabled: true,
+            runs: runsFixture,
+            selectedRunId: 'run-a',
+            prices: deepseekPrices,
+        });
+        expect(onlyFirstRun.configurations).toHaveLength(1);
+        expect(onlyFirstRun.configurations[0].label).toBe('Ghosting on · batch 1 · keep 10');
+    });
+
+    it('labels an estimated average prompt and an unavailable hit rate honestly', () => {
+        const view = buildUsageView({
+            records: [
+                measuredRecord({
+                    status: 'no-usage',
+                    usageSource: 'estimated',
+                    promptTokens: null,
+                    hitTokens: null,
+                    missTokens: null,
+                    completionTokens: null,
+                    estimatedPromptTokens: 480,
+                    configuration: batchOne,
+                }),
+                measuredRecord({
+                    recordId: 'rec-unavailable',
+                    status: 'no-usage',
+                    usageSource: 'unavailable',
+                    promptTokens: null,
+                    hitTokens: null,
+                    missTokens: null,
+                    completionTokens: null,
+                    configuration: batchThirty,
+                }),
+            ],
+            trackingEnabled: true,
+            prices: deepseekPrices,
+        });
+
+        expect(view.configurations[0]).toMatchObject({
+            label: 'Ghosting on · batch 1 · keep 10',
+            averagePromptLabel: '480',
+            averagePromptSource: 'estimated',
+            hitRateLabel: '—',
+            hitRateSource: 'unavailable',
+        });
+        expect(view.configurations[1]).toMatchObject({
+            label: 'Ghosting on · batch 30 · keep 10',
+            averagePromptLabel: '—',
+            averagePromptSource: 'unavailable',
+        });
+    });
+
+    it('separates ghosting off from ghosting on and reserves a group for a missing snapshot', () => {
+        const view = buildUsageView({
+            records: [
+                measuredRecord({
+                    recordId: 'off',
+                    configuration: { ghostEnabled: false, ghostBatchSize: 1, ghostKeepRecent: 10 },
+                }),
+                measuredRecord({ recordId: 'legacy' }),
+            ],
+            trackingEnabled: true,
+        });
+
+        expect(view.configurations.map((entry) => entry.label)).toEqual([
+            'Ghosting off · batch 1 · keep 10',
+            'Configuration unknown',
+        ]);
+        expect(view.configurations.map((entry) => entry.requestsLabel)).toEqual(['1 request', '1 request']);
+    });
+
+    it('notes which prompt tokens the configuration hit rate covers', () => {
+        const view = buildUsageView({
+            records: [
+                deepseekRecord({ recordId: 'a', configuration: batchOne, promptTokens: 1000, hitTokens: 500, missTokens: 500 }),
+                deepseekRecord({ recordId: 'b', configuration: batchOne, promptTokens: 100, hitTokens: null, missTokens: null }),
+                deepseekRecord({
+                    recordId: 'c',
+                    configuration: batchOne,
+                    status: 'no-usage',
+                    usageSource: 'estimated',
+                    promptTokens: null,
+                    hitTokens: null,
+                    missTokens: null,
+                    completionTokens: null,
+                    estimatedPromptTokens: 500,
+                }),
+            ],
+            trackingEnabled: true,
+            prices: deepseekPrices,
+        });
+
+        expect(view.configurations[0].hitRateNote).toBe('1,000 of 1,600 prompt tokens');
+    });
+
+    it('keeps failed requests out of the configuration comparison', () => {
+        const view = buildUsageView({
+            records: [measuredRecord({ status: 'error', configuration: batchOne })],
+            trackingEnabled: true,
+            prices: deepseekPrices,
+        });
+
+        expect(view.empty).toBe(false);
+        expect(view.rows).toHaveLength(1);
+        expect(view.configurations).toEqual([]);
+    });
+});
+
+describe('usage panel — measurement runs smoke', () => {
+    beforeEach(() => {
+        document.body.innerHTML = '';
+    });
+
+    it('resets the run filter when the active chat changes', () => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+        const settings = { usage_tracking_enabled: true };
+        let chatId = 'chat-1';
+        const ledger = {
+            recordsFor: (chat) => chat === 'chat-1'
+                ? [measuredRecord({ recordId: 'rec-a', runId: 'run-a' })]
+                : [measuredRecord({ recordId: 'rec-c', runId: 'run-c' })],
+            runsFor: (chat) => chat === 'chat-1'
+                ? runsFixture
+                : [{ runId: 'run-c', label: 'Run 1', startedAt: 1_700_000_100_000, endedAt: null }],
+            currentRunIdFor: (chat) => chat === 'chat-1' ? 'run-b' : 'run-c',
+        };
+
+        const refresh = initializeUsagePanel({ settings, ledger, getChatId: () => chatId });
+        const panel = document.getElementById('VectFox_usage_panel');
+        const select = panel.querySelector('[data-usage-run-select]');
+        select.value = 'run-a';
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        expect(panel.querySelector('.vectfox-usage-requests-table tbody')).not.toBeNull();
+        expect(panel.textContent).toContain('Run 1');
+
+        chatId = 'chat-2';
+        refresh();
+
+        const selectAfter = panel.querySelector('[data-usage-run-select]');
+        expect(selectAfter.value).toBe('');
+        expect(panel.querySelectorAll('.vectfox-usage-requests-table tbody tr')).toHaveLength(1);
+    });
+
+    it('starts a run and filters the request table by the selected run', () => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+        const settings = { usage_tracking_enabled: true };
+        const records = [
+            measuredRecord({ recordId: 'rec-b', runId: 'run-b', model: 'deepseek-batch-30', configuration: batchThirty }),
+            measuredRecord({ recordId: 'rec-a', runId: 'run-a', model: 'deepseek-batch-1', configuration: batchOne }),
+        ];
+        const ledger = {
+            recordsFor: () => records,
+            runsFor: () => runsFixture,
+            currentRunIdFor: () => 'run-b',
+        };
+        const onRunStart = vi.fn();
+
+        initializeUsagePanel({
+            settings,
+            ledger,
+            getChatId: () => 'chat-1',
+            onRunStart,
+        });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        expect(panel.querySelectorAll('.vectfox-usage-requests-table tbody tr')).toHaveLength(2);
+        expect(panel.textContent).toMatch(/Run 2/);
+        expect(panel.querySelectorAll('.vectfox-usage-configurations-table tbody tr')).toHaveLength(2);
+        expect(panel.textContent).toContain('Avg prompt');
+        expect(panel.textContent).toContain('Cost / request');
+        expect(panel.textContent).toContain('Ghosting on · batch 1 · keep 10');
+        expect(panel.textContent).toContain('Ghosting on · batch 30 · keep 10');
+
+        panel.querySelector('[data-usage-run-start]').click();
+        expect(onRunStart).toHaveBeenCalledTimes(1);
+
+        const select = panel.querySelector('[data-usage-run-select]');
+        select.value = 'run-a';
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+
+        // Filtering updates the results, not the select the user just used.
+        expect(panel.querySelector('[data-usage-run-select]')).toBe(select);
+        const rows = panel.querySelectorAll('.vectfox-usage-requests-table tbody tr');
+        expect(rows).toHaveLength(1);
+        expect(panel.textContent).toContain('deepseek-batch-1');
+        expect(panel.textContent).not.toContain('deepseek-batch-30');
+        expect(panel.querySelectorAll('.vectfox-usage-configurations-table tbody tr')).toHaveLength(1);
+        expect(panel.textContent).toContain('Ghosting on · batch 1 · keep 10');
+        expect(panel.textContent).not.toContain('Ghosting on · batch 30 · keep 10');
+    });
+
+    it('moves a filtered view to the new run when a measurement starts', () => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+        const settings = { usage_tracking_enabled: true };
+        let currentRunId = 'run-b';
+        let runs = [...runsFixture];
+        const records = [
+            measuredRecord({ recordId: 'rec-b', runId: 'run-b', model: 'deepseek-batch-30' }),
+            measuredRecord({ recordId: 'rec-a', runId: 'run-a', model: 'deepseek-batch-1' }),
+        ];
+        const ledger = {
+            recordsFor: () => records,
+            runsFor: () => runs,
+            currentRunIdFor: () => currentRunId,
+        };
+
+        initializeUsagePanel({
+            settings,
+            ledger,
+            getChatId: () => 'chat-1',
+            onRunStart: () => {
+                currentRunId = 'run-new';
+                runs = [{ runId: 'run-new', label: 'Run 3', startedAt: 1_700_000_120_000, endedAt: null }, ...runs];
+            },
+        });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        const select = panel.querySelector('[data-usage-run-select]');
+        select.value = 'run-a';
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+
+        panel.querySelector('[data-usage-run-start]').click();
+
+        expect(panel.querySelector('[data-usage-run-select]').value).toBe('run-new');
+        expect(panel.textContent).toMatch(/no requests in this measurement run/i);
     });
 });

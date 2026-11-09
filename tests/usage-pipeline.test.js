@@ -809,6 +809,82 @@ describe('usage pipeline — configuration snapshot', () => {
     });
 });
 
+describe('usage pipeline — measurement runs', () => {
+    it('stamps the run that was current when the request was sent', async () => {
+        const fetchMock = vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } }));
+        const target = { fetch: fetchMock };
+        const ledger = new UsageLedger();
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            getRunId: () => ledger.currentRunIdFor('chat-1'),
+            handleRecord: (record) => ledger.add(record),
+        });
+
+        const firstRun = ledger.startRun('chat-1', { now: 1_700_000_000_000 });
+        const call = target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) });
+        // A new run starts while the first request is still in flight. The
+        // record belongs to the run that was open when it was sent.
+        const secondRun = ledger.startRun('chat-1', { now: 1_700_000_050_000 });
+        await call;
+
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        expect(ledger.recordsFor('chat-1')[0].runId).toBe(firstRun.runId);
+        expect(secondRun.runId).not.toBe(firstRun.runId);
+    });
+
+    it('stamps the run on a streamed reply as well', async () => {
+        const fetchMock = vi.fn(async () => sseResponse([
+            'data: {"id":"gen-1","usage":{"prompt_tokens":10,"prompt_cache_hit_tokens":5}}\n\n',
+            'data: [DONE]\n\n',
+        ]));
+        const target = { fetch: fetchMock };
+        const ledger = new UsageLedger();
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            getRunId: () => ledger.currentRunIdFor('chat-1'),
+            handleRecord: (record) => ledger.add(record),
+        });
+
+        const run = ledger.startRun('chat-1', { now: 1_700_000_000_000 });
+        await target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody({ stream: true })) });
+
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            runId: run.runId,
+            status: 'ok',
+            hitTokens: 5,
+        });
+    });
+
+    it('keeps earlier runs available when a new measurement starts', () => {
+        const ledger = new UsageLedger();
+
+        const first = ledger.startRun('chat-a', { now: 1_700_000_000_000 });
+        const second = ledger.startRun('chat-a', { now: 1_700_000_060_000 });
+
+        expect(ledger.currentRunIdFor('chat-a')).toBe(second.runId);
+        expect(ledger.runsFor('chat-a')).toMatchObject([
+            { runId: second.runId, label: 'Run 2', startedAt: 1_700_000_060_000, endedAt: null },
+            { runId: first.runId, label: 'Run 1', startedAt: 1_700_000_000_000, endedAt: 1_700_000_060_000 },
+        ]);
+        expect(ledger.runsFor('chat-b')).toEqual([]);
+    });
+
+    it('leaves runId null when no measurement run is open', async () => {
+        const fetchMock = vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } }));
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) });
+
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        expect(ledger.recordsFor('chat-1')[0].runId).toBeNull();
+    });
+});
+
 describe('usage pipeline — observer health', () => {
     const HEALTHY = { matched: 0, captured: 0, skipped: 0, errors: 0 };
 

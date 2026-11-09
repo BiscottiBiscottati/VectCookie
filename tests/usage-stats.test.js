@@ -8,7 +8,12 @@
 
 import { describe, it, expect } from 'vitest';
 
-import { createDefaultUsagePrices, summarizeUsage, summarizeByOrigin } from '../core/usage-stats.js';
+import {
+    createDefaultUsagePrices,
+    summarizeUsage,
+    summarizeByConfiguration,
+    summarizeByOrigin,
+} from '../core/usage-stats.js';
 
 function record(overrides = {}) {
     return {
@@ -238,5 +243,54 @@ describe('usage statistics — by origin', () => {
         expect(origins.map((entry) => entry.origin)).toEqual(['story', 'vectfox-internal']);
         expect(origins[0]).toMatchObject({ requests: 2, promptTokens: 3000, hitTokens: 1500 });
         expect(origins[1].hitRate).toBe(0);
+    });
+});
+
+describe('usage statistics — by configuration', () => {
+    it('orders configurations by ghosting state, batch size and keep-recent, unknown last', () => {
+        const rows = summarizeByConfiguration([
+            record({ configuration: { ghostEnabled: true, ghostBatchSize: 30, ghostKeepRecent: 10 } }),
+            record({ recordId: 'rec-2', configuration: { ghostEnabled: false, ghostBatchSize: 30, ghostKeepRecent: 10 } }),
+            record({ recordId: 'rec-3', configuration: { ghostEnabled: true, ghostBatchSize: 1, ghostKeepRecent: 5 } }),
+            record({ recordId: 'rec-4', configuration: { ghostEnabled: true, ghostBatchSize: 1, ghostKeepRecent: 10 } }),
+            record({ recordId: 'rec-5', configuration: null }),
+        ]);
+
+        expect(rows.map((entry) => entry.configuration && [
+            entry.configuration.ghostEnabled,
+            entry.configuration.ghostBatchSize,
+            entry.configuration.ghostKeepRecent,
+        ])).toEqual([
+            [false, 30, 10],
+            [true, 1, 5],
+            [true, 1, 10],
+            [true, 30, 10],
+            null,
+        ]);
+    });
+
+    it('averages prompt over counted requests and cost over priced requests', () => {
+        const configuration = { ghostEnabled: true, ghostBatchSize: 30, ghostKeepRecent: 10 };
+        const [summary] = summarizeByConfiguration([
+            record({ promptTokens: 1000, hitTokens: 500, configuration }),
+            record({ recordId: 'rec-2', provider: 'custom', model: 'no-price', promptTokens: 100, hitTokens: 0, configuration }),
+            record({
+                recordId: 'rec-3',
+                status: 'no-usage',
+                usageSource: 'estimated',
+                promptTokens: null,
+                hitTokens: null,
+                missTokens: null,
+                estimatedPromptTokens: 500,
+                configuration,
+            }),
+        ], { prices: createDefaultUsagePrices() });
+
+        expect(summary.requests).toBe(3);
+        expect(summary.averagePromptTokens).toBeCloseTo(1600 / 3, 10);
+        expect(summary.averagePromptSource).toBe('estimated');
+        expect(summary.costedRequests).toBe(1);
+        expect(summary.costPerRequest).toBeCloseTo(summary.cost, 10);
+        expect(summary.costPerRequestSource).toBe('estimated');
     });
 });
