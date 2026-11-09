@@ -22,6 +22,12 @@ const SOURCE_LABELS = {
     estimated: 'estimated',
     unavailable: 'unavailable',
 };
+const ORIGIN_LABELS = {
+    story: 'story',
+    quiet: 'quiet',
+    'worker-profile': 'worker',
+    unknown: 'unknown',
+};
 
 /**
  * Turns ledger records into the labels the tab renders.
@@ -29,14 +35,53 @@ const SOURCE_LABELS = {
  * @param {object} [options]
  * @param {object[]} [options.records] Newest-first records for the active chat.
  * @param {boolean} [options.trackingEnabled] Whether the observer is capturing.
- * @returns {{empty: boolean, emptyMessage: string, trackingEnabled: boolean, rows: object[]}}
+ * @param {object|null} [options.health] Observer health counters, when installed.
+ * @returns {{empty: boolean, emptyMessage: string, trackingEnabled: boolean, health: object, rows: object[]}}
  */
-export function buildUsageView({ records = [], trackingEnabled = false } = {}) {
+export function buildUsageView({ records = [], trackingEnabled = false, health = null } = {}) {
     return {
         trackingEnabled,
+        health: describeObserverHealth({ trackingEnabled, health }),
         empty: records.length === 0,
         emptyMessage: trackingEnabled ? EMPTY_ON : EMPTY_OFF,
         rows: records.map(buildRow),
+    };
+}
+
+/**
+ * Separates "tracking is off", "observer installed but nothing captured yet"
+ * and "the observer is failing", so an empty table is never ambiguous.
+ *
+ * @param {{trackingEnabled: boolean, health: object|null}} options
+ * @returns {{state: string, label: string}}
+ */
+export function describeObserverHealth({ trackingEnabled = false, health = null } = {}) {
+    if (!trackingEnabled) {
+        return { state: 'off', label: 'Tracking is off — the observer is not installed.' };
+    }
+    if (!health) {
+        return { state: 'not-installed', label: 'Tracking is on, but the observer is not installed yet.' };
+    }
+
+    const skippedCount = Number(health.skipped) || 0;
+    const skipped = skippedCount > 0
+        ? `, ${skippedCount} request${skippedCount === 1 ? '' : 's'} skipped`
+        : '';
+    const errorCount = Number(health.errors) || 0;
+    if (errorCount > 0) {
+        return {
+            state: 'error',
+            label: `Observer error — ${errorCount} capture attempt${errorCount === 1 ? '' : 's'} failed${skipped}. Rows may be missing.`,
+        };
+    }
+
+    const captured = Number(health.captured) || 0;
+    if (captured === 0) {
+        return { state: 'idle', label: `Observer installed — no requests captured yet${skipped}.` };
+    }
+    return {
+        state: 'ok',
+        label: `Observer installed — ${captured} request${captured === 1 ? '' : 's'} captured${skipped}.`,
     };
 }
 
@@ -44,6 +89,7 @@ function buildRow(record) {
     return {
         recordId: record.recordId,
         timeLabel: formatTime(record.timestamp),
+        originLabel: formatOrigin(record),
         providerModel: `${record.provider ?? 'unknown'} / ${record.model ?? 'unknown'}`,
         promptLabel: formatCount(record.promptTokens),
         hitLabel: formatCount(record.hitTokens),
@@ -51,6 +97,13 @@ function buildRow(record) {
         totalLabel: formatCount(record.totalTokens),
         sourceLabel: SOURCE_LABELS[record.usageSource] ?? SOURCE_LABELS.unavailable,
     };
+}
+
+function formatOrigin(record) {
+    if (record.origin === 'vectfox-internal') {
+        return `VectFox · ${record.featureLabel || 'internal'}`;
+    }
+    return ORIGIN_LABELS[record.origin] ?? ORIGIN_LABELS.unknown;
 }
 
 function formatCount(value) {
@@ -71,6 +124,7 @@ function formatTime(timestamp) {
  * @param {object} [options.settings] VectFox settings object.
  * @param {{recordsFor: (chatId: string|null) => object[]}} [options.ledger]
  * @param {() => (string|null)} [options.getChatId]
+ * @param {() => (object|null)} [options.getHealth] Observer health counters.
  * @param {(enabled: boolean) => void} [options.onTrackingChange] Persists the
  *   toggle and installs the observer when it turns on.
  * @returns {() => void} Refresh callback.
@@ -79,6 +133,7 @@ export function initializeUsagePanel({
     settings = {},
     ledger,
     getChatId = () => null,
+    getHealth = () => null,
     onTrackingChange,
 } = {}) {
     const container = document.getElementById('VectFox_usage_panel');
@@ -89,6 +144,7 @@ export function initializeUsagePanel({
         container.innerHTML = renderPanel(buildUsageView({
             records,
             trackingEnabled: !!settings.usage_tracking_enabled,
+            health: getHealth?.() ?? null,
         }));
     };
 
@@ -123,6 +179,9 @@ function renderPanel(view) {
                     network calls of its own.
                 </small>
             </div>
+            <div class="vectfox-usage-health vectfox-usage-health-${StringUtils.escapeHtml(view.health.state)}" role="status">
+                ${StringUtils.escapeHtml(view.health.label)}
+            </div>
             ${view.empty ? renderEmpty(view) : renderTable(view.rows)}
         </div>
     `;
@@ -136,6 +195,7 @@ function renderTable(rows) {
     const body = rows.map((row) => `
         <tr>
             <td class="vectfox-usage-time">${StringUtils.escapeHtml(row.timeLabel)}</td>
+            <td class="vectfox-usage-origin">${StringUtils.escapeHtml(row.originLabel)}</td>
             <td class="vectfox-usage-model">${StringUtils.escapeHtml(row.providerModel)}</td>
             <td class="num">${StringUtils.escapeHtml(row.promptLabel)}</td>
             <td class="num">${StringUtils.escapeHtml(row.hitLabel)}</td>
@@ -151,6 +211,7 @@ function renderTable(rows) {
                 <thead>
                     <tr>
                         <th>Time</th>
+                        <th>Origin</th>
                         <th>Provider / model</th>
                         <th class="num">Prompt</th>
                         <th class="num">Hit</th>

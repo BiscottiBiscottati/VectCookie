@@ -30,6 +30,7 @@
 import { getRequestHeaders } from '../../../../../script.js';
 import { getModelConfigErrorMessage } from './model-http-errors.js';
 import { isConnectionError, notifyConnectionError, notifyUpstreamRejection } from './model-config-notifier.js';
+import { beginInternalCall, endInternalCall } from './usage-attribution.js';
 import { log } from './log.js';
 
 /**
@@ -267,12 +268,20 @@ export async function postChatCompletion({
         ? { chat_completion_source: 'custom', custom_url: vllmUrl, ...body }
         : { chat_completion_source: 'openrouter', ...body };
 
-    const response = await fetch('/api/backends/chat-completions/generate', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(timeoutMs),
-    });
+    // VectFox's own helper: tell the usage observer this request is internal, so
+    // an extraction made during a story turn is never attributed to the story.
+    const internalCall = beginInternalCall(contextLabel);
+    let response;
+    try {
+        response = await fetch('/api/backends/chat-completions/generate', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify(requestBody),
+            signal: AbortSignal.timeout(timeoutMs),
+        });
+    } finally {
+        endInternalCall(internalCall);
+    }
 
     if (!response.ok) {
         const errText = await response.text().catch(() => response.statusText);

@@ -118,3 +118,106 @@ describe('usage panel — jsdom smoke', () => {
         expect(panel.textContent).toMatch(/tracking is off/i);
     });
 });
+
+describe('usage view model — origins', () => {
+    it('makes each origin distinguishable in the row', () => {
+        const rows = buildUsageView({
+            records: [
+                measuredRecord({ origin: 'story' }),
+                measuredRecord({ origin: 'quiet' }),
+                measuredRecord({ origin: 'worker-profile' }),
+                measuredRecord({ origin: 'vectfox-internal', featureLabel: 'EventBase' }),
+                measuredRecord({ origin: 'unknown' }),
+            ],
+            trackingEnabled: true,
+        }).rows;
+
+        expect(rows.map((row) => row.originLabel)).toEqual([
+            'story',
+            'quiet',
+            'worker',
+            'VectFox · EventBase',
+            'unknown',
+        ]);
+    });
+
+    it('falls back to unknown when a record predates origins', () => {
+        const [row] = buildUsageView({ records: [measuredRecord()], trackingEnabled: true }).rows;
+        expect(row.originLabel).toBe('unknown');
+    });
+});
+
+describe('usage view model — observer health', () => {
+    it('says tracking is off when the observer is not installed', () => {
+        const view = buildUsageView({ records: [], trackingEnabled: false });
+
+        expect(view.health.state).toBe('off');
+        expect(view.health.label).toMatch(/tracking is off/i);
+    });
+
+    it('distinguishes "no requests captured yet" from an observer error', () => {
+        const idle = buildUsageView({
+            records: [],
+            trackingEnabled: true,
+            health: { matched: 0, captured: 0, skipped: 0, errors: 0 },
+        });
+        expect(idle.health.state).toBe('idle');
+        expect(idle.health.label).toMatch(/no requests captured yet/i);
+
+        const failed = buildUsageView({
+            records: [],
+            trackingEnabled: true,
+            health: { matched: 3, captured: 2, skipped: 0, errors: 1 },
+        });
+        expect(failed.health.state).toBe('error');
+        expect(failed.health.label).toMatch(/observer error/i);
+        expect(failed.health.label).not.toMatch(/no requests captured yet/i);
+    });
+
+    it('reports how many requests were captured while healthy', () => {
+        const view = buildUsageView({
+            records: [measuredRecord({ origin: 'story' })],
+            trackingEnabled: true,
+            health: { matched: 2, captured: 2, skipped: 0, errors: 0 },
+        });
+
+        expect(view.health.state).toBe('ok');
+        expect(view.health.label).toMatch(/2 requests captured/i);
+    });
+
+    it('mentions skipped requests without calling them errors', () => {
+        const view = buildUsageView({
+            records: [],
+            trackingEnabled: true,
+            health: { matched: 1, captured: 0, skipped: 1, errors: 0 },
+        });
+
+        expect(view.health.state).toBe('idle');
+        expect(view.health.label).toMatch(/1 request skipped/i);
+    });
+});
+
+describe('usage panel — health and origin smoke', () => {
+    beforeEach(() => {
+        document.body.innerHTML = '';
+    });
+
+    it('renders the health line and each row origin', () => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+        const settings = { usage_tracking_enabled: true };
+        const ledger = {
+            recordsFor: () => [measuredRecord({ origin: 'vectfox-internal', featureLabel: 'EventBase' })],
+        };
+
+        initializeUsagePanel({
+            settings,
+            ledger,
+            getChatId: () => 'chat-1',
+            getHealth: () => ({ matched: 1, captured: 1, skipped: 0, errors: 0 }),
+        });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        expect(panel.textContent).toMatch(/1 request captured/i);
+        expect(panel.textContent).toMatch(/VectFox · EventBase/);
+    });
+});

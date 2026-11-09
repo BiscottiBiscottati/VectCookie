@@ -35,6 +35,7 @@ vi.mock('../core/log.js', () => ({
 
 import StringUtils from '../utils/string-utils.js';
 import { postChatCompletion, parseJsonArrayFromLlm, resolveModelParameterStyle, LlmCallError } from '../core/llm-provider-call.js';
+import { resolveUsageOrigin, resetUsageAttribution } from '../core/usage-attribution.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -532,5 +533,38 @@ describe('StringUtils.ensureArray', () => {
     });
     it('coerces non-string members via String()', () => {
         expect(StringUtils.ensureArray([1, 2, 2, null])).toEqual(['1', '2']);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// postChatCompletion — usage attribution flag
+// ---------------------------------------------------------------------------
+
+describe('postChatCompletion — internal-call flag', () => {
+    beforeEach(() => {
+        resetUsageAttribution();
+    });
+
+    it('marks its request vectfox-internal for the duration of the fetch', async () => {
+        let duringFetch = null;
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            duringFetch = resolveUsageOrigin();
+            return okResponse({ content: 'hi' });
+        }));
+
+        await postChatCompletion(baseArgs({ contextLabel: 'EventBase' }));
+
+        expect(duringFetch).toEqual({ origin: 'vectfox-internal', featureLabel: 'EventBase' });
+        // Released afterwards: the next request is not tainted.
+        expect(resolveUsageOrigin()).toEqual({ origin: 'worker-profile', featureLabel: null });
+    });
+
+    it('releases the flag when the fetch rejects', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            throw new Error('network down');
+        }));
+
+        await expect(postChatCompletion(baseArgs())).rejects.toThrow('network down');
+        expect(resolveUsageOrigin()).toEqual({ origin: 'worker-profile', featureLabel: null });
     });
 });

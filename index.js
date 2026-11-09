@@ -48,9 +48,10 @@ import { renderSettings, openDiagnosticsModal, loadWebLlmModels, updateWebLlmSta
 import { initializeVisualizer } from './ui/chunk-visualizer.js';
 import { initializeDatabaseBrowser } from './ui/database-browser.js';
 import { initializeWorldInfoIntegration } from './core/world-info-integration.js';
-import { refreshWorldInfoEntryDepthCache } from './core/summarizer-injection.js';
+import { refreshWorldInfoEntryDepthCache, normalizeGhostStep } from './core/summarizer-injection.js';
 import { CJK_TOKENIZER_MODES, setCjkTokenizerMode, ensureJiebaTokenizerLoaded, ensureJiebaTwLoaded } from './core/bm25-scorer.js';
-import { installUsageObserver } from './core/usage-observer.js';
+import { installUsageObserver, getUsageObserverHealth } from './core/usage-observer.js';
+import { noteGenerationStarted, noteGenerationEnded } from './core/usage-attribution.js';
 import { UsageLedger } from './core/usage-ledger.js';
 import { initializeUsagePanel } from './ui/usage-panel.js';
 
@@ -758,26 +759,51 @@ jQuery(async () => {
     // wrapping fetch a second time. Off at startup means no wrapper at all.
     const usageLedger = new UsageLedger();
     const getActiveChatId = () => getContext()?.chatId ?? null;
-    let refreshUsagePanel = () => {};
-    const installUsageTelemetry = () => installUsageObserver({
-        isEnabled: () => !!settings.usage_tracking_enabled,
-        getChatId: getActiveChatId,
-        handleRecord: (record) => {
-            usageLedger.add(record);
-            refreshUsagePanel();
-        },
+    // What ghosting was actually doing when the request went out. Ghosting is
+    // gated on Summarizer Injection, so the raw checkbox alone would report
+    // "on" for requests nothing wiped.
+    const readUsageConfiguration = () => ({
+        ghostEnabled: !!(settings.eventbase_ghost_enabled && settings.summarizer_injection_enabled),
+        ghostBatchSize: normalizeGhostStep(settings.eventbase_ghost_step),
+        ghostKeepRecent: Math.max(0, Math.min(100, Math.floor(Number(settings.eventbase_ghost_keep_recent) || 0))),
     });
+    let usageGenerationStateBound = false;
+    const bindUsageGenerationState = () => {
+        if (usageGenerationStateBound) return;
+        usageGenerationStateBound = true;
+        eventSource.on(event_types.GENERATION_STARTED, (type, options, dryRun) => {
+            noteGenerationStarted(type, { dryRun, quietToLoud: options?.quietToLoud });
+        });
+        eventSource.on(event_types.GENERATION_ENDED, () => noteGenerationEnded());
+        eventSource.on(event_types.GENERATION_STOPPED, () => noteGenerationEnded());
+    };
+    let refreshUsagePanel = () => {};
+    const installUsageTelemetry = () => {
+        bindUsageGenerationState();
+        return installUsageObserver({
+            isEnabled: () => !!settings.usage_tracking_enabled,
+            getChatId: getActiveChatId,
+            getConfig: readUsageConfiguration,
+            handleRecord: (record) => usageLedger.add(record),
+            // Refresh on settle, not on record: a skipped body or a failed
+            // capture writes no record but still changes the health line.
+            onSettle: () => refreshUsagePanel(),
+        });
+    };
+    // Install before the panel renders so a returning user sees the observer's
+    // real health ("no requests captured yet"), not "not installed yet".
+    if (settings.usage_tracking_enabled) installUsageTelemetry();
     refreshUsagePanel = initializeUsagePanel({
         settings,
         ledger: usageLedger,
         getChatId: getActiveChatId,
+        getHealth: () => getUsageObserverHealth(),
         onTrackingChange: (enabled) => {
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
             if (enabled) installUsageTelemetry();
         },
     });
-    if (settings.usage_tracking_enabled) installUsageTelemetry();
 
     // Initialize auto-sync checkbox state for current chat (if any)
     refreshAutoSyncCheckbox(settings);

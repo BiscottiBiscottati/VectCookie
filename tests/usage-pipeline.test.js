@@ -8,8 +8,15 @@
 
 import { describe, it, expect, vi } from 'vitest';
 
-import { installUsageObserver } from '../core/usage-observer.js';
+import { installUsageObserver, getUsageObserverHealth } from '../core/usage-observer.js';
 import { UsageLedger } from '../core/usage-ledger.js';
+import {
+    noteGenerationStarted,
+    noteGenerationEnded,
+    beginInternalCall,
+    endInternalCall,
+    resetUsageAttribution,
+} from '../core/usage-attribution.js';
 
 const ENDPOINT = '/api/backends/chat-completions/generate';
 
@@ -652,5 +659,289 @@ describe('usage pipeline — partial usage', () => {
             hitTokens: null,
             totalTokens: 50,
         });
+    });
+});
+
+describe('usage pipeline — origins', () => {
+    async function recordOne({ prepare, installOptions = {} } = {}) {
+        const fetchMock = vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } }));
+        const target = { fetch: fetchMock };
+        const ledger = new UsageLedger();
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: (record) => ledger.add(record),
+            ...installOptions,
+        });
+        prepare?.();
+        const returned = await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody()),
+        });
+        prepare?.afterResponse?.();
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        return { record: ledger.recordsFor('chat-1')[0], returned };
+    }
+
+    it('tags a normal generation as story, decided when the request is sent', async () => {
+        resetUsageAttribution();
+        noteGenerationStarted('normal');
+
+        const { record } = await recordOne({
+            prepare: Object.assign(
+                () => {},
+                { afterResponse: () => noteGenerationEnded() },
+            ),
+        });
+
+        expect(record).toMatchObject({ origin: 'story', featureLabel: null });
+    });
+
+    it('tags a quiet generation as quiet', async () => {
+        resetUsageAttribution();
+        noteGenerationStarted('quiet');
+
+        const { record } = await recordOne();
+
+        expect(record).toMatchObject({ origin: 'quiet', featureLabel: null });
+    });
+
+    it('tags a request outside any generation as worker-profile', async () => {
+        resetUsageAttribution();
+
+        const { record } = await recordOne();
+
+        expect(record).toMatchObject({ origin: 'worker-profile', featureLabel: null });
+    });
+
+    it('lets the internal-call flag win over an in-flight generation', async () => {
+        resetUsageAttribution();
+        noteGenerationStarted('normal');
+        const call = beginInternalCall('EventBase');
+
+        const { record } = await recordOne({
+            prepare: () => {},
+        });
+        endInternalCall(call);
+
+        expect(record).toMatchObject({ origin: 'vectfox-internal', featureLabel: 'EventBase' });
+    });
+
+    it('tags a quiet-to-loud generation as story because its result is posted', async () => {
+        resetUsageAttribution();
+        noteGenerationStarted('quiet', { quietToLoud: true });
+
+        const { record } = await recordOne();
+
+        expect(record).toMatchObject({ origin: 'story', featureLabel: null });
+    });
+
+    it('does not let a dry run make the next worker request look like story', async () => {
+        resetUsageAttribution();
+        noteGenerationStarted('normal', { dryRun: true });
+
+        const { record } = await recordOne();
+
+        expect(record).toMatchObject({ origin: 'worker-profile', featureLabel: null });
+    });
+
+    it('reads origin through the current sink after a reinstall', async () => {
+        const fetchMock = vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } }));
+        const target = { fetch: fetchMock };
+        const second = [];
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: () => {},
+            getOrigin: () => ({ origin: 'quiet', featureLabel: null }),
+        });
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: (record) => second.push(record),
+            getOrigin: () => ({ origin: 'vectfox-internal', featureLabel: 'Summarizer' }),
+        });
+
+        await target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) });
+        await vi.waitFor(() => expect(second).toHaveLength(1));
+        expect(second[0]).toMatchObject({ origin: 'vectfox-internal', featureLabel: 'Summarizer' });
+    });
+
+    it('tags an unrecognised generation type as unknown', async () => {
+        resetUsageAttribution();
+        noteGenerationStarted('mystery-mode');
+
+        const { record } = await recordOne();
+
+        expect(record).toMatchObject({ origin: 'unknown', featureLabel: null });
+    });
+});
+
+describe('usage pipeline — configuration snapshot', () => {
+    it('stamps the ghosting configuration active when the request was sent', async () => {
+        let config = { ghostEnabled: true, ghostBatchSize: 30, ghostKeepRecent: 10 };
+        const fetchMock = vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } }));
+        const target = { fetch: fetchMock };
+        const ledger = new UsageLedger();
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: (record) => ledger.add(record),
+            getConfig: () => config,
+        });
+
+        const call = target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) });
+        // A setting change after the request went out must not rewrite history.
+        config = { ghostEnabled: false, ghostBatchSize: 1, ghostKeepRecent: 0 };
+        await call;
+
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        expect(ledger.recordsFor('chat-1')[0].configuration).toEqual({
+            ghostEnabled: true,
+            ghostBatchSize: 30,
+            ghostKeepRecent: 10,
+        });
+    });
+});
+
+describe('usage pipeline — observer health', () => {
+    const HEALTHY = { matched: 0, captured: 0, skipped: 0, errors: 0 };
+
+    it('reports no requests captured yet before anything was sent', () => {
+        const target = { fetch: vi.fn(async () => jsonResponse({})) };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: () => {},
+        });
+
+        expect(getUsageObserverHealth(target)).toEqual(HEALTHY);
+    });
+
+    it('returns null when no observer is installed', () => {
+        expect(getUsageObserverHealth({})).toBeNull();
+    });
+
+    it('counts captured requests and never counts a non-target fetch', async () => {
+        const target = { fetch: vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } })) };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: () => {},
+        });
+
+        await target.fetch('/api/backends/text-completions/generate', { method: 'POST', body: '{}' });
+        await target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) });
+
+        await vi.waitFor(() => expect(getUsageObserverHealth(target).captured).toBe(1));
+        expect(getUsageObserverHealth(target)).toEqual({ ...HEALTHY, matched: 1, captured: 1 });
+    });
+
+    it('counts a request with no readable body as skipped, not captured', async () => {
+        const target = { fetch: vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } })) };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: () => {},
+        });
+
+        await target.fetch(ENDPOINT, { method: 'POST', body: new FormData() });
+
+        await vi.waitFor(() => expect(getUsageObserverHealth(target).skipped).toBe(1));
+        expect(getUsageObserverHealth(target)).toMatchObject({ matched: 1, captured: 0 });
+    });
+
+    it('counts a failed capture as an observer error without failing the caller', async () => {
+        const response = jsonResponse({ usage: { prompt_tokens: 10 } });
+        const target = { fetch: vi.fn(async () => response) };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: () => {
+                throw new Error('ledger exploded');
+            },
+        });
+
+        await expect(target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) })).resolves.toBe(response);
+
+        await vi.waitFor(() => expect(getUsageObserverHealth(target).errors).toBe(1));
+        expect(getUsageObserverHealth(target)).toMatchObject({ matched: 1, captured: 0 });
+    });
+});
+
+describe('usage pipeline — capture settlement', () => {
+    it('notifies after a successful capture so the panel can refresh', async () => {
+        const onSettle = vi.fn();
+        const target = { fetch: vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } })) };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: () => {},
+            onSettle,
+        });
+
+        await target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) });
+
+        await vi.waitFor(() => expect(onSettle).toHaveBeenCalledTimes(1));
+    });
+
+    it('notifies after a skipped body, because the health line changed', async () => {
+        const onSettle = vi.fn();
+        const target = { fetch: vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } })) };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: () => {},
+            onSettle,
+        });
+
+        await target.fetch(ENDPOINT, { method: 'POST', body: new FormData() });
+
+        await vi.waitFor(() => expect(onSettle).toHaveBeenCalledTimes(1));
+    });
+
+    it('notifies after a capture failure, because the health line changed', async () => {
+        const onSettle = vi.fn();
+        const target = { fetch: vi.fn(async () => jsonResponse({ usage: { prompt_tokens: 10 } })) };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: () => {
+                throw new Error('ledger exploded');
+            },
+            onSettle,
+        });
+
+        await target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) });
+
+        await vi.waitFor(() => expect(onSettle).toHaveBeenCalledTimes(1));
+    });
+
+    it('does not notify for a non-target fetch', async () => {
+        const onSettle = vi.fn();
+        const target = { fetch: vi.fn(async () => jsonResponse({})) };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: () => {},
+            onSettle,
+        });
+
+        await target.fetch('/api/backends/text-completions/generate', { method: 'POST', body: '{}' });
+        await settle();
+
+        expect(onSettle).not.toHaveBeenCalled();
     });
 });
