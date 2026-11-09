@@ -38,6 +38,9 @@ let _recordSequence = 0;
  *   reading the new attribution state.
  * @param {() => (object|null)} [options.getConfig] Ghosting configuration
  *   snapshot, read synchronously when the request is sent.
+ * @param {(messages: object[]) => (number|Promise<number|null>|null)} [options.estimatePromptTokens]
+ *   Optional prompt-token estimate from the request messages, used only when
+ *   the provider reported no usage. Runs after the response, never on its path.
  * @param {() => void} [options.onSettle] Called after every observed request's
  *   capture attempt finishes, including a skipped body or a capture failure, so
  *   the health line can refresh without a record.
@@ -52,6 +55,7 @@ export function installUsageObserver({
     handleRecord = () => {},
     getOrigin = resolveUsageOrigin,
     getConfig = () => null,
+    estimatePromptTokens = null,
     onSettle = () => {},
     now = () => Date.now(),
 } = {}) {
@@ -65,6 +69,7 @@ export function installUsageObserver({
         handleRecord,
         getOrigin,
         getConfig,
+        estimatePromptTokens,
         onSettle,
         now,
         health: createHealth(),
@@ -389,6 +394,10 @@ async function captureJsonRecord({ sink, init, chatId, origin, configuration, cl
     if (!body) return;
 
     const usage = data && typeof data === 'object' ? data.usage : null;
+    const status = usageStatus({ error: !!data?.error, usage });
+    const estimatedPromptTokens = status === 'no-usage'
+        ? await estimatePrompt(sink, body)
+        : null;
     emitRecord(sink, buildRecord({
         body,
         chatId,
@@ -399,7 +408,8 @@ async function captureJsonRecord({ sink, init, chatId, origin, configuration, cl
         responseId: data?.id ?? null,
         cacheDiscount: toCount(data?.cache_discount),
         usage,
-        status: usageStatus({ error: !!data?.error, usage }),
+        status,
+        estimatedPromptTokens,
         startedAt,
         latencyMs,
     }));
@@ -421,6 +431,10 @@ async function captureStreamedRecord({ sink, init, chatId, origin, configuration
 
     const { reader, ...result } = await readSseCapture(clone, init?.signal);
     try {
+        const status = usageStatus(result);
+        const estimatedPromptTokens = status === 'no-usage'
+            ? await estimatePrompt(sink, body)
+            : null;
         emitRecord(sink, buildRecord({
             body,
             chatId,
@@ -430,7 +444,8 @@ async function captureStreamedRecord({ sink, init, chatId, origin, configuration
             responseId: result.responseId,
             cacheDiscount: result.cacheDiscount,
             usage: result.usage,
-            status: usageStatus(result),
+            status,
+            estimatedPromptTokens,
             startedAt,
             latencyMs,
         }));
@@ -517,6 +532,22 @@ function drainSseLines(carry, result) {
     return carry;
 }
 
+/**
+ * Runs the injected estimator after a usage-less response. A missing or
+ * failing estimator leaves the prompt count unavailable rather than inventing
+ * a number; the observer still records the request.
+ */
+async function estimatePrompt(sink, body) {
+    const estimator = sink?.estimatePromptTokens;
+    if (typeof estimator !== 'function' || !Array.isArray(body?.messages)) return null;
+    try {
+        const value = await estimator(body.messages);
+        return Number.isFinite(value) && value >= 0 ? Math.round(value) : null;
+    } catch {
+        return null;
+    }
+}
+
 function buildRecord({
     body,
     chatId,
@@ -528,6 +559,7 @@ function buildRecord({
     cacheDiscount = null,
     usage = null,
     status,
+    estimatedPromptTokens = null,
     startedAt,
     latencyMs,
 }) {
@@ -570,7 +602,8 @@ function buildRecord({
         totalTokens,
         cost: toCount(usage?.cost),
         cacheDiscount: cacheDiscount ?? toCount(usage?.cache_discount),
-        usageSource: hasUsage ? 'measured' : 'unavailable',
+        estimatedPromptTokens,
+        usageSource: hasUsage ? 'measured' : (estimatedPromptTokens != null ? 'estimated' : 'unavailable'),
     };
 }
 

@@ -53,7 +53,7 @@ function chatBody(overrides = {}) {
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
 
-function installOver(fetchMock, { enabled = true, chatId = 'chat-1' } = {}) {
+function installOver(fetchMock, { enabled = true, chatId = 'chat-1', ...observerOptions } = {}) {
     const target = { fetch: fetchMock };
     const ledger = new UsageLedger();
     installUsageObserver({
@@ -62,6 +62,7 @@ function installOver(fetchMock, { enabled = true, chatId = 'chat-1' } = {}) {
         getChatId: () => chatId,
         handleRecord: (record) => ledger.add(record),
         now: () => 1_700_000_000_000,
+        ...observerOptions,
     });
     return { target, ledger };
 }
@@ -943,5 +944,107 @@ describe('usage pipeline — capture settlement', () => {
         await settle();
 
         expect(onSettle).not.toHaveBeenCalled();
+    });
+});
+
+
+describe('usage pipeline — estimate fallback', () => {
+    it('estimates prompt tokens from the request messages when JSON usage is missing', async () => {
+        const estimator = vi.fn(async (messages) => messages.length * 120);
+        const response = jsonResponse({ id: 'gen-1', choices: [] });
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock, { estimatePromptTokens: estimator });
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({
+                chat_completion_source: 'custom',
+                messages: [
+                    { role: 'system', content: 'a longer prompt' },
+                    { role: 'user', content: 'hello' },
+                ],
+            })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(estimator).toHaveBeenCalledWith([
+            { role: 'system', content: 'a longer prompt' },
+            { role: 'user', content: 'hello' },
+        ]);
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'no-usage',
+            usageSource: 'estimated',
+            promptTokens: null,
+            estimatedPromptTokens: 240,
+            hitTokens: null,
+            missTokens: null,
+        });
+    });
+
+    it('estimates a completed stream that carried no usage', async () => {
+        const estimator = vi.fn(async () => 75);
+        const response = sseResponse([
+            'data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\n',
+            'data: [DONE]\n\n',
+        ]);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock, { estimatePromptTokens: estimator });
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: true })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'no-usage',
+            usageSource: 'estimated',
+            estimatedPromptTokens: 75,
+            hitTokens: null,
+        });
+    });
+
+    it('does not estimate when the provider reported usage', async () => {
+        const estimator = vi.fn(async () => 999);
+        const response = jsonResponse({ usage: { prompt_tokens: 10, completion_tokens: 2 } });
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock, { estimatePromptTokens: estimator });
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody()),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(estimator).not.toHaveBeenCalled();
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'ok',
+            usageSource: 'measured',
+            promptTokens: 10,
+            estimatedPromptTokens: null,
+        });
+    });
+
+    it('keeps the row available but unestimated when the estimator fails', async () => {
+        const estimator = vi.fn(async () => {
+            throw new Error('tokenizer unavailable');
+        });
+        const response = jsonResponse({ id: 'gen-1', choices: [] });
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock, { estimatePromptTokens: estimator });
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody()),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'no-usage',
+            usageSource: 'unavailable',
+            promptTokens: null,
+            estimatedPromptTokens: null,
+            hitTokens: null,
+        });
     });
 });
