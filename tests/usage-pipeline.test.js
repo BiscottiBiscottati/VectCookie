@@ -46,6 +46,17 @@ function sseResponse(parts, { status = 200 } = {}) {
     });
 }
 
+function sseResponseWithoutContentType(parts, { status = 200 } = {}) {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+        start(controller) {
+            for (const part of parts) controller.enqueue(encoder.encode(part));
+            controller.close();
+        },
+    });
+    return new Response(stream, { status });
+}
+
 function chatBody(overrides = {}) {
     return {
         chat_completion_source: 'openrouter',
@@ -179,6 +190,61 @@ describe('usage pipeline — streamed capture', () => {
 
         // The caller's body is still the provider's bytes, untouched.
         await expect(returned.text()).resolves.toBe(chunks.join(''));
+    });
+
+    it('captures a stream when the proxy omits the content type', async () => {
+        // SillyTavern proxies the provider SSE without a content-type header.
+        // The request's stream flag is the fallback signal.
+        const chunks = [
+            'data: {"id":"deepseek-1","model":"deepseek-flash","choices":[{"index":0,"delta":{"content":null,"reasoning_content":""}}]}\n\n',
+            'data: {"id":"deepseek-1","choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":1674,"completion_tokens":105,"total_tokens":1779,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":1674,"prompt_tokens_details":{"cached_tokens":0}}}\n\n',
+            'data: [DONE]\n\n',
+        ];
+        const response = sseResponseWithoutContentType(chunks);
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({
+                stream: true,
+                chat_completion_source: 'deepseek',
+                model: 'deepseek-flash',
+            })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'ok',
+            provider: 'deepseek',
+            model: 'deepseek-flash',
+            promptTokens: 1674,
+            hitTokens: 0,
+            missTokens: 1674,
+            completionTokens: 105,
+            usageSource: 'measured',
+        });
+    });
+
+    it('still reads JSON when the content type is missing but streaming was not requested', async () => {
+        const response = new Response(JSON.stringify({
+            id: 'json-1',
+            usage: { prompt_tokens: 42, completion_tokens: 2, total_tokens: 44 },
+        }));
+        const fetchMock = vi.fn(async () => response);
+        const { target, ledger } = installOver(fetchMock);
+
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ stream: false })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            status: 'ok',
+            promptTokens: 42,
+            usageSource: 'measured',
+        });
     });
 
     it('keeps OpenRouter cache-write tokens and its reported cost', async () => {

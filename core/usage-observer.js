@@ -169,7 +169,7 @@ export function installUsageObserver({
                 latencyMs,
                 httpStatus: response.status,
             };
-            if (isEventStream(response)) {
+            if (isEventStream(response, init)) {
                 startCapture(sink, () => captureStreamedRecord(captured));
             } else {
                 startCapture(sink, () => captureJsonRecord(captured));
@@ -357,9 +357,26 @@ function isChatCompletionRequest(input) {
     }
 }
 
-function isEventStream(response) {
+function isEventStream(response, init) {
     try {
-        return String(response?.headers?.get?.('content-type') ?? '').includes('text/event-stream');
+        const contentType = String(response?.headers?.get?.('content-type') ?? '').toLowerCase();
+        if (contentType.includes('text/event-stream')) return true;
+        if (contentType) return false;
+        // SillyTavern's chat-completion proxy pipes provider SSE without a
+        // content-type header. When the header is absent, the request's stream
+        // flag is the only reliable signal; a non-streamed JSON response keeps
+        // the JSON path.
+        return requestWantsStream(init);
+    } catch {
+        return false;
+    }
+}
+
+function requestWantsStream(init) {
+    const rawBody = init?.body;
+    if (typeof rawBody !== 'string') return false;
+    try {
+        return JSON.parse(rawBody)?.stream === true;
     } catch {
         return false;
     }
