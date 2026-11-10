@@ -26,6 +26,18 @@ export function normalizeUsageOrigin(origin) {
 }
 
 /**
+ * The single rule for a request that produced a record worth counting: a
+ * completed request (`ok` or `no-usage`). Failed and aborted rows are recorded
+ * but excluded from the completed counters.
+ *
+ * @param {unknown} status
+ * @returns {boolean}
+ */
+export function isCompletedUsageStatus(status) {
+    return COMPLETED_STATUSES.has(status);
+}
+
+/**
  * Seed price table. DeepSeek Flash off-peak rates from the ghosting cost
  * analysis in `.scratch/cache-friendly-ghosting/cost-analysis.md`: cache hit
  * $0.003/M, cache miss $0.15/M, output $0.60/M. Cache writes bill at the miss
@@ -372,7 +384,7 @@ function mergeSources(sources) {
 }
 
 function isCompleted(record) {
-    return !!record && COMPLETED_STATUSES.has(record.status);
+    return !!record && isCompletedUsageStatus(record.status);
 }
 
 function isMeasured(record) {

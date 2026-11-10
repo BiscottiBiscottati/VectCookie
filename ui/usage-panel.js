@@ -329,6 +329,7 @@ function buildRow(record, prices) {
     const measuredPrompt = Number.isFinite(record.promptTokens) ? record.promptTokens : null;
     const estimatedPrompt = Number.isFinite(record.estimatedPromptTokens) ? record.estimatedPromptTokens : null;
     const prompt = measuredPrompt ?? estimatedPrompt;
+    const sharedPrefix = Number.isFinite(record.sharedPrefixTokens) ? record.sharedPrefixTokens : null;
 
     return {
         recordId: record.recordId,
@@ -346,6 +347,13 @@ function buildRow(record, prices) {
         costSource: usageSourceLabel(cost.costSource),
         savingLabel: formatCost(cost.saving, prices.currency, cost.savingSource),
         savingSource: usageSourceLabel(cost.savingSource),
+        // Prefix tokens come from the tokenizer estimate, never from the
+        // provider; the field is empty when there is no comparable prior
+        // request or a matched message has no token count. The source label is
+        // empty too, so the table cell has one availability signal.
+        sharedPrefixLabel: formatCount(sharedPrefix),
+        sharedPrefixSource: sharedPrefix == null ? '' : usageSourceLabel('estimated'),
+        prefixBreakerLabel: record.possiblePrefixBreaker ? 'Possible prefix breaker' : '',
         sourceLabel: usageSourceLabel(record.usageSource),
     };
 }
@@ -765,6 +773,13 @@ function renderTable(rows) {
             <td class="num">${StringUtils.escapeHtml(row.totalLabel)}</td>
             <td class="num">${StringUtils.escapeHtml(row.costLabel)} ${renderSource(row.costSource)}</td>
             <td class="num">${StringUtils.escapeHtml(row.savingLabel)} ${renderSource(row.savingSource)}</td>
+            <td class="num">
+                ${StringUtils.escapeHtml(row.sharedPrefixLabel)}
+                ${row.sharedPrefixSource ? renderSource(row.sharedPrefixSource) : ''}
+                ${row.prefixBreakerLabel
+                    ? `<span class="vectfox-usage-prefix-flag" data-usage-prefix-flag>${StringUtils.escapeHtml(row.prefixBreakerLabel)}</span>`
+                    : ''}
+            </td>
             <td><span class="vectfox-usage-source vectfox-usage-source-${StringUtils.escapeHtml(row.sourceLabel)}">${StringUtils.escapeHtml(row.sourceLabel)}</span></td>
         </tr>
     `).join('');
@@ -784,6 +799,7 @@ function renderTable(rows) {
                         <th class="num">Total</th>
                         <th class="num">Cost</th>
                         <th class="num">Saving</th>
+                        <th class="num">Shared prefix</th>
                         <th>Source</th>
                     </tr>
                 </thead>

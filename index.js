@@ -56,7 +56,7 @@ import { noteGenerationStarted, noteGenerationEnded } from './core/usage-attribu
 import { UsageLedger } from './core/usage-ledger.js';
 import { normalizeUsageConfiguration } from './core/usage-configuration.js';
 import { createDefaultUsagePrices } from './core/usage-stats.js';
-import { createPromptTokenEstimator } from './core/usage-estimator.js';
+import { createMessageTokenEstimator, createPromptTokenEstimator } from './core/usage-estimator.js';
 import { initializeUsagePanel } from './ui/usage-panel.js';
 
 // SillyTavern display label — NOT the settings key. For settings, use 'vectfox' (lowercase).
@@ -801,12 +801,13 @@ jQuery(async () => {
         eventSource.on(event_types.GENERATION_ENDED, () => noteGenerationEnded());
         eventSource.on(event_types.GENERATION_STOPPED, () => noteGenerationEnded());
     };
-    // Prompt-token estimate for providers that omit usage. The tokenizer is
+    // Prompt-token estimate for providers that omit usage, plus the
+    // per-message counts the prefix fingerprint needs. The tokenizer is
     // imported lazily, so an unavailable one leaves the row "unavailable"
     // instead of breaking the extension.
-    const estimatePromptTokens = createPromptTokenEstimator({
-        loadTokenizer: () => import('../../../../scripts/tokenizers.js'),
-    });
+    const loadUsageTokenizer = () => import('../../../../scripts/tokenizers.js');
+    const estimatePromptTokens = createPromptTokenEstimator({ loadTokenizer: loadUsageTokenizer });
+    const estimateMessageTokens = createMessageTokenEstimator({ loadTokenizer: loadUsageTokenizer });
 
     let refreshUsagePanel = () => {};
     const persistUsageSettings = () => {
@@ -821,6 +822,7 @@ jQuery(async () => {
             getRunId: () => usageLedger.currentRunIdFor(getActiveChatId()),
             getConfig: readUsageConfiguration,
             estimatePromptTokens,
+            estimateMessageTokens,
             handleRecord: (record) => usageLedger.add(record),
             // Refresh on settle, not on record: a skipped body or a failed
             // capture writes no record but still changes the health line.
