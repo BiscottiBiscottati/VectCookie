@@ -1,0 +1,18 @@
+#!/bin/sh
+# Run the repository check before a commit.
+#
+# The full unit output is useful when something fails and noise when it does
+# not, so the log stays on disk and only its tail reaches the commit output.
+set -u
+
+log="${TMPDIR:-/tmp}/vectfox-check.log"
+
+if npm run check >"$log" 2>&1; then
+    echo "pre-commit: npm run check passed (log: $log)"
+    exit 0
+fi
+
+status=$?
+tail -n 120 "$log" 2>/dev/null || true
+echo "pre-commit: npm run check failed — full log: $log" >&2
+exit "$status"

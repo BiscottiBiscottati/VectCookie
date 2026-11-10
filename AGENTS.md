@@ -23,5 +23,6 @@ review protocol. Review agents must read it before reviewing.
 
 ### Checks
 
-`npm run check` parses every JS file and runs the unit suite. Install the local
-pre-commit hook once per clone with `npm run hooks:install`.
+`npm run check` parses every JS file, verifies the paths named in the agent
+docs, and runs the unit suite. Install the tracked hook once per clone with
+`npm run hooks:install`; CI runs the same command.

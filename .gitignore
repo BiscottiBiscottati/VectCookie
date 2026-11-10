@@ -1,6 +1,3 @@
-# Documentation files (except README)
-docs/*.md
-!README.md
 .DS_Store
 
 # Local development notes
@@ -12,9 +9,7 @@ VECTOR_LIST.md
 
 node_modules/
 .playwright-auth.json
-docs/
 .claude/
-.github/
 CLAUDE.md
 npm-debug.log*
 yarn-debug.log**
