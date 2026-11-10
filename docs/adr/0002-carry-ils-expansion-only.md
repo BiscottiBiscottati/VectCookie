@@ -15,7 +15,7 @@ The fork started life as a clone of a *fork* of VectFox and accumulated 14 commi
 Zach's 7 commits (+295/−47) implemented three things:
 
 1. **ILS expansion** — `core/ils-expander.js`, expanding InlineSummary ("ILS") summary messages back into their original messages so EventBase extraction and semantic World Info vectorize real content rather than summary text. Supports two storage layouts (legacy `msg.extra.ILS_Data.OriginalMessages`, and ref-based `chat_metadata.ILS_Originals[Ref]`). Upstream has **no** support for this at all.
-2. **Auto-sync trailing gap** — a second "hold back the tail" mechanism (`eventbase_autosync_tail_lag_messages`, default 0), plus a `core/eventbase-workflow-utils.js` module created to hold it.
+2. **Auto-sync trailing gap** — a second "hold back the tail" mechanism (`eventbase_autosync_tail_lag_messages`, default 0), plus a core/eventbase-workflow-utils.js module created to hold it.
 3. **Removal of the `modules` dependency** — deleting `import { modules }` and the `extras_module_missing` guard from `throwIfSourceInvalid` in `core/core-vector-api.js`. This is the only one of the seven that *deletes* upstream behaviour.
 
 Removing all seven was tested empirically and is not breaking: the owner's 3 commits cherry-pick onto `upstream/main` with zero conflicts and 1042 tests pass.
@@ -25,8 +25,8 @@ Removing all seven was tested empirically and is not breaking: the owner's 3 com
 **Carry ILS expansion only.** Specifically:
 
 1. **Keep ILS expansion** (`ILS Expansion`, `Fix ILS Expansion`) — the sole functional divergence from upstream. It is additive, pure, and a no-op when no InlineSummary messages are present.
-2. **Do not carry the auto-sync trailing gap.** It duplicates a concept upstream already has: `eventbase_autosync_settle_lag` holds back the active turn via `getCommitBoundary`. The two compose rather than replace (tail truncation runs first, then `getCommitBoundary` runs on the truncated array), so keeping both would leave two settings meaning nearly the same thing with an ill-defined interaction. With it go `core/eventbase-workflow-utils.js`, the settings default, the UI slider, and its tests.
-3. **Keep upstream's `modules` / `extras` guard.** SillyTavern still exports `modules` (`public/scripts/extensions.js`), so the import was never broken; removing the guard only delayed a clear `extras_module_missing` error into something vaguer. Upstream keeps it, so we keep it.
+2. **Do not carry the auto-sync trailing gap.** It duplicates a concept upstream already has: `eventbase_autosync_settle_lag` holds back the active turn via `getCommitBoundary`. The two compose rather than replace (tail truncation runs first, then `getCommitBoundary` runs on the truncated array), so keeping both would leave two settings meaning nearly the same thing with an ill-defined interaction. With it go core/eventbase-workflow-utils.js, the settings default, the UI slider, and its tests.
+3. **Keep upstream's `modules` / `extras` guard.** SillyTavern still exports `modules` (public/scripts/extensions.js in SillyTavern's own repository), so the import was never broken; removing the guard only delayed a clear `extras_module_missing` error into something vaguer. Upstream keeps it, so we keep it.
 4. **Do not keep `getAutoSyncWindowSize` extracted into a utils module.** Upstream defines it inline in `core/eventbase-workflow.js`; the extraction existed only to serve the trailing gap and was a conflict magnifier. `eventbase-workflow.js` is back to upstream's structure.
 5. **Sync by rebase, not merge, and force-push.** This fork's `main` is rewritten history by design.
 
