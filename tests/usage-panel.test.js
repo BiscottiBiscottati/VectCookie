@@ -11,26 +11,21 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 import { buildUsageView, initializeUsagePanel } from '../ui/usage-panel.js';
-import { createUsageAccumulator } from '../core/usage-stats.js';
+import { usageAccumulator as accumulator, usageRecord } from './fixtures/usage.js';
 
 function measuredRecord(overrides = {}) {
-    return {
-        recordId: 'rec-1',
-        timestamp: 1_700_000_000_000,
-        chatId: 'chat-1',
+    return usageRecord({
         provider: 'openrouter',
         model: 'deepseek/deepseek-v3',
-        stream: false,
-        status: 'ok',
-        httpStatus: 200,
         promptTokens: 1200,
         hitTokens: 900,
         missTokens: 300,
         completionTokens: 100,
         totalTokens: 1300,
-        usageSource: 'measured',
+        stream: false,
+        httpStatus: 200,
         ...overrides,
-    };
+    });
 }
 
 describe('usage view model', () => {
@@ -826,9 +821,6 @@ describe('usage panel — measurement runs smoke', () => {
     });
 });
 
-function accumulator(overrides = {}) {
-    return { ...createUsageAccumulator(), ...overrides };
-}
 
 describe('usage view model — durable totals', () => {
     it('adds the archived counters of capped rows to the cards and configurations', () => {
@@ -1252,5 +1244,158 @@ describe('usage panel — prefix diagnostics smoke', () => {
         expect(panel.querySelector('[data-usage-prefix-flag]')).toBeNull();
         const cells = [...panel.querySelectorAll('.vectfox-usage-requests-table tbody td')];
         expect(cells.some((cell) => cell.textContent.trim() === '—')).toBe(true);
+    });
+});
+
+describe('usage panel — export smoke', () => {
+    beforeEach(() => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+    });
+
+    it('downloads a versioned export with records, runs and aggregates but no prompt text', () => {
+        const downloadFile = vi.fn();
+        const ledger = {
+            exportSnapshotFor: () => ({
+                records: [measuredRecord({
+                    sharedPrefixTokens: 2400,
+                    promptText: 'SECRET PROMPT TEXT',
+                })],
+                runs: [{ runId: 'run-1', label: 'Run 1', startedAt: 1_700_000_000_000, endedAt: null }],
+                currentRunId: 'run-1',
+                archived: {
+                    total: accumulator({ requests: 1 }),
+                    byOrigin: {},
+                    byModel: {},
+                    byConfiguration: {},
+                },
+                retention: { limit: 500, retained: 1, total: 1 },
+                allTime: {
+                    totals: accumulator({ requests: 1 }),
+                    buckets: { 'chat-1': accumulator({ requests: 1 }) },
+                },
+            }),
+        };
+
+        initializeUsagePanel({
+            settings: { usage_tracking_enabled: true },
+            ledger,
+            getChatId: () => 'chat-1',
+            downloadFile,
+            now: () => Date.UTC(2026, 10, 10, 12, 34, 56),
+        });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        panel.querySelector('[data-usage-export]').click();
+
+        expect(downloadFile).toHaveBeenCalledTimes(1);
+        const [filename, content] = downloadFile.mock.calls[0];
+        expect(filename).toBe('vectfox-usage-chat-1-20261110-123456.json');
+        expect(content).not.toContain('SECRET PROMPT TEXT');
+
+        const exported = JSON.parse(content);
+        expect(exported.version).toBe(1);
+        expect(exported.chatId).toBe('chat-1');
+        expect(exported.records[0]).toMatchObject({ recordId: 'rec-1', sharedPrefixTokens: 2400 });
+        expect(exported.runs[0]).toMatchObject({ runId: 'run-1' });
+        expect(exported.aggregates.archived.total.requests).toBe(1);
+        expect(exported.aggregates.allTime.chats['chat-1'].requests).toBe(1);
+        expect(exported.currentPrices.entries[0].model).toBe('deepseek-v4-flash');
+    });
+});
+
+describe('usage panel — reset smoke', () => {
+    beforeEach(() => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+    });
+
+    it('resets the current chat only after the confirmation accepts', () => {
+        let cleared = false;
+        const confirmReset = vi.fn(() => false);
+        const onResetChat = vi.fn(() => {
+            cleared = true;
+        });
+        const ledger = {
+            recordsFor: () => (cleared ? [] : [measuredRecord()]),
+            runsFor: () => [],
+            currentRunIdFor: () => '',
+        };
+
+        initializeUsagePanel({
+            settings: { usage_tracking_enabled: true },
+            ledger,
+            getChatId: () => 'chat-1',
+            confirmReset,
+            onResetChat,
+        });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        panel.querySelector('[data-usage-reset="chat"]').click();
+
+        expect(confirmReset).toHaveBeenCalledTimes(1);
+        expect(confirmReset.mock.calls[0][0]).toMatch(/current chat/i);
+        expect(onResetChat).not.toHaveBeenCalled();
+        expect(panel.querySelectorAll('.vectfox-usage-requests-table tbody tr')).toHaveLength(1);
+
+        confirmReset.mockReturnValue(true);
+        panel.querySelector('[data-usage-reset="chat"]').click();
+
+        expect(onResetChat).toHaveBeenCalledTimes(1);
+        expect(panel.querySelectorAll('.vectfox-usage-requests-table tbody tr')).toHaveLength(0);
+        expect(panel.textContent).toMatch(/tracking is on/i);
+    });
+
+    it('asks about all-time separately and never calls the chat reset', () => {
+        const confirmReset = vi.fn(() => true);
+        const onResetChat = vi.fn();
+        const onResetAllTime = vi.fn();
+
+        initializeUsagePanel({
+            settings: { usage_tracking_enabled: true },
+            ledger: { recordsFor: () => [measuredRecord()] },
+            getChatId: () => 'chat-1',
+            confirmReset,
+            onResetChat,
+            onResetAllTime,
+        });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        panel.querySelector('[data-usage-reset="all-time"]').click();
+
+        expect(confirmReset).toHaveBeenCalledTimes(1);
+        expect(confirmReset.mock.calls[0][0]).toMatch(/all-time/i);
+        expect(onResetAllTime).toHaveBeenCalledTimes(1);
+        expect(onResetChat).not.toHaveBeenCalled();
+    });
+});
+
+describe('usage panel — help smoke', () => {
+    beforeEach(() => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+    });
+
+    it('explains the hit rate, the source labels and the measurement caveats', () => {
+        initializeUsagePanel({
+            settings: { usage_tracking_enabled: false },
+            ledger: { recordsFor: () => [] },
+            getChatId: () => null,
+        });
+
+        const help = document.getElementById('VectFox_usage_panel').querySelector('[data-usage-help]');
+        expect(help).not.toBeNull();
+        const text = help.textContent;
+
+        expect(text).toMatch(/token-weighted/i);
+        expect(text).toMatch(/measured/i);
+        expect(text).toMatch(/estimated/i);
+        expect(text).toMatch(/unavailable/i);
+        expect(text).toMatch(/coverage/i);
+        expect(text).toMatch(/expire/i);
+        expect(text).toMatch(/\{\{time\}\}/);
+        expect(text).toMatch(/World Info/i);
+        expect(text).toMatch(/Author's Note/i);
+        expect(text).toMatch(/context budget/i);
+        expect(text).toMatch(/aborted/i);
+        expect(text).toMatch(/full-prefix/i);
+        expect(text).toMatch(/cannot produce a hit rate/i);
     });
 });

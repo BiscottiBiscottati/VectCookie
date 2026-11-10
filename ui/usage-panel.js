@@ -10,6 +10,7 @@
  */
 
 import StringUtils from '../utils/string-utils.js';
+import { buildUsageExport, usageExportFileName } from '../core/usage-export.js';
 import {
     createDefaultUsagePrices,
     normalizeUsagePrices,
@@ -52,6 +53,22 @@ const CARD_TITLES = {
     ...ORIGIN_LABELS,
     'vectfox-internal': 'VectFox · internal',
 };
+const RESET_SCOPES = {
+    chat: 'chat',
+    allTime: 'all-time',
+};
+const RESET_CHAT_CONFIRM = 'Reset usage records for the current chat?\n\n'
+    + 'This deletes its requests, measurement runs and its all-time contribution. Other chats are not touched.';
+const RESET_ALL_TIME_CONFIRM = 'Reset all-time usage totals across every chat?\n\n'
+    + 'Only the cross-chat totals are cleared; every chat keeps its request rows.';
+const HELP_LINES = [
+    'The cache-hit rate is token-weighted: cached prompt tokens divided by the provider-reported prompt tokens. Percentages are never averaged, and failed or aborted requests stay out of the denominator.',
+    'Measured means the provider reported the number. Estimated means only prompt tokens were inferred with SillyTavern\'s tokenizer; cache hit is never estimated. Unavailable means neither is possible, and it is never shown as zero. A custom endpoint that omits usage cannot produce a hit rate at all.',
+    'Coverage is the share of prompt tokens the provider actually reported. Estimated prompt tokens count as uncovered, so a provider that omits usage visibly lowers it. Coverage is also capped by the share of completed requests that had a count, so an unestimated row cannot leave it at 100%.',
+    'Provider caches are best-effort and expire after hours to days. Hit counts are quantised, commonly in 128-token blocks, and the first turns after a change, or the first run after a long pause, are cold. DeepSeek\'s cache units require a full-prefix match and take seconds to persist, so those first turns are misses.',
+    'A branch starts with a clean table, and an aborted stream has no terminal usage. OpenRouter cost is in reported credits and is not converted.',
+    'Known prefix breakers: {{time}} and {{date}} macros early in the prompt; keyword-triggered World Info entries; Author\'s Note, character depth prompts and World Info entries at depth; per-collection injection overrides that move VectFox blocks; and a context budget small enough to trim the oldest message every turn.',
+];
 
 /**
  * Turns ledger records into the labels the tab renders.
@@ -461,6 +478,17 @@ function formatTime(timestamp) {
  * @param {(prices: object) => void} [options.onPricesChange] Persists the
  *   edited price table.
  * @param {() => void} [options.onRunStart] Opens a new measurement run.
+ * @param {(chatId: string|null) => object} [options.ledger.exportSnapshotFor]
+ *   One normalized read of the records, runs, aggregates and all-time buckets.
+ * @param {() => void} [options.onResetChat] Clears the current chat's records,
+ *   runs and all-time contribution after confirmation.
+ * @param {() => void} [options.onResetAllTime] Clears the cross-chat totals
+ *   after confirmation, leaving per-chat rows alone.
+ * @param {(message: string) => boolean} [options.confirmReset] Confirmation
+ *   prompt, injected so the smoke test never opens a real dialog.
+ * @param {(filename: string, content: string) => void} [options.downloadFile]
+ *   Download sink, injected so the smoke test can inspect the file.
+ * @param {() => number} [options.now] Clock used for the export time.
  * @returns {() => void} Refresh callback.
  */
 export function initializeUsagePanel({
@@ -471,6 +499,11 @@ export function initializeUsagePanel({
     onTrackingChange,
     onPricesChange,
     onRunStart,
+    onResetChat,
+    onResetAllTime,
+    confirmReset = defaultConfirm,
+    downloadFile = downloadJsonFile,
+    now = () => Date.now(),
 } = {}) {
     const container = document.getElementById('VectFox_usage_panel');
     if (!container) return () => {};
@@ -560,6 +593,41 @@ export function initializeUsagePanel({
 
         container.addEventListener('click', (event) => {
             const target = event.target;
+            if (target?.closest?.('[data-usage-export]')) {
+                const chatId = getChatId();
+                const exportedAt = now();
+                const exported = buildUsageExport({
+                    chatId,
+                    now: exportedAt,
+                    snapshot: ledger?.exportSnapshotFor?.(chatId) ?? null,
+                    prices: settings.usage_prices,
+                });
+                downloadFile(
+                    usageExportFileName({ chatId, now: exportedAt }),
+                    JSON.stringify(exported, null, 2),
+                );
+                return;
+            }
+
+            const reset = target?.closest?.('[data-usage-reset]');
+            if (reset) {
+                if (reset.dataset.usageReset === RESET_SCOPES.chat) {
+                    if (!confirmReset(RESET_CHAT_CONFIRM)) return;
+                    onResetChat?.();
+                    // The reset clears the runs too, so a run filter would
+                    // point at a run that no longer exists.
+                    selectedRunId = '';
+                    refresh();
+                    return;
+                }
+                if (reset.dataset.usageReset === RESET_SCOPES.allTime) {
+                    if (!confirmReset(RESET_ALL_TIME_CONFIRM)) return;
+                    onResetAllTime?.();
+                    refresh();
+                    return;
+                }
+            }
+
             if (target?.closest?.('[data-usage-run-start]')) {
                 onRunStart?.();
                 // With a run filtered, point the table at the new run or its
@@ -622,9 +690,66 @@ function renderPanel(view) {
             <div class="vectfox-usage-results">
                 ${renderResults(view)}
             </div>
+            ${renderActions()}
+            ${renderHelp()}
             ${renderPriceEditor(view.prices)}
         </div>
     `;
+}
+
+function renderActions() {
+    return `
+        <section class="vectfox-usage-actions">
+            <h4>Export and reset</h4>
+            <div class="vectfox-usage-action-buttons">
+                <button type="button" class="menu_button" data-usage-export>Export JSON</button>
+                <button type="button" class="menu_button vectfox-usage-danger-button" data-usage-reset="${RESET_SCOPES.chat}">Reset this chat</button>
+                <button type="button" class="menu_button vectfox-usage-danger-button vectfox-usage-danger-button-strong" data-usage-reset="${RESET_SCOPES.allTime}">Reset all-time totals</button>
+            </div>
+            <small class="VectFox_hint">
+                Export downloads a versioned JSON file with the open chat's retained requests and runs,
+                its evicted-row aggregates, and every chat's all-time counters. It contains no prompt text
+                and no API keys. Both resets ask first. Reset this chat clears only the open chat's records
+                and its all-time contribution; reset all-time totals clears the cross-chat totals and
+                leaves every chat's rows.
+            </small>
+        </section>
+    `;
+}
+
+function renderHelp() {
+    const items = HELP_LINES.map((line) => `<li>${StringUtils.escapeHtml(line)}</li>`).join('');
+    return `
+        <section class="vectfox-usage-help" data-usage-help>
+            <h4>How to read these numbers</h4>
+            <ul>${items}</ul>
+        </section>
+    `;
+}
+
+function defaultConfirm(message) {
+    return typeof globalThis.confirm === 'function' ? globalThis.confirm(message) : false;
+}
+
+function downloadJsonFile(filename, content) {
+    if (typeof Blob !== 'function'
+        || typeof globalThis.URL?.createObjectURL !== 'function'
+        || typeof document === 'undefined') {
+        return false;
+    }
+    const blob = new Blob([content], { type: 'application/json' });
+    const url = globalThis.URL.createObjectURL(blob);
+    try {
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        return true;
+    } finally {
+        globalThis.URL.revokeObjectURL?.(url);
+    }
 }
 
 function renderRunBar(run) {
