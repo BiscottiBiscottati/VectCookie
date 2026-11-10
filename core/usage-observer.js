@@ -111,7 +111,7 @@ export function installUsageObserver({
 
         // Origin and configuration are decided when the request is sent, not
         // when its (deferred) capture runs: a generation can end in between.
-        const origin = readOrigin(sink);
+        const origin = readOrigin(sink, init);
         const configuration = readConfiguration(sink);
         noteHealth(sink, 'matched');
 
@@ -244,9 +244,9 @@ function readRunId(sink) {
  * Attribution is read through the sink so the wrapper installed by an earlier
  * module instance uses the reloaded instance's generation state.
  */
-function readOrigin(sink) {
+function readOrigin(sink, init) {
     try {
-        const origin = sink.getOrigin?.();
+        const origin = sink.getOrigin?.(init);
         if (origin && typeof origin === 'object') return origin;
     } catch {
         /* attribution must never break capture */

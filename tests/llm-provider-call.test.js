@@ -540,31 +540,32 @@ describe('StringUtils.ensureArray', () => {
 // postChatCompletion — usage attribution flag
 // ---------------------------------------------------------------------------
 
-describe('postChatCompletion — internal-call flag', () => {
+describe('postChatCompletion — internal-call attribution', () => {
     beforeEach(() => {
         resetUsageAttribution();
     });
 
-    it('marks its request vectfox-internal for the duration of the fetch', async () => {
+    it('marks its own request vectfox-internal without tainting concurrent requests', async () => {
         let duringFetch = null;
-        vi.stubGlobal('fetch', vi.fn(async () => {
-            duringFetch = resolveUsageOrigin();
+        vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+            duringFetch = resolveUsageOrigin(init);
             return okResponse({ content: 'hi' });
         }));
 
         await postChatCompletion(baseArgs({ contextLabel: 'EventBase' }));
 
         expect(duringFetch).toEqual({ origin: 'vectfox-internal', featureLabel: 'EventBase' });
-        // Released afterwards: the next request is not tainted.
-        expect(resolveUsageOrigin()).toEqual({ origin: 'worker-profile', featureLabel: null });
+        // The mark lives on that request's init, not in shared state: an
+        // unrelated request sent afterwards is still a worker-profile call.
+        expect(resolveUsageOrigin({ method: 'POST' })).toEqual({ origin: 'worker-profile', featureLabel: null });
     });
 
-    it('releases the flag when the fetch rejects', async () => {
+    it('leaves no mark behind when the fetch rejects', async () => {
         vi.stubGlobal('fetch', vi.fn(async () => {
             throw new Error('network down');
         }));
 
         await expect(postChatCompletion(baseArgs())).rejects.toThrow('network down');
-        expect(resolveUsageOrigin()).toEqual({ origin: 'worker-profile', featureLabel: null });
+        expect(resolveUsageOrigin({ method: 'POST' })).toEqual({ origin: 'worker-profile', featureLabel: null });
     });
 });

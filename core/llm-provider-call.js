@@ -30,7 +30,7 @@
 import { getRequestHeaders } from '../../../../../script.js';
 import { getModelConfigErrorMessage } from './model-http-errors.js';
 import { isConnectionError, notifyConnectionError, notifyUpstreamRejection } from './model-config-notifier.js';
-import { beginInternalCall, endInternalCall } from './usage-attribution.js';
+import { markInternalRequest } from './usage-attribution.js';
 import { log } from './log.js';
 
 /**
@@ -268,20 +268,19 @@ export async function postChatCompletion({
         ? { chat_completion_source: 'custom', custom_url: vllmUrl, ...body }
         : { chat_completion_source: 'openrouter', ...body };
 
-    // VectFox's own helper: tell the usage observer this request is internal, so
-    // an extraction made during a story turn is never attributed to the story.
-    const internalCall = beginInternalCall(contextLabel);
-    let response;
-    try {
-        response = await fetch('/api/backends/chat-completions/generate', {
-            method: 'POST',
-            headers: getRequestHeaders(),
-            body: JSON.stringify(requestBody),
-            signal: AbortSignal.timeout(timeoutMs),
-        });
-    } finally {
-        endInternalCall(internalCall);
-    }
+    // VectFox's own helper: mark THIS request internal, so an extraction made
+    // during a story turn is never attributed to the story — and a story turn
+    // sent while an extraction is still in flight is never stolen by it. The
+    // mark travels on the request init; shared module state cannot tell two
+    // concurrent requests apart.
+    const init = {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(timeoutMs),
+    };
+    markInternalRequest(init, contextLabel);
+    const response = await fetch('/api/backends/chat-completions/generate', init);
 
     if (!response.ok) {
         const errText = await response.text().catch(() => response.statusText);

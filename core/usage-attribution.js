@@ -5,10 +5,17 @@
  * Answers "who caused this chat-completion request?" for the usage observer.
  *
  * The generation state is fed from SillyTavern's GENERATION_STARTED /
- * GENERATION_ENDED / GENERATION_STOPPED events. VectFox's own LLM helper raises
- * the internal-call flag around its fetch, so an extraction or planner call made
- * while a story generation is in flight is still attributed to VectFox and not
- * to the story reply.
+ * GENERATION_ENDED / GENERATION_STOPPED events. VectFox's own LLM helper marks
+ * the request it is about to send, so an extraction or planner call is still
+ * attributed to VectFox even while a story generation is in flight — and,
+ * equally important, a story request sent while an extraction is in flight is
+ * NOT stolen by the extraction.
+ *
+ * The mark lives on that request's `init` object, not in shared module state:
+ * two overlapping requests must be attributable independently. An earlier
+ * shared flag made the newest internal call win for every request in flight,
+ * which mislabelled story replies as `VectFox · EventBase` (observed live when
+ * auto-sync overlapped the next turn).
  *
  * The observer resolves the origin synchronously when the request is sent: a
  * generation can end before a deferred capture runs.
@@ -23,11 +30,33 @@ export const USAGE_ORIGINS = Object.freeze({
     UNKNOWN: 'unknown',
 });
 
+// Symbol.for, not a module-local Symbol: a reloaded module instance must still
+// read the mark written by the previous one.
+const INTERNAL_REQUEST_MARK = Symbol.for('vectfox.usage.internal-request');
+
 // Generation types that produce the story reply (and its swipe/regen/continue).
 const STORY_GENERATION_TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue', 'impersonate']);
 
 let _generation = null;
-let _internalCalls = [];
+
+/**
+ * Marks one request init as VectFox-internal. The mark is non-enumerable and a
+ * Symbol, so it never reaches the wire and never changes a JSON body.
+ *
+ * @param {object|null} init Request init about to be passed to fetch.
+ * @param {string|null} [featureLabel] Short feature name, e.g. 'EventBase'.
+ * @returns {object|null} The same init, for chaining.
+ */
+export function markInternalRequest(init, featureLabel = null) {
+    if (!init || typeof init !== 'object') return null;
+    Object.defineProperty(init, INTERNAL_REQUEST_MARK, {
+        value: { featureLabel: typeof featureLabel === 'string' && featureLabel ? featureLabel : null },
+        configurable: true,
+        enumerable: false,
+        writable: false,
+    });
+    return init;
+}
 
 /**
  * Marks a generation as in flight. A dry run assembles a prompt without calling
@@ -52,38 +81,17 @@ export function noteGenerationEnded() {
 }
 
 /**
- * Raises VectFox's internal-call flag for one request. Returns a token to pass
- * back so concurrent calls cannot release each other's flag.
+ * The origin the observed request belongs to. A per-request internal mark wins;
+ * otherwise the request follows the generation state. A generation type this
+ * module does not know is ambiguous and stays unknown.
  *
- * @param {string|null} featureLabel Short feature name, e.g. 'EventBase'.
- * @returns {{featureLabel: string|null}}
- */
-export function beginInternalCall(featureLabel = null) {
-    const token = { featureLabel: typeof featureLabel === 'string' && featureLabel ? featureLabel : null };
-    _internalCalls.push(token);
-    return token;
-}
-
-/**
- * Lowers an internal-call flag raised by beginInternalCall.
- * @param {{featureLabel: string|null}} token
- */
-export function endInternalCall(token) {
-    const index = _internalCalls.lastIndexOf(token);
-    if (index >= 0) _internalCalls.splice(index, 1);
-}
-
-/**
- * The origin the next observed request belongs to. The internal flag wins over
- * the generation state; leaving a generation means worker-profile; a generation
- * type this module does not know is ambiguous and stays unknown.
- *
+ * @param {object|null} [init] The request init the observer received.
  * @returns {{origin: string, featureLabel: string|null}}
  */
-export function resolveUsageOrigin() {
-    const internal = _internalCalls[_internalCalls.length - 1];
-    if (internal) {
-        return { origin: USAGE_ORIGINS.VECTFOX_INTERNAL, featureLabel: internal.featureLabel };
+export function resolveUsageOrigin(init = null) {
+    const marked = init && typeof init === 'object' ? init[INTERNAL_REQUEST_MARK] : null;
+    if (marked) {
+        return { origin: USAGE_ORIGINS.VECTFOX_INTERNAL, featureLabel: marked.featureLabel ?? null };
     }
     if (!_generation) {
         return { origin: USAGE_ORIGINS.WORKER_PROFILE, featureLabel: null };
@@ -102,8 +110,7 @@ export function resolveUsageOrigin() {
     return { origin: USAGE_ORIGINS.UNKNOWN, featureLabel: null };
 }
 
-/** Resets all attribution state. Test helper; production code never calls it. */
+/** Resets generation attribution state. Test helper; production never calls it. */
 export function resetUsageAttribution() {
     _generation = null;
-    _internalCalls = [];
 }

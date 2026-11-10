@@ -18,8 +18,7 @@ import {
 import {
     noteGenerationStarted,
     noteGenerationEnded,
-    beginInternalCall,
-    endInternalCall,
+    markInternalRequest,
     resetUsageAttribution,
 } from '../core/usage-attribution.js';
 
@@ -787,17 +786,50 @@ describe('usage pipeline — origins', () => {
         expect(record).toMatchObject({ origin: 'worker-profile', featureLabel: null });
     });
 
-    it('lets the internal-call flag win over an in-flight generation', async () => {
+    it('keeps a story request as story while an internal request is in flight', async () => {
         resetUsageAttribution();
         noteGenerationStarted('normal');
-        const call = beginInternalCall('EventBase');
 
-        const { record } = await recordOne({
-            prepare: () => {},
+        // Both requests stay pending until released, so the story request is sent
+        // while the internal one is genuinely in flight — the shape auto-sync
+        // produces when an extraction overlaps the next story turn.
+        const release = [];
+        const fetchMock = vi.fn(() => new Promise((resolve) => {
+            release.push(() => resolve(jsonResponse({ usage: { prompt_tokens: 10 } })));
+        }));
+        const { target, ledger } = installOver(fetchMock);
+
+        const internalInit = { method: 'POST', body: JSON.stringify(chatBody()) };
+        markInternalRequest(internalInit, 'EventBase');
+        const internal = target.fetch(ENDPOINT, internalInit);
+        const story = target.fetch(ENDPOINT, { method: 'POST', body: JSON.stringify(chatBody()) });
+
+        for (const resolve of release) resolve();
+        await Promise.all([internal, story]);
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const origins = ledger.recordsFor('chat-1').map(({ origin, featureLabel }) => ({ origin, featureLabel }));
+        expect(origins).toContainEqual({ origin: 'vectfox-internal', featureLabel: 'EventBase' });
+        expect(origins).toContainEqual({ origin: 'story', featureLabel: null });
+        noteGenerationEnded();
+    });
+
+    it('marks an internal request vectfox-internal even during a story generation', async () => {
+        resetUsageAttribution();
+        noteGenerationStarted('normal');
+        const fetchMock = vi.fn(() => Promise.resolve(jsonResponse({ usage: { prompt_tokens: 10 } })));
+        const { target, ledger } = installOver(fetchMock);
+
+        const internalInit = { method: 'POST', body: JSON.stringify(chatBody()) };
+        markInternalRequest(internalInit, 'Summarizer');
+        await target.fetch(ENDPOINT, internalInit);
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+
+        expect(ledger.recordsFor('chat-1')[0]).toMatchObject({
+            origin: 'vectfox-internal',
+            featureLabel: 'Summarizer',
         });
-        endInternalCall(call);
-
-        expect(record).toMatchObject({ origin: 'vectfox-internal', featureLabel: 'EventBase' });
+        noteGenerationEnded();
     });
 
     it('tags a quiet-to-loud generation as story because its result is posted', async () => {
