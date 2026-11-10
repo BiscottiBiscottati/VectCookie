@@ -29,6 +29,8 @@ make.
 - Keep fixtures local to the test file unless three or more files need them.
 - For each acceptance bullet, cover the boundary matrix: measured / estimated /
   unavailable, empty / one / many, and the UI surfaces the bullet names.
+- For a destructive state transition, cover repeated invocation, a persistence
+  failure, and scope isolation. A reset that works once is not a reset.
 
 ## Review protocol
 
