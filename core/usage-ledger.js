@@ -264,6 +264,88 @@ export class UsageLedger {
     }
 
     /**
+     * The all-time counters plus one bucket per chat, shaped for the export.
+     * {@link allTimeForView} intentionally reduces chats to a count; the export
+     * needs the buckets themselves.
+     *
+     * @returns {{totals: object, buckets: object}}
+     */
+    allTimeForExport() {
+        return {
+            totals: normalizeUsageAccumulator(this.#allTime.totals),
+            buckets: Object.fromEntries(Object.entries(this.#allTime.chats).map(([chatId, counters]) => [
+                chatId,
+                normalizeUsageAccumulator(counters),
+            ])),
+        };
+    }
+
+    /**
+     * One normalized read of everything the export needs, so the panel cannot
+     * observe a half-updated chat between separate calls.
+     *
+     * @param {string|null} chatId
+     * @returns {{records: object[], runs: object[], currentRunId: string|null, archived: object, retention: object, allTime: object}}
+     */
+    exportSnapshotFor(chatId) {
+        return {
+            records: this.recordsFor(chatId),
+            runs: this.runsFor(chatId),
+            currentRunId: this.currentRunIdFor(chatId),
+            archived: this.archivedFor(chatId),
+            retention: this.retentionFor(chatId),
+            allTime: this.allTimeForExport(),
+        };
+    }
+
+    /**
+     * Clears one chat's records, measurement runs, prefix baselines, pending
+     * copy, namespace and all-time contribution. Other chats are untouched.
+     *
+     * The namespace is removed from the live metadata and saved now. A failed
+     * save can leave the old namespace in the chat file, and `saveMetadata`
+     * resolves even when it failed, so a revisioned empty snapshot is left in
+     * the pending copy: the next open adopts it instead of the stale rows.
+     * Removing the all-time bucket keeps the totals honest.
+     *
+     * @param {string|null} chatId
+     */
+    resetChat(chatId) {
+        const metadata = this.#getMetadata();
+        const persisted = metadata && this.#isActiveChat(chatId)
+            ? normalizeNamespace(metadata[USAGE_CHAT_METADATA_KEY])
+            : null;
+        // A reset followed by another reset must not drop below the tombstone
+        // revision it already staged: a second save failure would otherwise
+        // let the stale rows back in on the next open.
+        const pending = normalizeNamespace(this.#pendingBackup.chats[bucketKeyFor(chatId)]);
+        const previousRevision = Math.max(
+            this.#byChat.get(chatKey(chatId))?.revision ?? 0,
+            persisted?.revision ?? 0,
+            pending?.revision ?? 0,
+        );
+
+        this.#forgetChat(chatId);
+
+        if (metadata && this.#isActiveChat(chatId) && metadata[USAGE_CHAT_METADATA_KEY]) {
+            delete metadata[USAGE_CHAT_METADATA_KEY];
+            this.#saveMetadataNow();
+        }
+        this.#stageResetTombstone(chatId, previousRevision);
+    }
+
+    /**
+     * Clears the cross-chat all-time totals and chat buckets. Per-chat records
+     * and namespaces are the other reset scope, so they are left untouched;
+     * new requests start new buckets. The pending-record copies belong to the
+     * per-chat scope and are kept.
+     */
+    resetAllTime() {
+        this.#allTime = createAllTime();
+        this.#persistAllTime();
+    }
+
+    /**
      * Loads (or re-adopts) one chat's namespace. A pending copy left by a save
      * that never ran is replayed when it is newer than the persisted namespace,
      * so a switch inside the debounce does not lose the records. A pending copy
@@ -351,20 +433,7 @@ export class UsageLedger {
      * @param {string|null} chatId
      */
     handleChatDeleted(chatId) {
-        const key = chatKey(chatId);
-        this.#pendingChatIds.delete(key);
-        this.#byChat.delete(key);
-        this.#deletePendingBackup(chatId);
-
-        const bucketKey = bucketKeyFor(chatId);
-        if (bucketKey && this.#allTime.chats[bucketKey]) {
-            this.#allTime.totals = subtractUsageAccumulators(
-                this.#allTime.totals,
-                this.#allTime.chats[bucketKey],
-            );
-            delete this.#allTime.chats[bucketKey];
-            this.#persistAllTime();
-        }
+        this.#forgetChat(chatId);
 
         const metadata = this.#getMetadata();
         if (metadata && this.#isActiveChat(chatId)
@@ -464,6 +533,48 @@ export class UsageLedger {
         const key = chatKey(chatId);
         if (!this.#byChat.has(key)) this.loadChat(chatId);
         return this.#byChat.get(key) ?? createChatState(chatId);
+    }
+
+    /**
+     * Removes a chat's in-memory state, pending copy, queued save and all-time
+     * bucket. The metadata namespace is the caller's concern, because delete
+     * and reset persist it differently.
+     *
+     * @param {string|null} chatId
+     */
+    #forgetChat(chatId) {
+        const key = chatKey(chatId);
+        this.#pendingChatIds.delete(key);
+        this.#byChat.delete(key);
+        this.#deletePendingBackup(chatId);
+
+        const bucketKey = bucketKeyFor(chatId);
+        if (!bucketKey || !this.#allTime.chats[bucketKey]) return;
+        this.#allTime.totals = subtractUsageAccumulators(
+            this.#allTime.totals,
+            this.#allTime.chats[bucketKey],
+        );
+        delete this.#allTime.chats[bucketKey];
+        this.#persistAllTime();
+    }
+
+    /**
+     * Leaves an empty revisioned snapshot in the pending copy so a metadata
+     * save that fails cannot let the next open restore the reset rows.
+     *
+     * @param {string|null} chatId
+     * @param {number} previousRevision
+     */
+    #stageResetTombstone(chatId, previousRevision) {
+        if (!this.#storage || typeof this.#saveMetadata !== 'function') return;
+        // Nothing persisted means nothing can be resurrected.
+        if (!(previousRevision > 0)) return;
+        const key = bucketKeyFor(chatId);
+        if (!key) return;
+        const state = createChatState(chatId);
+        state.revision = previousRevision + 1;
+        this.#pendingBackup.chats[key] = serializeState(state);
+        this.#persistPendingBackup();
     }
 
     #applyPrefixDiagnostics(state, record) {
@@ -834,7 +945,10 @@ function readPendingBackup(storage) {
         for (const [chatId, entry] of Object.entries(parsed.chats ?? {})) {
             const namespace = normalizeNamespace(entry);
             if (!namespace) continue;
-            if (namespace.records.length === 0 && namespace.runs.length === 0) continue;
+            // An empty snapshot with a revision is a reset tombstone: keep
+            // it so a stale chat file cannot restore the cleared rows.
+            if (namespace.records.length === 0 && namespace.runs.length === 0
+                && namespace.revision === 0) continue;
             backup.chats[chatId] = { ...namespace, ownerChatId: namespace.ownerChatId ?? chatId };
         }
         return backup;

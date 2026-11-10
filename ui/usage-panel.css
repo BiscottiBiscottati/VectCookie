@@ -311,3 +311,43 @@
     font-weight: 600;
     white-space: normal;
 }
+
+/* Export, reset and help -------------------------------------------------- */
+
+.vectfox-usage-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.vectfox-usage-action-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.vectfox-usage-danger-button {
+    color: var(--vectfox-danger, #ef4444);
+}
+
+.vectfox-usage-danger-button-strong {
+    font-weight: 600;
+}
+
+.vectfox-usage-help {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.vectfox-usage-help ul {
+    margin: 0;
+    padding-left: 18px;
+    font-size: 0.82em;
+    line-height: 1.45;
+    opacity: 0.85;
+}
+
+.vectfox-usage-help li {
+    margin-bottom: 4px;
+}

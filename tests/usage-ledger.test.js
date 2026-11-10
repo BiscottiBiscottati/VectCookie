@@ -16,6 +16,7 @@ import {
     USAGE_PENDING_STORAGE_KEY,
     USAGE_RECORD_LIMIT,
 } from '../core/usage-ledger.js';
+import { usageRecord } from './fixtures/usage.js';
 
 function memoryStorage(initial = {}) {
     const items = new Map(Object.entries(initial));
@@ -29,24 +30,16 @@ function memoryStorage(initial = {}) {
 }
 
 function record(recordId, chatId = 'chat-1', overrides = {}) {
-    return {
+    return usageRecord({
         recordId,
-        timestamp: 1_700_000_000_000 + Number(String(recordId).replace(/\D/g, '') || 0),
         chatId,
+        timestamp: 1_700_000_000_000 + Number(String(recordId).replace(/\D/g, '') || 0),
         runId: null,
         origin: 'story',
-        provider: 'deepseek',
-        model: 'deepseek-v4-flash',
-        status: 'ok',
-        promptTokens: 1000,
-        hitTokens: 500,
-        missTokens: 500,
-        completionTokens: 100,
-        cacheDiscount: null,
         cost: null,
-        usageSource: 'measured',
+        cacheDiscount: null,
         ...overrides,
-    };
+    });
 }
 
 function harness({
@@ -939,5 +932,180 @@ describe('usage ledger — prefix diagnostics', () => {
             origin: 'story',
             messages: [{ hash: 11, tokens: 1500 }],
         }]);
+    });
+});
+
+describe('usage ledger — reset', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('resets the current chat only, clearing its state, namespace, pending copy and bucket', () => {
+        const { ledger, env, save } = harness();
+        ledger.loadChat('chat-1');
+        ledger.startRun('chat-1');
+        ledger.add(record('r1', 'chat-1'));
+        ledger.add(record('r2', 'chat-2'));
+
+        expect(ledger.recordsFor('chat-1')).toHaveLength(1);
+        expect(env.metadata[USAGE_CHAT_METADATA_KEY].records).toHaveLength(1);
+        expect(ledger.allTimeForView().chats).toBe(2);
+
+        ledger.resetChat('chat-1');
+
+        expect(ledger.recordsFor('chat-1')).toEqual([]);
+        expect(ledger.runsFor('chat-1')).toEqual([]);
+        expect(ledger.currentRunIdFor('chat-1')).toBeNull();
+        expect(ledger.retentionFor('chat-1')).toMatchObject({ retained: 0, total: 0 });
+        expect(ledger.archivedFor('chat-1').total.requests).toBe(0);
+        expect(env.metadata[USAGE_CHAT_METADATA_KEY]).toBeUndefined();
+        expect(save).toHaveBeenCalled();
+
+        // The other chat keeps its rows and its all-time contribution.
+        expect(ledger.recordsFor('chat-2')).toHaveLength(1);
+        expect(ledger.allTimeForView().totals.requests).toBe(1);
+        expect(ledger.allTimeForView().chats).toBe(1);
+        expect(env.storage.readAllTime().chats['chat-1']).toBeUndefined();
+        expect(env.storage.readAllTime().chats['chat-2']).toBeTruthy();
+        // The pending copy becomes an empty reset tombstone, not a stale row.
+        const pendingAfterReset = JSON.parse(
+            env.storage.read(USAGE_PENDING_STORAGE_KEY) ?? '{"chats":{}}',
+        ).chats['chat-1'];
+        expect(pendingAfterReset.records).toEqual([]);
+        expect(pendingAfterReset.runs).toEqual([]);
+
+        // A queued save cannot resurrect the chat after the reset.
+        vi.advanceTimersByTime(5000);
+        expect(env.metadata[USAGE_CHAT_METADATA_KEY]).toBeUndefined();
+        expect(ledger.recordsFor('chat-1')).toEqual([]);
+        expect(env.storage.readAllTime().chats['chat-1']).toBeUndefined();
+    });
+
+    it('drops the prefix baseline so the next request cannot compare with a reset row', () => {
+        const fingerprint = (messages) => ({
+            provider: 'deepseek',
+            model: 'deepseek-v4-flash',
+            origin: 'story',
+            messages,
+        });
+        const { ledger } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1', {
+            messageFingerprint: fingerprint([{ hash: 11, tokens: 1500 }, { hash: 22, tokens: 600 }]),
+        }));
+
+        ledger.resetChat('chat-1');
+
+        const next = record('r2', 'chat-1', {
+            hitTokens: 0,
+            messageFingerprint: fingerprint([
+                { hash: 11, tokens: 1500 },
+                { hash: 22, tokens: 600 },
+                { hash: 33, tokens: 300 },
+            ]),
+        });
+        ledger.add(next);
+
+        expect(next.sharedPrefixTokens).toBeNull();
+        expect(next.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('resets all-time totals without touching any chat rows or namespace', () => {
+        const { ledger, env } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1'));
+        ledger.flush();
+
+        ledger.resetAllTime();
+
+        expect(ledger.allTimeForView().totals.requests).toBe(0);
+        expect(ledger.allTimeForView().chats).toBe(0);
+        expect(env.storage.readAllTime().totals.requests).toBe(0);
+        expect(ledger.recordsFor('chat-1')).toHaveLength(1);
+        expect(env.metadata[USAGE_CHAT_METADATA_KEY].records).toHaveLength(1);
+    });
+
+    it('exposes the all-time buckets so an export can carry them', () => {
+        const { ledger } = harness();
+        ledger.add(record('r1', 'chat-1'));
+        ledger.add(record('r2', 'chat-1'));
+        ledger.add(record('r3', 'chat-2'));
+
+        const allTime = ledger.allTimeForExport();
+
+        expect(allTime.totals.requests).toBe(3);
+        expect(allTime.buckets['chat-1'].requests).toBe(2);
+        expect(allTime.buckets['chat-2'].requests).toBe(1);
+    });
+
+    it('returns one normalized snapshot with records, runs, aggregates and buckets', () => {
+        const { ledger } = harness();
+        ledger.loadChat('chat-1');
+        ledger.startRun('chat-1');
+        ledger.add(record('r1', 'chat-1'));
+        ledger.add(record('r2', 'chat-2'));
+
+        const snapshot = ledger.exportSnapshotFor('chat-1');
+
+        expect(snapshot.records.map((entry) => entry.recordId)).toEqual(['r1']);
+        expect(snapshot.runs).toHaveLength(1);
+        expect(snapshot.currentRunId).toBe(ledger.currentRunIdFor('chat-1'));
+        expect(snapshot.archived.total.requests).toBe(0);
+        expect(snapshot.retention).toMatchObject({ limit: USAGE_RECORD_LIMIT, retained: 1, total: 1 });
+        expect(snapshot.allTime.buckets['chat-1'].requests).toBe(1);
+        expect(snapshot.allTime.buckets['chat-2'].requests).toBe(1);
+    });
+
+    it('leaves an empty chat as a no-op and keeps the other bucket', () => {
+        const { ledger } = harness();
+        ledger.add(record('r1', 'chat-2'));
+
+        ledger.resetChat('chat-1');
+
+        expect(ledger.recordsFor('chat-1')).toEqual([]);
+        expect(ledger.allTimeForView().totals.requests).toBe(1);
+        expect(ledger.allTimeForView().chats).toBe(1);
+    });
+
+    it('keeps the tombstone through two resets so a failed save still cannot restore the rows', () => {
+        const { ledger, env } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1'));
+        ledger.flush();
+        const staleNamespace = JSON.parse(JSON.stringify(env.metadata[USAGE_CHAT_METADATA_KEY]));
+
+        // Both saves fail, so only the pending tombstone carries the reset.
+        ledger.resetChat('chat-1');
+        ledger.resetChat('chat-1');
+
+        env.metadata = { [USAGE_CHAT_METADATA_KEY]: staleNamespace };
+        const restored = reload(env);
+
+        expect(restored.recordsFor('chat-1')).toEqual([]);
+        expect(restored.allTimeForView().totals.requests).toBe(0);
+    });
+
+    it('replays a reset tombstone so a failed metadata save cannot restore the rows', () => {
+        const { ledger, env } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1'));
+        ledger.flush();
+        // The chat file still carries this namespace when the reset's save
+        // silently fails, which is what SillyTavern's saveMetadata can do.
+        const staleNamespace = JSON.parse(JSON.stringify(env.metadata[USAGE_CHAT_METADATA_KEY]));
+
+        ledger.resetChat('chat-1');
+        expect(ledger.allTimeForView().totals.requests).toBe(0);
+
+        env.metadata = { [USAGE_CHAT_METADATA_KEY]: staleNamespace };
+        const restored = reload(env);
+
+        expect(restored.recordsFor('chat-1')).toEqual([]);
+        expect(restored.allTimeForView().totals.requests).toBe(0);
+        expect(env.metadata[USAGE_CHAT_METADATA_KEY].records).toEqual([]);
     });
 });

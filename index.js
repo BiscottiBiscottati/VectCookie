@@ -843,6 +843,8 @@ jQuery(async () => {
         },
         onPricesChange: persistUsageSettings,
         onRunStart: () => usageLedger.startRun(getActiveChatId()),
+        onResetChat: () => usageLedger.resetChat(getActiveChatId()),
+        onResetAllTime: () => usageLedger.resetAllTime(),
     });
 
     // Initialize auto-sync checkbox state for current chat (if any)
