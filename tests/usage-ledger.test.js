@@ -713,3 +713,231 @@ describe('usage ledger — branch', () => {
         expect(source.ledger.allTimeForView().totals.requests).toBe(1);
     });
 });
+
+describe('usage ledger — prefix diagnostics', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    function fingerprint(overrides = {}) {
+        return {
+            provider: 'deepseek',
+            model: 'deepseek-v4-flash',
+            origin: 'story',
+            messages: [
+                { hash: 11, tokens: 1500 },
+                { hash: 22, tokens: 600 },
+            ],
+            ...overrides,
+        };
+    }
+
+    function fingerprintWithExtraMessage(overrides = {}) {
+        return fingerprint({
+            messages: [
+                { hash: 11, tokens: 1500 },
+                { hash: 22, tokens: 600 },
+                { hash: 33, tokens: 300 },
+            ],
+            ...overrides,
+        });
+    }
+
+    it('carries the fingerprint across a reload so the next request compares', () => {
+        const { ledger, env } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1', { messageFingerprint: fingerprint() }));
+        ledger.flush();
+
+        const reloaded = reload(env);
+        const persisted = () => Object.values(
+            env.metadata[USAGE_CHAT_METADATA_KEY].promptFingerprints,
+        );
+        expect(persisted()).toHaveLength(1);
+        expect(persisted()[0].messages).toHaveLength(2);
+
+        const next = record('r2', 'chat-1', { hitTokens: 0, messageFingerprint: fingerprintWithExtraMessage() });
+        reloaded.add(next);
+
+        expect(next.sharedPrefixTokens).toBe(2100);
+        expect(next.possiblePrefixBreaker).toBe(true);
+        expect(persisted()[0].messages).toHaveLength(3);
+        // The fingerprint is a comparison input, not a row field: retaining it
+        // on every row would put a hash array per record in the chat file.
+        expect(next.messageFingerprint).toBeUndefined();
+    });
+
+    it('loads a namespace written before the fingerprint existed', () => {
+        const env = {
+            chatId: 'chat-1',
+            metadata: {
+                [USAGE_CHAT_METADATA_KEY]: {
+                    version: 1,
+                    ownerChatId: 'chat-1',
+                    records: [record('r1')],
+                    runs: [],
+                    currentRunId: null,
+                    revision: 3,
+                },
+            },
+            storage: memoryStorage(),
+            prices: null,
+        };
+        const ledger = reload(env);
+
+        expect(ledger.recordsFor('chat-1')).toHaveLength(1);
+
+        const next = record('r2', 'chat-1', { messageFingerprint: fingerprint() });
+        ledger.add(next);
+
+        expect(next.sharedPrefixTokens).toBeNull();
+        expect(next.possiblePrefixBreaker).toBe(false);
+        expect(Object.values(env.metadata[USAGE_CHAT_METADATA_KEY].promptFingerprints))
+            .toEqual([fingerprint()]);
+    });
+
+    it('does not let a failed request displace the baseline', () => {
+        const { ledger } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1', { messageFingerprint: fingerprint() }));
+
+        const failed = record('r2', 'chat-1', {
+            status: 'error',
+            hitTokens: 0,
+            messageFingerprint: fingerprintWithExtraMessage(),
+        });
+        ledger.add(failed);
+
+        // A failed row can still show what it shared; it is not a cache miss,
+        // so it is never flagged, and it must not move the baseline.
+        expect(failed.sharedPrefixTokens).toBe(2100);
+        expect(failed.possiblePrefixBreaker).toBe(false);
+
+        const next = record('r3', 'chat-1', { hitTokens: 0, messageFingerprint: fingerprintWithExtraMessage() });
+        ledger.add(next);
+        expect(next.sharedPrefixTokens).toBe(2100);
+        expect(next.possiblePrefixBreaker).toBe(true);
+    });
+
+    it('compares each origin against its own baseline', () => {
+        const { ledger } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1', { messageFingerprint: fingerprint() }));
+
+        const quiet = record('r2', 'chat-1', {
+            origin: 'quiet',
+            hitTokens: 0,
+            messageFingerprint: fingerprint({
+                origin: 'quiet',
+                messages: [{ hash: 91, tokens: 5000 }],
+            }),
+        });
+        ledger.add(quiet);
+        expect(quiet.sharedPrefixTokens).toBeNull();
+
+        const next = record('r3', 'chat-1', {
+            hitTokens: 0,
+            messageFingerprint: fingerprintWithExtraMessage(),
+        });
+        ledger.add(next);
+        expect(next.sharedPrefixTokens).toBe(2100);
+        expect(next.possiblePrefixBreaker).toBe(true);
+    });
+
+    it('flags at exactly 2048 shared tokens and not at 2047', () => {
+        const { ledger } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1', {
+            messageFingerprint: fingerprint({
+                messages: [{ hash: 11, tokens: 1500 }, { hash: 22, tokens: 548 }],
+            }),
+        }));
+
+        const exactly = record('r2', 'chat-1', {
+            hitTokens: 0,
+            messageFingerprint: fingerprint({
+                messages: [
+                    { hash: 11, tokens: 1500 },
+                    { hash: 22, tokens: 548 },
+                    { hash: 33, tokens: 100 },
+                ],
+            }),
+        });
+        ledger.add(exactly);
+        expect(exactly.sharedPrefixTokens).toBe(2048);
+        expect(exactly.possiblePrefixBreaker).toBe(true);
+
+        ledger.add(record('r3', 'chat-1', {
+            messageFingerprint: fingerprint({
+                messages: [{ hash: 11, tokens: 1500 }, { hash: 22, tokens: 547 }],
+            }),
+        }));
+        const below = record('r4', 'chat-1', {
+            hitTokens: 0,
+            messageFingerprint: fingerprint({
+                messages: [
+                    { hash: 11, tokens: 1500 },
+                    { hash: 22, tokens: 547 },
+                    { hash: 33, tokens: 100 },
+                ],
+            }),
+        });
+        ledger.add(below);
+        expect(below.sharedPrefixTokens).toBe(2047);
+        expect(below.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('replaces the baseline on a provider change so the next same-provider row compares', () => {
+        const { ledger } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1', { messageFingerprint: fingerprint() }));
+
+        const changed = record('r2', 'chat-1', {
+            provider: 'openrouter',
+            model: 'deepseek/deepseek-v3',
+            hitTokens: 0,
+            messageFingerprint: fingerprint({ provider: 'openrouter', model: 'deepseek/deepseek-v3' }),
+        });
+        ledger.add(changed);
+        expect(changed.sharedPrefixTokens).toBeNull();
+        expect(changed.possiblePrefixBreaker).toBe(false);
+
+        const next = record('r3', 'chat-1', {
+            provider: 'openrouter',
+            model: 'deepseek/deepseek-v3',
+            messageFingerprint: fingerprintWithExtraMessage({
+                provider: 'openrouter',
+                model: 'deepseek/deepseek-v3',
+            }),
+        });
+        ledger.add(next);
+        expect(next.sharedPrefixTokens).toBe(2100);
+    });
+
+    it('strips text that reached the ledger inside a fingerprint', () => {
+        const { ledger, env } = harness();
+        ledger.loadChat('chat-1');
+        ledger.add(record('r1', 'chat-1', {
+            messageFingerprint: {
+                provider: 'deepseek',
+                model: 'deepseek-v4-flash',
+                origin: 'story',
+                messages: [{ hash: 11, tokens: 1500, content: 'SECRET PROMPT TEXT' }],
+            },
+        }));
+        ledger.flush();
+
+        expect(JSON.stringify(env.metadata[USAGE_CHAT_METADATA_KEY])).not.toContain('SECRET PROMPT TEXT');
+        expect(ledger.recordsFor('chat-1')[0]).not.toHaveProperty('messageFingerprint');
+        expect(Object.values(env.metadata[USAGE_CHAT_METADATA_KEY].promptFingerprints)).toEqual([{
+            provider: 'deepseek',
+            model: 'deepseek-v4-flash',
+            origin: 'story',
+            messages: [{ hash: 11, tokens: 1500 }],
+        }]);
+    });
+});

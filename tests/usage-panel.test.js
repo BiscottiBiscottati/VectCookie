@@ -1167,3 +1167,90 @@ describe('usage panel — durable totals smoke', () => {
         expect(panel.querySelector('[data-usage-card="all"]').textContent).toMatch(/2 requests/);
     });
 });
+
+describe('usage view model — prefix diagnostics', () => {
+    it('shows the shared-prefix tokens of a comparable row', () => {
+        const [row] = buildUsageView({
+            records: [measuredRecord({ sharedPrefixTokens: 2200 })],
+            trackingEnabled: true,
+        }).rows;
+
+        expect(row.sharedPrefixLabel).toBe('2,200');
+        expect(row.sharedPrefixSource).toBe('estimated');
+        expect(row.prefixBreakerLabel).toBe('');
+    });
+
+    it('leaves the shared prefix empty when there is no comparable prior', () => {
+        const [row] = buildUsageView({
+            records: [measuredRecord({ sharedPrefixTokens: null })],
+            trackingEnabled: true,
+        }).rows;
+
+        expect(row.sharedPrefixLabel).toBe('—');
+        expect(row.sharedPrefixSource).toBe('');
+    });
+
+    it('flags a zero-hit row with a long shared prefix in words', () => {
+        const [row] = buildUsageView({
+            records: [measuredRecord({
+                hitTokens: 0,
+                sharedPrefixTokens: 2200,
+                possiblePrefixBreaker: true,
+            })],
+            trackingEnabled: true,
+        }).rows;
+
+        expect(row.sharedPrefixLabel).toBe('2,200');
+        expect(row.prefixBreakerLabel).toBe('Possible prefix breaker');
+    });
+
+    it('does not flag a zero-hit row with a short shared prefix', () => {
+        const [row] = buildUsageView({
+            records: [measuredRecord({ hitTokens: 0, sharedPrefixTokens: 780 })],
+            trackingEnabled: true,
+        }).rows;
+
+        expect(row.prefixBreakerLabel).toBe('');
+    });
+});
+
+describe('usage panel — prefix diagnostics smoke', () => {
+    beforeEach(() => {
+        document.body.innerHTML = '<div id="VectFox_usage_panel"></div>';
+    });
+
+    it('renders the shared-prefix column and the breaker flag', () => {
+        initializeUsagePanel({
+            settings: { usage_tracking_enabled: true },
+            ledger: {
+                recordsFor: () => [measuredRecord({
+                    hitTokens: 0,
+                    sharedPrefixTokens: 2200,
+                    possiblePrefixBreaker: true,
+                })],
+            },
+            getChatId: () => 'chat-1',
+        });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        const headers = [...panel.querySelectorAll('.vectfox-usage-requests-table thead th')]
+            .map((header) => header.textContent.trim());
+        expect(headers).toContain('Shared prefix');
+        expect(panel.textContent).toContain('2,200');
+        expect(panel.querySelector('[data-usage-prefix-flag]')).not.toBeNull();
+        expect(panel.textContent).toContain('Possible prefix breaker');
+    });
+
+    it('renders an em dash when no comparable prior exists', () => {
+        initializeUsagePanel({
+            settings: { usage_tracking_enabled: true },
+            ledger: { recordsFor: () => [measuredRecord()] },
+            getChatId: () => 'chat-1',
+        });
+
+        const panel = document.getElementById('VectFox_usage_panel');
+        expect(panel.querySelector('[data-usage-prefix-flag]')).toBeNull();
+        const cells = [...panel.querySelectorAll('.vectfox-usage-requests-table tbody td')];
+        expect(cells.some((cell) => cell.textContent.trim() === '—')).toBe(true);
+    });
+});

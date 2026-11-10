@@ -11,6 +11,7 @@
  */
 
 import { resolveUsageOrigin } from './usage-attribution.js';
+import { createPromptFingerprint } from './usage-prefix.js';
 
 export const USAGE_CHAT_COMPLETION_PATH = '/api/backends/chat-completions/generate';
 export const USAGE_OBSERVER_MARKER = '__vectfox_usage_observer__';
@@ -43,6 +44,10 @@ let _recordSequence = 0;
  * @param {(messages: object[]) => (number|Promise<number|null>|null)} [options.estimatePromptTokens]
  *   Optional prompt-token estimate from the request messages, used only when
  *   the provider reported no usage. Runs after the response, never on its path.
+ * @param {(messages: object[]) => ((number|null)[]|Promise<(number|null)[]|null>)} [options.estimateMessageTokens]
+ *   Optional per-message token counts for the prefix fingerprint. Runs after
+ *   the response, never on its path; a missing or failing estimator leaves the
+ *   counts unavailable, never zero.
  * @param {() => void} [options.onSettle] Called after every observed request's
  *   capture attempt finishes, including a skipped body or a capture failure, so
  *   the health line can refresh without a record.
@@ -59,6 +64,7 @@ export function installUsageObserver({
     getOrigin = resolveUsageOrigin,
     getConfig = () => null,
     estimatePromptTokens = null,
+    estimateMessageTokens = null,
     onSettle = () => {},
     now = () => Date.now(),
 } = {}) {
@@ -74,6 +80,7 @@ export function installUsageObserver({
         getOrigin,
         getConfig,
         estimatePromptTokens,
+        estimateMessageTokens,
         onSettle,
         now,
         health: createHealth(),
@@ -299,7 +306,7 @@ function notifySettled(sink) {
     }
 }
 
-function captureRejectedRequest(context) {
+async function captureRejectedRequest(context) {
     const { sink, init, chatId, runId, origin, configuration, startedAt, error } = context;
     const body = readBodyOrCountSkipped(sink, init);
     if (!body) return;
@@ -313,6 +320,7 @@ function captureRejectedRequest(context) {
         httpStatus: null,
         usage: null,
         status: usageStatus({ aborted: isAbortError(error, init?.signal), error: true }),
+        messageTokenCounts: await fingerprintMessageTokenCounts(sink, body),
         startedAt,
         latencyMs: Math.max(0, sink.now() - startedAt),
     }));
@@ -394,6 +402,7 @@ async function captureHttpErrorRecord(context) {
         httpStatus,
         usage: null,
         status: usageStatus({ error: true }),
+        messageTokenCounts: await fingerprintMessageTokenCounts(sink, body),
         startedAt,
         latencyMs,
     }));
@@ -420,6 +429,7 @@ async function captureJsonRecord(context) {
     const estimatedPromptTokens = status === 'no-usage'
         ? await estimatePrompt(sink, body)
         : null;
+    const messageTokenCounts = await fingerprintMessageTokenCounts(sink, body);
     emitRecord(sink, buildRecord({
         body,
         chatId,
@@ -433,6 +443,7 @@ async function captureJsonRecord(context) {
         usage,
         status,
         estimatedPromptTokens,
+        messageTokenCounts,
         startedAt,
         latencyMs,
     }));
@@ -459,6 +470,7 @@ async function captureStreamedRecord(context) {
         const estimatedPromptTokens = status === 'no-usage'
             ? await estimatePrompt(sink, body)
             : null;
+        const messageTokenCounts = await fingerprintMessageTokenCounts(sink, body);
         emitRecord(sink, buildRecord({
             body,
             chatId,
@@ -471,6 +483,7 @@ async function captureStreamedRecord(context) {
             usage: result.usage,
             status,
             estimatedPromptTokens,
+            messageTokenCounts,
             startedAt,
             latencyMs,
         }));
@@ -573,6 +586,24 @@ async function estimatePrompt(sink, body) {
     }
 }
 
+/**
+ * Runs the injected per-message estimator after any request with a readable
+ * body, so a failed or aborted row can still show what it shared with its
+ * comparable baseline; only the ledger decides that such a row must not move
+ * the baseline. Unlike the prompt total, a failure leaves the whole array
+ * unavailable: a partial sum must not pass as a shorter shared prefix.
+ */
+async function fingerprintMessageTokenCounts(sink, body) {
+    const estimator = sink?.estimateMessageTokens;
+    if (typeof estimator !== 'function' || !Array.isArray(body?.messages)) return null;
+    try {
+        const counts = await estimator(body.messages);
+        return Array.isArray(counts) ? counts : null;
+    } catch {
+        return null;
+    }
+}
+
 function buildRecord({
     body,
     chatId,
@@ -586,6 +617,7 @@ function buildRecord({
     usage = null,
     status,
     estimatedPromptTokens = null,
+    messageTokenCounts = null,
     startedAt,
     latencyMs,
 }) {
@@ -600,17 +632,20 @@ function buildRecord({
     const totalTokens = reportedTotal ?? (
         promptTokens != null && completionTokens != null ? promptTokens + completionTokens : null
     );
+    const recordOrigin = origin?.origin ?? 'unknown';
+    const provider = body.chat_completion_source || 'unknown';
+    const model = body.model || responseModel || 'unknown';
 
     return {
         recordId: createRecordId(),
         timestamp: startedAt,
         chatId,
         runId,
-        origin: origin?.origin ?? 'unknown',
+        origin: recordOrigin,
         featureLabel: origin?.featureLabel ?? null,
         configuration: configuration ?? null,
-        provider: body.chat_completion_source || 'unknown',
-        model: body.model || responseModel || 'unknown',
+        provider,
+        model,
         responseId,
         stream: body.stream === true,
         status,
@@ -630,6 +665,16 @@ function buildRecord({
         cost: toCount(usage?.cost),
         cacheDiscount: cacheDiscount ?? toCount(usage?.cache_discount),
         estimatedPromptTokens,
+        // Hashes and counts only: the request messages are never kept.
+        // Failed and aborted rows are fingerprinted too, so they can show a
+        // shared prefix, but the ledger never lets them move a baseline.
+        messageFingerprint: createPromptFingerprint({
+            provider,
+            model,
+            origin: recordOrigin,
+            messages: body.messages,
+            tokenCounts: messageTokenCounts,
+        }),
         usageSource: hasUsage ? 'measured' : (estimatedPromptTokens != null ? 'estimated' : 'unavailable'),
     };
 }

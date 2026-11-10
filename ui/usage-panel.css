@@ -300,3 +300,14 @@
     opacity: 0.75;
     padding: 0 2px;
 }
+
+/* Prefix diagnostics ------------------------------------------------------ */
+
+.vectfox-usage-prefix-flag {
+    display: block;
+    margin-top: 2px;
+    color: var(--vectfox-warning, #f59e0b);
+    font-size: 0.82em;
+    font-weight: 600;
+    white-space: normal;
+}

@@ -9,7 +9,12 @@
 import { describe, it, expect, vi } from 'vitest';
 
 import { installUsageObserver, getUsageObserverHealth } from '../core/usage-observer.js';
-import { UsageLedger, USAGE_CHAT_METADATA_KEY, USAGE_ALL_TIME_STORAGE_KEY } from '../core/usage-ledger.js';
+import {
+    UsageLedger,
+    USAGE_CHAT_METADATA_KEY,
+    USAGE_ALL_TIME_STORAGE_KEY,
+    USAGE_PENDING_STORAGE_KEY,
+} from '../core/usage-ledger.js';
 import {
     noteGenerationStarted,
     noteGenerationEnded,
@@ -1165,5 +1170,375 @@ describe('usage pipeline — durable ledger', () => {
         const allTime = JSON.parse(items.get(USAGE_ALL_TIME_STORAGE_KEY));
         expect(allTime.totals.requests).toBe(1);
         expect(allTime.chats['chat-1'].promptTokens).toBe(1200);
+    });
+});
+
+describe('usage pipeline — prefix diagnostics', () => {
+    const PREFIX_TOKENS = {
+        'stable system prompt': 1500,
+        'first turn': 700,
+        'second turn': 300,
+        'short system prompt': 80,
+    };
+
+    const countMessages = async (messages) => messages.map(
+        (message) => PREFIX_TOKENS[message?.content] ?? 0,
+    );
+
+    function messages(...contents) {
+        return contents.map((content, index) => ({
+            role: index === 0 ? 'system' : (index % 2 === 1 ? 'user' : 'assistant'),
+            content,
+        }));
+    }
+
+    function usageResponse({ hit = 900, prompt = 2300 } = {}) {
+        return jsonResponse({
+            id: 'gen-prefix',
+            usage: {
+                prompt_tokens: prompt,
+                completion_tokens: 10,
+                prompt_cache_hit_tokens: hit,
+            },
+        });
+    }
+
+    async function send({ target, fetchMock }, { body = {}, messages: requestMessages, hit, prompt } = {}) {
+        const response = usageResponse({ hit, prompt });
+        fetchMock.mockImplementationOnce(async () => response);
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({ messages: requestMessages, ...body })),
+        });
+    }
+
+    it('shows the shared-prefix tokens of the previous comparable request', async () => {
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, { estimateMessageTokens: countMessages });
+
+        await send({ target, fetchMock }, { messages: messages('stable system prompt', 'first turn') });
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn', 'second turn'),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [newest, previous] = ledger.recordsFor('chat-1');
+        expect(newest.sharedPrefixTokens).toBe(2200);
+        expect(previous.sharedPrefixTokens).toBeNull();
+        expect(newest.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('flags a zero-hit request that shares a long prefix', async () => {
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, { estimateMessageTokens: countMessages });
+
+        await send({ target, fetchMock }, { messages: messages('stable system prompt', 'first turn') });
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn', 'second turn'),
+            hit: 0,
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [newest] = ledger.recordsFor('chat-1');
+        expect(newest.sharedPrefixTokens).toBe(2200);
+        expect(newest.possiblePrefixBreaker).toBe(true);
+    });
+
+    it('does not flag a zero-hit request whose shared prefix is short', async () => {
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, { estimateMessageTokens: countMessages });
+
+        await send({ target, fetchMock }, { messages: messages('short system prompt', 'first turn') });
+        await send({ target, fetchMock }, {
+            messages: messages('short system prompt', 'first turn', 'second turn'),
+            hit: 0,
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [newest] = ledger.recordsFor('chat-1');
+        expect(newest.sharedPrefixTokens).toBe(780);
+        expect(newest.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('does not flag a row whose provider reported no hit count at all', async () => {
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, { estimateMessageTokens: countMessages });
+
+        await send({ target, fetchMock }, { messages: messages('stable system prompt', 'first turn') });
+        const response = jsonResponse({ id: 'gen-1', choices: [] });
+        fetchMock.mockImplementationOnce(async () => response);
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({
+                messages: messages('stable system prompt', 'first turn', 'second turn'),
+            })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [newest] = ledger.recordsFor('chat-1');
+        expect(newest.sharedPrefixTokens).toBe(2200);
+        expect(newest.hitTokens).toBeNull();
+        expect(newest.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('keeps the shared prefix unavailable when a matched message has no count', async () => {
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, {
+            estimateMessageTokens: async () => null,
+        });
+
+        await send({ target, fetchMock }, { messages: messages('stable system prompt', 'first turn') });
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn', 'second turn'),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [newest] = ledger.recordsFor('chat-1');
+        expect(newest.sharedPrefixTokens).toBeNull();
+        expect(newest.possiblePrefixBreaker).toBe(false);
+    });
+
+    it.each([
+        ['provider', { chat_completion_source: 'deepseek' }],
+        ['model', { model: 'deepseek-v4-flash' }],
+    ])('clears the comparison when the %s changes', async (_field, change) => {
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, { estimateMessageTokens: countMessages });
+
+        await send({ target, fetchMock }, { messages: messages('stable system prompt', 'first turn') });
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn', 'second turn'),
+            body: change,
+            hit: 0,
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [newest] = ledger.recordsFor('chat-1');
+        expect(newest.sharedPrefixTokens).toBeNull();
+        expect(newest.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('clears the comparison when the origin changes', async () => {
+        let origin = 'story';
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, {
+            estimateMessageTokens: countMessages,
+            getOrigin: () => ({ origin, featureLabel: null }),
+        });
+
+        await send({ target, fetchMock }, { messages: messages('stable system prompt', 'first turn') });
+        origin = 'quiet';
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn', 'second turn'),
+            hit: 0,
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [newest] = ledger.recordsFor('chat-1');
+        expect(newest.origin).toBe('quiet');
+        expect(newest.sharedPrefixTokens).toBeNull();
+        expect(newest.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('compares against the latest comparable request even when its counts were unavailable', async () => {
+        let countsAvailable = true;
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, {
+            estimateMessageTokens: async (requestMessages) => (
+                countsAvailable ? countMessages(requestMessages) : null
+            ),
+        });
+
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn'),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(1));
+        countsAvailable = false;
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn', 'second turn'),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+        countsAvailable = true;
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn', 'second turn'),
+            hit: 0,
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(3));
+
+        const [newest, unmeasured] = ledger.recordsFor('chat-1');
+        // The unmeasured row cannot report its own prefix, but its hashes are
+        // the latest comparable baseline, so the next row sums three messages
+        // (2,500), not the two the older measured fingerprint knew (2,200).
+        expect(unmeasured.sharedPrefixTokens).toBeNull();
+        expect(newest.sharedPrefixTokens).toBe(2500);
+        expect(newest.possiblePrefixBreaker).toBe(true);
+    });
+
+    it('shows what an aborted request shared without flagging it', async () => {
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, { estimateMessageTokens: countMessages });
+
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn'),
+        });
+        const abortError = new Error('network aborted');
+        abortError.name = 'AbortError';
+        fetchMock.mockImplementationOnce(async () => { throw abortError; });
+        await expect(target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({
+                messages: messages('stable system prompt', 'first turn', 'second turn'),
+            })),
+        })).rejects.toThrow('network aborted');
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [aborted] = ledger.recordsFor('chat-1');
+        expect(aborted.status).toBe('aborted');
+        expect(aborted.sharedPrefixTokens).toBe(2200);
+        expect(aborted.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('shows what an aborted stream shared without flagging it', async () => {
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, { estimateMessageTokens: countMessages });
+
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn'),
+        });
+        const encoder = new TextEncoder();
+        const controller = new AbortController();
+        const stream = new ReadableStream({
+            start(streamController) {
+                streamController.enqueue(encoder.encode(
+                    'data: {"usage":{"prompt_tokens":10,"total_tokens":10,"prompt_cache_hit_tokens":0}}\n\n',
+                ));
+                setTimeout(() => {
+                    controller.abort();
+                    streamController.error(new DOMException('The user aborted a request.', 'AbortError'));
+                }, 5);
+            },
+        });
+        fetchMock.mockImplementationOnce(async () => new Response(stream, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+        }));
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({
+                stream: true,
+                messages: messages('stable system prompt', 'first turn', 'second turn'),
+            })),
+            signal: controller.signal,
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [aborted] = ledger.recordsFor('chat-1');
+        expect(aborted.status).toBe('aborted');
+        expect(aborted.hitTokens).toBe(0);
+        expect(aborted.sharedPrefixTokens).toBe(2200);
+        expect(aborted.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('compares each origin against its own baseline', async () => {
+        let origin = 'story';
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, {
+            estimateMessageTokens: countMessages,
+            getOrigin: () => ({ origin, featureLabel: null }),
+        });
+
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn'),
+        });
+        origin = 'worker-profile';
+        await send({ target, fetchMock }, {
+            messages: messages('short system prompt'),
+            hit: 0,
+        });
+        origin = 'story';
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn', 'second turn'),
+            hit: 0,
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(3));
+
+        const [newest, worker] = ledger.recordsFor('chat-1');
+        expect(worker.origin).toBe('worker-profile');
+        expect(worker.sharedPrefixTokens).toBeNull();
+        expect(worker.possiblePrefixBreaker).toBe(false);
+        expect(newest.origin).toBe('story');
+        expect(newest.sharedPrefixTokens).toBe(2200);
+        expect(newest.possiblePrefixBreaker).toBe(true);
+    });
+
+    it('shows what a failed row shared without flagging it', async () => {
+        const fetchMock = vi.fn();
+        const { target, ledger } = installOver(fetchMock, { estimateMessageTokens: countMessages });
+
+        await send({ target, fetchMock }, {
+            messages: messages('stable system prompt', 'first turn'),
+        });
+        fetchMock.mockImplementationOnce(async () => new Response('upstream failed', { status: 500 }));
+        await target.fetch(ENDPOINT, {
+            method: 'POST',
+            body: JSON.stringify(chatBody({
+                messages: messages('stable system prompt', 'first turn', 'second turn'),
+            })),
+        });
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+
+        const [failed] = ledger.recordsFor('chat-1');
+        expect(failed.status).toBe('error');
+        expect(failed.hitTokens).toBeNull();
+        expect(failed.sharedPrefixTokens).toBe(2200);
+        expect(failed.possiblePrefixBreaker).toBe(false);
+    });
+
+    it('stores only hashes and counts, never prompt text', async () => {
+        const secret = 'PROMPT-TEXT-MUST-NOT-LEAK';
+        const metadata = {};
+        const items = new Map();
+        const storage = {
+            getItem: (key) => (items.has(key) ? items.get(key) : null),
+            setItem: (key, value) => items.set(key, value),
+        };
+        const ledger = new UsageLedger({
+            getChatId: () => 'chat-1',
+            getMetadata: () => metadata,
+            saveMetadata: async () => {},
+            storage,
+        });
+        ledger.loadChat('chat-1');
+        const fetchMock = vi.fn();
+        const target = { fetch: fetchMock };
+        installUsageObserver({
+            target,
+            isEnabled: () => true,
+            getChatId: () => 'chat-1',
+            handleRecord: (record) => ledger.add(record),
+            estimateMessageTokens: async (requestMessages) => requestMessages.map(() => 1),
+            now: () => 1_700_000_000_000,
+        });
+
+        for (const content of [`${secret} one`, `${secret} two`]) {
+            fetchMock.mockImplementationOnce(async () => usageResponse());
+            await target.fetch(ENDPOINT, {
+                method: 'POST',
+                body: JSON.stringify(chatBody({ messages: messages(content) })),
+            });
+        }
+        await vi.waitFor(() => expect(ledger.recordsFor('chat-1')).toHaveLength(2));
+        ledger.flush();
+
+        const [record] = ledger.recordsFor('chat-1');
+        expect(record).not.toHaveProperty('messageFingerprint');
+        const baselines = Object.values(metadata[USAGE_CHAT_METADATA_KEY].promptFingerprints);
+        expect(baselines).toHaveLength(1);
+        expect(baselines[0].messages).toHaveLength(1);
+        expect(baselines[0].messages[0]).toEqual({ hash: expect.any(Number), tokens: 1 });
+        expect(JSON.stringify(record)).not.toContain(secret);
+        expect(JSON.stringify(metadata)).not.toContain(secret);
+        expect(items.get(USAGE_PENDING_STORAGE_KEY)).not.toContain(secret);
+        expect(items.get(USAGE_ALL_TIME_STORAGE_KEY)).not.toContain(secret);
     });
 });
