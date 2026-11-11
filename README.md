@@ -402,9 +402,25 @@ New collections auto-activate for the current chat. "Active for current chat" ch
 
 Auto-Sync card shows whether the current chat is vectorized and how many events exist. World Info card shows vectorized lorebooks by name. Both link to the right vectorizer if something's missing.
 
+### 📊 Usage telemetry — what the provider actually charged
+
+A **Usage** tab records every chat-completion request this browser makes and shows the provider-reported tokens, cache hits and cost — per reply, per measurement run and per ghost configuration. It exists to answer the question batching raises: *is the stable prefix actually being served from cache, and is it saving money?*
+
+- **Per-request rows** — time, origin, provider/model, prompt, hit, hit %, miss, total, cost, saving, shared prefix and status. Measured numbers are labelled `measured`; a provider that omits usage gets an **estimated** prompt size (marked `~`) and `unavailable` cache hit — never a fake zero.
+- **Origins kept apart** — `story` replies, `quiet` background generations, `worker` requests (background jobs sent over their own connection profile), and VectFox's own extraction, reformat and agent calls. A worker call cannot pollute the story reply's hit rate.
+- **Measurement runs** — click **Start new measurement**, send N replies, change a setting, start another run. **By configuration** groups requests by ghosting state, batch size and keep-recent, so batch 1 and batch 30 compare side by side in requests, average prompt, hit %, cost per request and saving. Old runs are kept.
+- **All-time totals** across chats follow renames, lose only the deleted chat's contribution, and a branch starts with a clean table instead of inheriting a copy.
+- **Prefix diagnostics** — each row shows how many tokens it shares with the previous comparable request, and flags a **possible prefix breaker** when a long shared prefix still reports zero cached tokens.
+- **Price table** — editable hit / miss / output / cache-write prices per million tokens, used only when the provider does not report cost itself. A model with no price row shows `unavailable`, never `$0.00`.
+- **Export and reset** — export a versioned JSON with records, runs and aggregates (no prompt text, no API keys) for a bug report or spreadsheet; reset the current chat or the all-time totals, each behind a confirmation.
+
+Off by default and **observe-only**: enabling it wraps `fetch` once, never changes a request, prompt or response, stores no message text and makes no network calls of its own. Per-chat records live in the chat file and disappear with it. Works best on providers that report `usage` — DeepSeek and OpenRouter both do; a custom endpoint that drops it still gets estimated prompt sizes but no hit rate.
+
+See [Doc/usage_telemetry.md](Doc/usage_telemetry.md) for the metric definitions, the batch-size comparison recipe, provider notes and troubleshooting.
+
 ### 🗂️ Tabbed interface
 
-Settings split into **Core** (backend, embedding, hybrid), **EventBase** (chat hsitory/archive chat file .jsonl), **ChunkBase** (lorebook/docs/URLs/wiki), **Action** (diagnostics, dev tools).
+Settings split into **Action** (diagnostics, dev tools), **Core** (backend, embedding, hybrid), **EventBase** (chat history / archive chat file `.jsonl`), **ChunkBase** (lorebook/docs/URLs/wiki), **AutoSync** (auto-sync, Summarizer Injection, ghosting), **WorldInfo** (semantic lorebook activation), **RAG** (retrieval prompt, XML tag, injection depth/position), **AgentMode** (planner), and **Usage** (token and cache telemetry, price table, export).
 
 ### ⚡ Parallel Windows — Vectorization Speedup
 
@@ -557,6 +573,7 @@ Restart SillyTavern.
 9. Enable Auto-Sync if needed in the **AutoSync** tab. Frequency is controlled by the EventBase tab under *Extraction > Window Size*.
 10. Vectorize your lorebook / World Info if needed in the **WorldInfo** tab.
 11. (Optional) Turn on **Agent Mode** in the AgentMode tab once everything else works. Leave provider/model/API-key blank to inherit from your summarizer config — that way the same cheap/fast model used in step 4 also drives the planner. See "How It Works → Agent Mode" above for what it does.
+12. (Optional) Open the **Usage** tab and tick **Track token usage** to measure provider-reported cache hits and cost per reply. Start a measurement run before changing ghosting settings, so the before/after comparison stays clean — see [Doc/usage_telemetry.md](Doc/usage_telemetry.md) for the recipe.
 
 ---
 
@@ -606,6 +623,12 @@ Pick your tokenizer mode *before* you start vectorizing a chat and stick with it
 
 **Can I use triggers/conditions on Chinese/Japanese/Korean chats?**
 Yes. Keyword/pattern matching uses plain substring search, so it works for CJK the same as English. The only caveat is user-written regex using ASCII `\b` word boundaries (which don't fire between CJK characters) — use plain substrings or Unicode `\p{L}` with the `u` flag. Numeric conditions (Message Count / Turn Count) are always language-independent.
+
+**Does the Usage tab show what I will actually be billed?**
+It shows what the provider reports for each request. On DeepSeek that is the billed number. On OpenRouter with a **BYOK** key, OpenRouter can report `cost: 0` even though the upstream provider charges you, so the row says `$0.00 reported` while the real bill is on the upstream dashboard. Add your own price row for that model if you want the tab to estimate the spend; a reported provider cost always wins over the table, and a missing price row shows `unavailable` rather than `$0.00`.
+
+**Why is cache hit or cost unavailable on some rows?**
+That provider or endpoint did not report usage for those requests. VectFox never invents a cache number: cache hit stays `unavailable`, and prompt tokens are shown as an estimate (marked `~`) when SillyTavern's tokenizer could make one. See [Doc/usage_telemetry.md](Doc/usage_telemetry.md) for provider coverage and the exact definitions.
 
 **How do I delete a collection safely?**
 **ALWAYS use the Database Browser inside VectFox** (Action tab → "Database Browser" button) to delete collections. Click the red "Delete" button on the collection card. This properly cleans up both the vector database **and** VectFox's internal registry + metadata. Never delete collections manually from Qdrant's web UI or by editing SillyTavern's `settings.json` — doing so leaves orphaned metadata that causes sync conflicts, "collection not found" errors, and other strange behavior.
