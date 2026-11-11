@@ -9,10 +9,11 @@
  * in-memory mirror, hydrated lazily from the transport on first use, backs them;
  * persistence is asynchronous, coalesced per chunk and debounced.
  *
- * The legacy settings shape (`vectfox_chunk_meta_<hash>`) is owned by
- * core/collection-metadata.js and reached through the injected readLegacy /
- * writeLegacy / deleteLegacy / listLegacy callbacks, so this module never
- * touches the settings object's shape.
+ * The legacy settings shape (`vectfox_chunk_meta_<hash>`) is defined in
+ * core/chunk-meta-keys.js and written by core/collection-metadata.js, which
+ * reaches this module through the injected readLegacy / writeLegacy /
+ * deleteLegacy / listLegacy callbacks, so this module never touches the settings
+ * object's shape.
  */
 
 import { log } from './log.js';

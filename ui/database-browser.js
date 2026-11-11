@@ -54,7 +54,7 @@ import {
   getCollectionCharacterLockCount,
   isCollectionActiveForContext,
 } from "../core/collection-metadata.js";
-import { getContext } from "../../../../extensions.js";
+import { extension_settings, getContext } from "../../../../extensions.js";
 import {
   VALID_GENERATION_TYPES,
 } from "../core/conditional-activation.js";
@@ -760,7 +760,10 @@ function switchTab(tabName) {
   } else if (tabName === "search") {
     bindSearchEvents();
   } else if (tabName === "size") {
-    renderSizeInspectorTab(document.getElementById("vectfox_tab_size"));
+    renderSizeInspectorTab(
+      document.getElementById("vectfox_tab_size"),
+      () => extension_settings?.vectfox,
+    );
   }
 }
 

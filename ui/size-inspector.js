@@ -14,10 +14,10 @@
  * ============================================================================
  */
 
-import { extension_settings } from "../../../../extensions.js";
 import { loadAllCollections } from "../core/collection-loader.js";
 import { buildRegistryKey } from "../core/collection-ids.js";
 import { listChunks } from "../core/core-vector-api.js";
+import { renderStorageHealthPanel } from "./storage-health-panel.js";
 import { icons } from "./icons.js";
 import StringUtils from "../utils/string-utils.js";
 
@@ -30,21 +30,24 @@ const _cache = {
 
 /**
  * Renders the Size Inspector tab content into the given container.
- * Idempotent — safe to call multiple times.
+ * Idempotent — safe to call multiple times. Settings arrive through a getter
+ * rather than being read from the extension global here, so the open path can be
+ * tested without resolving the SillyTavern host modules — and the scan still
+ * reads the current settings rather than a snapshot from when the tab opened.
  * @param {jQuery|HTMLElement} container
+ * @param {function(): (object|null|undefined)} [getSettings] Returns the
+ *     extension settings (`extension_settings.vectfox`).
  */
-export function renderSizeInspectorTab(container) {
+export function renderSizeInspectorTab(container, getSettings = () => null) {
     const $c = window.jQuery ? window.jQuery(container) : null;
     if (!$c || !$c.length) return;
 
-    if ($c.find(".vectfox-size-inspector").length) {
-        // Already rendered — just rebind in case events were lost.
-        bindEvents();
-        return;
-    }
-
-    $c.html(`
+    if (!$c.find(".vectfox-size-inspector").length) {
+        $c.html(`
         <div class="vectfox-size-inspector">
+            <!-- Storage health: settings-only, re-measured on every open. -->
+            <div id="vectfox_size_health" class="vectfox-size-health"></div>
+
             <div class="vectfox-size-toolbar">
                 <button id="vectfox_size_scan_btn" class="vectfox-btn vectfox-btn-primary">
                     ${icons.refreshCw(14)} Scan all collections
@@ -100,18 +103,26 @@ export function renderSizeInspectorTab(container) {
             </div>
         </div>
     `);
+    }
 
-    bindEvents();
+    // Rebind every time in case events were lost, and re-measure the storage
+    // health block so a tab left open does not show a stale size.
+    bindEvents(getSettings);
+    const root = container.nodeType === 1 ? container : container?.[0];
+    renderStorageHealthPanel(
+        root?.querySelector?.("#vectfox_size_health") || null,
+        getSettings,
+    );
 }
 
-function bindEvents() {
+function bindEvents(getSettings) {
     const $ = window.jQuery;
     if (!$) return;
 
     $("#vectfox_size_scan_btn").off("click").on("click", async function (e) {
         e.stopPropagation();
         e.preventDefault();
-        await runScan();
+        await runScan(getSettings);
     });
 
     $("#vectfox_size_back_btn").off("click").on("click", function (e) {
@@ -128,7 +139,12 @@ function bindEvents() {
     });
 }
 
-async function runScan() {
+/**
+ * Surveys every collection and fills the summary table. Reads settings through
+ * the getter at scan time, so a settings reload since the tab opened is picked up.
+ * @param {function(): (object|null|undefined)} getSettings
+ */
+async function runScan(getSettings) {
     const $ = window.jQuery;
     const $btn = $("#vectfox_size_scan_btn");
     const $status = $("#vectfox_size_status");
@@ -150,7 +166,7 @@ async function runScan() {
         // and per-entry source/model resolution. Each returned entry already
         // carries { id, registryKey, backend, source, model, chunkCount } — no
         // local fetch + dedup needed here. See Doc/collection_helper.md.
-        const settings = extension_settings?.vectfox;
+        const settings = getSettings?.();
         if (!settings) {
             throw new Error("VectFox settings not initialized");
         }

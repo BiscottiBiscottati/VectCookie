@@ -13,6 +13,7 @@ import { extension_settings, getContext } from '../../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../../script.js';
 import { parseRegistryKey, COLLECTION_PREFIXES, parseCollectionId, sanitizeHandleId } from './collection-ids.js';
 import { createChunkMetaStore } from './chunk-meta-store.js';
+import { chunkHashFromSettingsKey, chunkMetaSettingsKey } from './chunk-meta-keys.js';
 import { log } from './log.js';
 
 // ============================================================================
@@ -339,10 +340,10 @@ export function isCollectionAutoSyncEnabled(collectionId) {
 // The four public functions below stay synchronous so their call sites do not
 // change; reads merge per field (payload, then these settings) and writes to the
 // payload are persisted asynchronously behind them.
+//
+// The key shape itself lives in core/chunk-meta-keys.js so that the Size
+// Inspector can count these entries without importing this host-coupled module.
 // ============================================================================
-
-/** Legacy settings key prefix — this module owns the shape. */
-const LEGACY_CHUNK_META_PREFIX = 'vectfox_chunk_meta_';
 
 /**
  * Per-chunk fields with no backend payload representation. They are persisted to
@@ -350,10 +351,6 @@ const LEGACY_CHUNK_META_PREFIX = 'vectfox_chunk_meta_';
  * owner of the list; ui/chunk-visualizer.js imports it for its save split.
  */
 export const CLIENT_ONLY_CHUNK_FIELDS = ['summaries'];
-
-function chunkMetaSettingsKey(hash) {
-    return `${LEGACY_CHUNK_META_PREFIX}${hash}`;
-}
 
 function readLegacyChunkMetadata(hash) {
     return extension_settings?.vectfox?.[chunkMetaSettingsKey(hash)] || null;
@@ -382,8 +379,9 @@ function listLegacyChunkMetadata() {
         return result;
     }
     for (const key in store) {
-        if (key.startsWith(LEGACY_CHUNK_META_PREFIX)) {
-            result[key.replace(LEGACY_CHUNK_META_PREFIX, '')] = store[key];
+        const hash = chunkHashFromSettingsKey(key);
+        if (hash !== null) {
+            result[hash] = store[key];
         }
     }
     return result;

@@ -1355,6 +1355,78 @@
     overflow: auto;
 }
 
+/* Storage health — the settings-size report shown before any scan. */
+.vectfox-size-health {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--SmartThemeBodyColor) 4%, transparent);
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 60%, transparent);
+}
+
+.vectfox-size-health-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.vectfox-size-health-head h4 {
+    margin: 0;
+    font-size: 14px;
+}
+
+.vectfox-size-health-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px;
+}
+
+.vectfox-size-health-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 160px;
+}
+
+.vectfox-size-health-label {
+    font-size: 12px;
+    opacity: 0.75;
+}
+
+.vectfox-size-health-value {
+    font-size: 20px;
+    font-weight: 600;
+    line-height: 1.2;
+}
+
+.vectfox-size-health-detail {
+    font-size: 12px;
+    opacity: 0.7;
+}
+
+.vectfox-size-health-status {
+    font-size: 13px;
+    opacity: 0.85;
+}
+
+.vectfox-size-health-warning {
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: var(--SmartThemeQuoteColor, #c44);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #c44) 12%, transparent);
+    border-left: 3px solid var(--SmartThemeQuoteColor, #c44);
+}
+
+.vectfox-size-health-empty {
+    font-size: 13px;
+    font-style: italic;
+    opacity: 0.7;
+}
+
 .vectfox-size-toolbar {
     display: flex;
     align-items: center;
