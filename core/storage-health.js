@@ -59,6 +59,20 @@ export function formatCount(value) {
     return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
+/** The noun half of an entry count: "entry" or "entries". */
+function entryNoun(count) {
+    return count === 1 ? 'entry' : 'entries';
+}
+
+/**
+ * Human label for a chunk-metadata entry count: "1 entry", "1,200 entries".
+ * @param {number} count
+ * @returns {string}
+ */
+export function formatEntryCount(count) {
+    return `${count === 1 ? 1 : formatCount(count)} ${entryNoun(count)}`;
+}
+
 /**
  * Everything the UI shows about one measured size: the raw bytes, the short
  * human label, and the exact grouped byte count.
@@ -136,7 +150,7 @@ function warningFor(total, chunkMeta) {
     }
     const chunkLine = chunkMeta.count === 0
         ? 'No chunk-metadata entries in settings.'
-        : `${chunkMeta.countLabel} chunk-metadata ${chunkMeta.count === 1 ? 'entry accounts' : 'entries account'} for ${chunkMeta.sizeLabel}.`;
+        : `${chunkMeta.countLabel} chunk-metadata ${entryNoun(chunkMeta.count)} ${chunkMeta.count === 1 ? 'accounts' : 'account'} for ${chunkMeta.sizeLabel}.`;
     return `Extension settings are ${total.sizeLabel} — past the ${formatSize(WARN_BYTES)} health limit. ${chunkLine}`;
 }
 

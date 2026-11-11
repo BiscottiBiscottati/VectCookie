@@ -83,22 +83,26 @@ import {
   isVectFoxPNG,
 } from "../core/png-export.js";
 import { renderSizeInspectorTab } from "./size-inspector.js";
-import { createStorageDryRun } from "../core/chunk-meta-dry-run.js";
+import { createStorageBackup, createStorageDryRun } from "../core/chunk-meta-dry-run.js";
 import { createPluginChunkTransport } from "../core/chunk-meta-transport.js";
 import {
   CLIENT_ONLY_CHUNK_FIELDS,
   listLegacyChunkMetadata,
 } from "../core/collection-metadata.js";
 
-// The storage dry run, composed with the live services here in the wiring layer
-// so neither the Size Inspector nor the storage-health panel imports the plugin
-// transport. `extension_settings` is read at call time.
-const storageDryRun = createStorageDryRun({
+// The storage dry run and its backup, composed with the live services here in
+// the wiring layer so neither the Size Inspector nor the storage-health panel
+// imports the plugin transport. Both share one dependency set — the same
+// collections, entries and client-only fields — so the backup describes exactly
+// what the dry run reports on. `extension_settings` is read at call time.
+const storageActionDeps = {
   createTransport: ({ getSettings }) => createPluginChunkTransport({ getSettings }),
   listCollections: getRegisteredCollections,
   listEntries: listLegacyChunkMetadata,
   clientOnlyFields: CLIENT_ONLY_CHUNK_FIELDS,
-});
+};
+const storageDryRun = createStorageDryRun(storageActionDeps);
+const storageBackup = createStorageBackup(storageActionDeps);
 
 // Browser state
 // checkPluginAvailable() is imported from ../core/collection-loader.js —
@@ -785,6 +789,10 @@ function switchTab(tabName) {
         // imports the plugin transport, and opening the tab still costs nothing:
         // the scan starts only when the dry-run button is pressed.
         runDryRun: options => storageDryRun({
+          ...options,
+          getSettings: () => extension_settings?.vectfox,
+        }),
+        runBackup: options => storageBackup({
           ...options,
           getSettings: () => extension_settings?.vectfox,
         }),

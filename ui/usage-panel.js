@@ -10,6 +10,7 @@
  */
 
 import StringUtils from '../utils/string-utils.js';
+import { downloadJsonFile } from '../utils/file-download.js';
 import { buildUsageExport, usageExportFileName } from '../core/usage-export.js';
 import {
     createDefaultUsagePrices,
@@ -729,27 +730,6 @@ function renderHelp() {
 
 function defaultConfirm(message) {
     return typeof globalThis.confirm === 'function' ? globalThis.confirm(message) : false;
-}
-
-function downloadJsonFile(filename, content) {
-    if (typeof Blob !== 'function'
-        || typeof globalThis.URL?.createObjectURL !== 'function'
-        || typeof document === 'undefined') {
-        return false;
-    }
-    const blob = new Blob([content], { type: 'application/json' });
-    const url = globalThis.URL.createObjectURL(blob);
-    try {
-        const anchor = document.createElement('a');
-        anchor.href = url;
-        anchor.download = filename;
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
-        return true;
-    } finally {
-        globalThis.URL.revokeObjectURL?.(url);
-    }
 }
 
 function renderRunBar(run) {

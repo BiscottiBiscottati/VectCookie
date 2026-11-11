@@ -38,6 +38,7 @@ import { COLLECTION_PREFIXES, buildRegistryKey, parseCollectionId, normalizeBack
 import { getModelFromSettings } from './providers.js';
 import { encodeSparseVector } from './sparse-vector-encoder.js';
 import { progressTracker } from '../ui/progress-tracker.js';
+import { downloadJsonFile } from '../utils/file-download.js';
 import { getStringHash } from '../../../../utils.js';
 import { log } from './log.js';
 
@@ -413,16 +414,9 @@ export function downloadExport(exportData, filename = null) {
 
     const finalFilename = sanitized + EXPORT_FILE_EXTENSION;
 
-    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = finalFilename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    if (!downloadJsonFile(finalFilename, JSON.stringify(exportData, null, 2))) {
+        throw new Error('This browser cannot save files');
+    }
 
     log.lifecycle(`VectFox Export: Downloaded ${finalFilename}`);
 }

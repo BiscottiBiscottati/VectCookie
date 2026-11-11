@@ -41,6 +41,11 @@ const _cache = {
  * @param {function({ onProgress?: function }): Promise<object>} [deps.runDryRun]
  *     Runs the read-only storage dry run. Injected by the browser wiring so this
  *     module (and the panel it renders) never imports the plugin transport.
+ * @param {function({ onProgress?: function, onEncode?: function }): Promise<object>} [deps.runBackup]
+ *     Runs the same scan and returns the backup file's name and contents, its
+ *     entry-count label, and the report of the scan it used.
+ * @param {(filename: string, text: string) => void} [deps.saveFile]
+ *     Saves the backup; the panel defaults to a Blob download.
  */
 export function renderSizeInspectorTab(container, getSettings = () => null, deps = {}) {
     const $c = window.jQuery ? window.jQuery(container) : null;

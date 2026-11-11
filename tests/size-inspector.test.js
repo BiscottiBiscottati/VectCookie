@@ -371,3 +371,293 @@ describe("Size Inspector — the storage dry run", () => {
         expect(health.querySelector('#vectfox_size_dry_run').disabled).toBe(false);
     });
 });
+
+/** One collection whose payload already holds the entry: a 1-redundant report. */
+const BACKUP_FIXTURE = {
+    entries: { only: { context: 'about dwarves', keywords: ['dwarf'] } },
+    collections: [{ collectionId: 'C' }],
+    chunksByCollection: {
+        C: { only: { context: 'about dwarves', keywords: ['dwarf'] } },
+    },
+};
+
+const BACKUP_FILENAME = 'vectfox-chunk-meta-backup-2026-11-12T09-30-00-000Z.json';
+const BACKUP_TEXT = '{"format":"vectfox-chunk-meta-backup","version":1,"entries":[]}';
+
+/**
+ * The production backup entry point over the fake listing, so the report the
+ * panel shows is the real view model of the scan the file was built from.
+ */
+async function backupResult(overrides = {}) {
+    return {
+        status: 'measured',
+        filename: BACKUP_FILENAME,
+        text: BACKUP_TEXT,
+        entries: { count: 1, label: '1 entry' },
+        view: await makeDryRun(BACKUP_FIXTURE)({}),
+        ...overrides,
+    };
+}
+
+function backupStatusOf(health) {
+    return health.querySelector('#vectfox_size_backup_status').textContent;
+}
+
+describe("Size Inspector — the backup download", () => {
+    it("downloads only on click, never while opening the tab", async () => {
+        const runBackup = vi.fn(async () => backupResult());
+        const saveFile = vi.fn();
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runBackup, saveFile }));
+        const button = health.querySelector('#vectfox_size_backup_download');
+        expect(button).not.toBeNull();
+        expect(button.disabled).toBe(false);
+        expect(runBackup).not.toHaveBeenCalled();
+        expect(saveFile).not.toHaveBeenCalled();
+    });
+
+    it("saves the file the runner built and says how many entries it holds", async () => {
+        const runBackup = vi.fn(async () => backupResult());
+        const saveFile = vi.fn();
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runBackup, saveFile }));
+        health.querySelector('#vectfox_size_backup_download').click();
+        await settle();
+
+        expect(runBackup).toHaveBeenCalledTimes(1);
+        expect(saveFile).toHaveBeenCalledWith(BACKUP_FILENAME, BACKUP_TEXT);
+        expect(backupStatusOf(health)).toContain(`Backup saved: ${BACKUP_FILENAME} (1 entry)`);
+        expect(health.querySelector('#vectfox_size_backup_download').disabled).toBe(false);
+    });
+
+    it("shows the report of the scan the file was built from, replacing a stale dry run", async () => {
+        const runDryRun = vi.fn(makeDryRun(DRY_RUN_FIXTURE));
+        const runBackup = vi.fn(async () => backupResult());
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runDryRun, runBackup, saveFile: vi.fn() }));
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+        const report = health.querySelector('#vectfox_size_dry_run_report');
+        expect(report.querySelector('[data-dry-run="total-orphan"]').textContent).toBe('1');
+
+        health.querySelector('#vectfox_size_backup_download').click();
+        await settle();
+
+        const fresh = health.querySelector('#vectfox_size_dry_run_report');
+        expect(fresh.querySelector('[data-dry-run="headline"]').textContent).toContain('1 entries checked');
+        expect(fresh.querySelector('[data-dry-run="total-redundant"]').textContent).toBe('1');
+        expect(fresh.querySelector('[data-dry-run="total-orphan"]').textContent).toBe('0');
+    });
+
+    it("keeps the backup status when the block is re-measured", async () => {
+        const runBackup = vi.fn(async () => backupResult());
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runBackup, saveFile: vi.fn() }));
+        health.querySelector('#vectfox_size_backup_download').click();
+        await settle();
+        health.querySelector('#vectfox_size_health_refresh').click();
+
+        expect(backupStatusOf(health)).toContain(`Backup saved: ${BACKUP_FILENAME}`);
+    });
+
+    it("shows scan and file-writing progress while the download is built", async () => {
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const runBackup = vi.fn(async ({ onProgress, onEncode } = {}) => {
+            onProgress?.({ done: 1, total: 2 });
+            await gate;
+            onEncode?.({ done: 500, total: 20000 });
+            return backupResult();
+        });
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runBackup, saveFile: vi.fn() }));
+        health.querySelector('#vectfox_size_backup_download').click();
+
+        expect(backupStatusOf(health)).toContain('(1/2)');
+
+        release();
+        await settle();
+
+        expect(backupStatusOf(health)).toContain('Backup saved');
+    });
+
+    it("cannot start a second backup while one is being built, even across a re-render", async () => {
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const runBackup = vi.fn(async () => {
+            await gate;
+            return backupResult();
+        });
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runBackup, saveFile: vi.fn() }));
+        health.querySelector('#vectfox_size_backup_download').click();
+        await settle();
+
+        // Re-measure rebuilds the block mid-download; the fresh button must not
+        // offer a concurrent scan of every collection.
+        health.querySelector('#vectfox_size_health_refresh').click();
+        const fresh = health.querySelector('#vectfox_size_backup_download');
+        expect(fresh.disabled).toBe(true);
+        fresh.click();
+        await settle();
+
+        expect(runBackup).toHaveBeenCalledTimes(1);
+
+        release();
+        await settle();
+
+        expect(backupStatusOf(health)).toContain('Backup saved');
+        expect(health.querySelector('#vectfox_size_backup_download').disabled).toBe(false);
+    });
+
+    it("cannot start a backup while a dry run is scanning", async () => {
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const runDryRun = vi.fn(async () => {
+            await gate;
+            return makeDryRun(DRY_RUN_FIXTURE)({});
+        });
+        const runBackup = vi.fn(async () => backupResult());
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runDryRun, runBackup, saveFile: vi.fn() }));
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+
+        const backupButton = health.querySelector('#vectfox_size_backup_download');
+        expect(backupButton.disabled).toBe(true);
+        backupButton.click();
+        await settle();
+        expect(runBackup).not.toHaveBeenCalled();
+
+        release();
+        await settle();
+
+        expect(runDryRun).toHaveBeenCalledTimes(1);
+        expect(health.querySelector('[data-dry-run="headline"]').textContent).toContain('3 entries checked');
+        expect(backupButton.disabled).toBe(false);
+    });
+
+    it("cannot start a dry run while a backup is scanning", async () => {
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const runBackup = vi.fn(async () => {
+            await gate;
+            return backupResult();
+        });
+        const runDryRun = vi.fn(makeDryRun(DRY_RUN_FIXTURE));
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runDryRun, runBackup, saveFile: vi.fn() }));
+        health.querySelector('#vectfox_size_backup_download').click();
+        await settle();
+
+        const dryRunButton = health.querySelector('#vectfox_size_dry_run');
+        expect(dryRunButton.disabled).toBe(true);
+        dryRunButton.click();
+        await settle();
+        expect(runDryRun).not.toHaveBeenCalled();
+
+        release();
+        await settle();
+
+        expect(backupStatusOf(health)).toContain('Backup saved');
+        expect(dryRunButton.disabled).toBe(false);
+    });
+
+    it("does not call a saved file failed when the runner omits its display label", async () => {
+        const runBackup = vi.fn(async () => ({
+            status: 'measured',
+            filename: BACKUP_FILENAME,
+            text: BACKUP_TEXT,
+        }));
+        const saveFile = vi.fn();
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runBackup, saveFile }));
+        health.querySelector('#vectfox_size_backup_download').click();
+        await settle();
+
+        expect(saveFile).toHaveBeenCalledTimes(1);
+        expect(backupStatusOf(health)).toContain(`Backup saved: ${BACKUP_FILENAME}`);
+        expect(backupStatusOf(health)).not.toContain('failed');
+    });
+
+    it("explains an unavailable backup instead of saving an empty file", async () => {
+        const runBackup = vi.fn(async () => ({
+            status: 'unavailable',
+            reason: 'The Similharity plugin is not available, so there is no chunk payload to compare against.',
+        }));
+        const saveFile = vi.fn();
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runBackup, saveFile }));
+        health.querySelector('#vectfox_size_backup_download').click();
+        await settle();
+
+        expect(saveFile).not.toHaveBeenCalled();
+        expect(backupStatusOf(health)).toContain('Similharity plugin is not available');
+    });
+
+    it("reports a failure and leaves the button usable", async () => {
+        const runBackup = vi.fn(async () => { throw new Error('boom'); });
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runBackup, saveFile: vi.fn() }));
+        const button = health.querySelector('#vectfox_size_backup_download');
+        button.click();
+        await settle();
+
+        expect(backupStatusOf(health)).toContain('Backup failed: boom');
+        expect(button.disabled).toBe(false);
+    });
+
+    it("reports a browser that cannot save instead of claiming the backup exists", async () => {
+        const runBackup = vi.fn(async () => backupResult());
+        const saveFile = vi.fn(() => false);
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runBackup, saveFile }));
+        health.querySelector('#vectfox_size_backup_download').click();
+        await settle();
+
+        expect(backupStatusOf(health)).toContain('Backup failed: this browser cannot save files');
+    });
+
+    it("says the backup is unavailable when no runner is wired", async () => {
+        const health = healthOf(openTab({ chunk_size: 500 }));
+
+        health.querySelector('#vectfox_size_backup_download').click();
+        await settle();
+
+        expect(backupStatusOf(health)).toContain('not available in this build');
+    });
+
+    it("saves through a Blob download when no saveFile is injected", async () => {
+        const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+        const createObjectURL = vi.fn(() => 'blob:backup');
+        const revokeObjectURL = vi.fn();
+        const OriginalURL = globalThis.URL;
+        vi.stubGlobal('URL', class extends OriginalURL {
+            static createObjectURL = createObjectURL;
+            static revokeObjectURL = revokeObjectURL;
+        });
+
+        try {
+            const health = healthOf(openTab({ chunk_size: 500 }, {
+                runBackup: vi.fn(async () => backupResult()),
+            }));
+            health.querySelector('#vectfox_size_backup_download').click();
+            await settle();
+
+            expect(createObjectURL).toHaveBeenCalledTimes(1);
+            expect(clickSpy).toHaveBeenCalledTimes(1);
+            const blob = createObjectURL.mock.calls[0][0];
+            expect(blob.type).toBe('application/json');
+            const written = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsText(blob);
+            });
+            expect(written).toBe(BACKUP_TEXT);
+            expect(backupStatusOf(health)).toContain('Backup saved');
+        } finally {
+            clickSpy.mockRestore();
+        }
+    });
+});
