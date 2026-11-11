@@ -372,7 +372,15 @@ function deleteLegacyChunkMetadata(hash) {
     return true;
 }
 
-function listLegacyChunkMetadata() {
+/**
+ * The legacy settings entries: hash -> metadata, read straight from
+ * extension_settings with no payload overlay. The store uses it for full-map
+ * reads, and the sweep's dry run uses it because it must compare these entries
+ * against what the payload actually holds — merging the mirror in would make
+ * every entry look redundant.
+ * @returns {Object<string, object>} map of hash -> metadata
+ */
+export function listLegacyChunkMetadata() {
     const result = {};
     const store = extension_settings?.vectfox;
     if (!store) {

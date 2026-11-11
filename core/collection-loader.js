@@ -103,6 +103,36 @@ export function getCollectionRegistry() {
 }
 
 /**
+ * Read-only view of every registered collection, with its backend resolved the
+ * same way routing does. Built for callers that must not mutate anything — the
+ * chunk-metadata sweep's dry run (ADR-0003) scans every registered collection
+ * and refuses to delete when one was missed.
+ *
+ * Deliberately not loadAllCollections(): that performs discovery, registers
+ * entries and can save settings, so it would turn a read-only report into a
+ * write. This reads the registry array and nothing else.
+ *
+ * @param {object} [settings] VectFox settings, for the default backend.
+ * @returns {Array<{ registryKey: string, collectionId: string, backend: string }>}
+ */
+export function getRegisteredCollections(settings) {
+    const registry = extension_settings?.vectfox?.vectfox_collection_registry;
+    if (!Array.isArray(registry)) return [];
+
+    const fallbackBackend = getRegistryBackend(settings?.vector_backend);
+    return registry
+        .filter(registryKey => typeof registryKey === 'string' && registryKey)
+        .map(registryKey => {
+            const parsed = parseRegistryKey(registryKey);
+            return {
+                registryKey,
+                collectionId: parsed.collectionId,
+                backend: parsed.backend || fallbackBackend,
+            };
+        });
+}
+
+/**
  * Prune orphaned per-chat EventBase settings (auto-sync marker, last-used window
  * size, vectorization tip) — entries whose chat UUID no longer has an EventBase or
  * archive-event collection in the registry (chat or its collection deleted, possibly

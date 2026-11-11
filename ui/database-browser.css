@@ -1373,6 +1373,28 @@
     gap: 12px;
 }
 
+.vectfox-size-health-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.vectfox-size-health-report {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.vectfox-size-health-headline {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.vectfox-size-dry-run-total td {
+    font-weight: 600;
+    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 60%, transparent);
+}
+
 .vectfox-size-health-head h4 {
     margin: 0;
     font-size: 14px;

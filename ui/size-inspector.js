@@ -37,8 +37,12 @@ const _cache = {
  * @param {jQuery|HTMLElement} container
  * @param {function(): (object|null|undefined)} [getSettings] Returns the
  *     extension settings (`extension_settings.vectfox`).
+ * @param {object} [deps]
+ * @param {function({ onProgress?: function }): Promise<object>} [deps.runDryRun]
+ *     Runs the read-only storage dry run. Injected by the browser wiring so this
+ *     module (and the panel it renders) never imports the plugin transport.
  */
-export function renderSizeInspectorTab(container, getSettings = () => null) {
+export function renderSizeInspectorTab(container, getSettings = () => null, deps = {}) {
     const $c = window.jQuery ? window.jQuery(container) : null;
     if (!$c || !$c.length) return;
 
@@ -112,6 +116,7 @@ export function renderSizeInspectorTab(container, getSettings = () => null) {
     renderStorageHealthPanel(
         root?.querySelector?.("#vectfox_size_health") || null,
         getSettings,
+        deps,
     );
 }
 

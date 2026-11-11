@@ -30,6 +30,8 @@ vi.mock('../core/collection-ids.js', () => ({
 }));
 
 import { renderSizeInspectorTab } from '../ui/size-inspector.js';
+import { runChunkMetaDryRun } from '../core/chunk-meta-sweep-report.js';
+import { createFakeChunkListing } from './fixtures/chunk-listing.js';
 
 /**
  * Just enough jQuery for the render path: mount, template write, event rebind.
@@ -64,11 +66,16 @@ function installJQueryShim() {
     };
 }
 
-function openTab(settings) {
+function openTab(settings, deps = {}) {
     const container = document.createElement("div");
     document.body.appendChild(container);
-    renderSizeInspectorTab(container, () => settings);
+    renderSizeInspectorTab(container, () => settings, deps);
     return container;
+}
+
+/** Lets the click handler's await chain and the re-render settle. */
+function settle() {
+    return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function healthOf(container) {
@@ -237,5 +244,130 @@ describe("Size Inspector — opening the tab costs nothing", () => {
             .toContain("previous scan kept");
         expect(container.querySelectorAll(".vectfox-size-health")).toHaveLength(1);
         expect(container.querySelectorAll("#vectfox_size_health_refresh")).toHaveLength(1);
+    });
+});
+
+/**
+ * Injects the production dry-run entry point over a fake plugin listing, so the
+ * panel is what is under test — not a hand-built report.
+ */
+function makeDryRun({ entries, collections, chunksByCollection, failing = [] }) {
+    const { listChunks } = createFakeChunkListing({ chunksByCollection, failing });
+    return ({ onProgress } = {}) => runChunkMetaDryRun({
+        entries,
+        collections,
+        listChunks,
+        onProgress,
+    }).then(run => run.view);
+}
+
+const DRY_RUN_FIXTURE = {
+    entries: {
+        redundant: { context: 'about dragons', keywords: ['dragon'] },
+        patchMe: { context: 'about elves', keywords: ['elf'] },
+        gone: { context: 'deleted chunk' },
+    },
+    collections: [{ collectionId: 'A' }, { collectionId: 'B' }],
+    chunksByCollection: {
+        A: {
+            redundant: { context: 'about dragons', keywords: ['dragon'] },
+            patchMe: { context: 'about elves' },
+        },
+        B: {
+            redundant: { context: 'about dragons', keywords: ['dragon'] },
+        },
+    },
+};
+
+describe("Size Inspector — the storage dry run", () => {
+    it("runs only on click, never while opening the tab", async () => {
+        const runDryRun = vi.fn(makeDryRun(DRY_RUN_FIXTURE));
+
+        const health = healthOf(openTab({ chunk_size: 500 }, { runDryRun }));
+        await settle();
+
+        expect(runDryRun).not.toHaveBeenCalled();
+        expect(health.querySelector('#vectfox_size_dry_run')).not.toBeNull();
+    });
+
+    it("reports counts per collection and in total", async () => {
+        const runDryRun = vi.fn(makeDryRun(DRY_RUN_FIXTURE));
+        const health = healthOf(openTab({ chunk_size: 500 }, { runDryRun }));
+
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+
+        expect(runDryRun).toHaveBeenCalledTimes(1);
+        const report = health.querySelector('#vectfox_size_dry_run_report');
+        expect(report.querySelector('[data-dry-run="headline"]').textContent)
+            .toContain('3 entries');
+        expect(report.querySelector('[data-dry-run="coverage"]').textContent)
+            .toBe('2 of 2 collections fully read');
+        expect(report.querySelector('[data-dry-run="refusal"]')).toBeNull();
+
+        const rowA = report.querySelector('tbody tr[data-collection="A"]');
+        const rowB = report.querySelector('tbody tr[data-collection="B"]');
+        expect(rowA.querySelector('[data-dry-run="row-redundant"]').textContent).toBe('1');
+        expect(rowA.querySelector('[data-dry-run="row-patch"]').textContent).toBe('1');
+        expect(rowB.querySelector('[data-dry-run="row-redundant"]').textContent).toBe('1');
+        expect(rowB.querySelector('[data-dry-run="row-patch"]').textContent).toBe('0');
+
+        expect(report.querySelector('[data-dry-run="total-redundant"]').textContent).toBe('1');
+        expect(report.querySelector('[data-dry-run="total-patch"]').textContent).toBe('1');
+        expect(report.querySelector('[data-dry-run="total-orphan"]').textContent).toBe('1');
+        expect(report.querySelector('[data-dry-run="total-skipped"]').textContent).toBe('0');
+        expect(report.querySelector('.vectfox-size-dry-run-total').textContent).toContain('Total');
+    });
+
+    it("states plainly that an untrusted scan refuses deletion", async () => {
+        const runDryRun = vi.fn(makeDryRun({ ...DRY_RUN_FIXTURE, failing: ['B'] }));
+        const health = healthOf(openTab({ chunk_size: 500 }, { runDryRun }));
+
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+
+        const report = health.querySelector('#vectfox_size_dry_run_report');
+        const refusal = report.querySelector('[data-dry-run="refusal"]').textContent;
+        expect(refusal).toContain('Deletion is refused');
+        expect(refusal).toContain('1 of 2 collections could not be read');
+        // What the readable collection proved is still shown.
+        expect(report.querySelector('[data-dry-run="total-redundant"]').textContent).toBe('1');
+        expect(report.querySelector('[data-dry-run="total-skipped"]').textContent).toBe('1');
+        expect(report.querySelector('[data-dry-run="skipped-note"]').textContent)
+            .toContain('could not be attributed');
+        expect(report.querySelector('tbody tr[data-collection="B"]').textContent).toContain('failed');
+    });
+
+    it("keeps the report when the block is re-measured", async () => {
+        const runDryRun = vi.fn(makeDryRun(DRY_RUN_FIXTURE));
+        const health = healthOf(openTab({ chunk_size: 500 }, { runDryRun }));
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+
+        health.querySelector('#vectfox_size_health_refresh').click();
+
+        expect(health.querySelector('[data-dry-run="total-orphan"]').textContent).toBe('1');
+    });
+
+    it("says the dry run is unavailable when no runner is wired", async () => {
+        const health = healthOf(openTab({ chunk_size: 500 }));
+
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+
+        expect(health.querySelector('#vectfox_size_dry_run_status').textContent)
+            .toContain('not available in this build');
+    });
+
+    it("reports a runner failure instead of leaving the button dead", async () => {
+        const runDryRun = vi.fn(async () => { throw new Error('boom'); });
+        const health = healthOf(openTab({ chunk_size: 500 }, { runDryRun }));
+
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+
+        expect(health.querySelector('[data-dry-run="unavailable"]').textContent)
+            .toContain('Dry run failed: boom');
+        expect(health.querySelector('#vectfox_size_dry_run').disabled).toBe(false);
     });
 });

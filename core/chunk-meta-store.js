@@ -17,52 +17,21 @@
  */
 
 import { log } from './log.js';
-
-/** Payload keys that are chunk data, not chunk metadata; not copied into the mirror. */
-const PAYLOAD_NON_METADATA_KEYS = new Set(['hash', 'text', 'index', 'vector']);
+import {
+    chunkHashOf,
+    chunkMetadataFromPayload,
+    hasValue,
+    payloadPatch,
+} from './chunk-meta-fields.js';
+import { listAllChunkItems } from './chunk-paging.js';
 
 /** Chunk hash as used by the public functions (numeric or string). */
 function hashKey(hash) {
     return String(hash);
 }
 
-/** Preserve the caller's hash type for the transport, drop payload data keys. */
-function payloadMetadata(rawMetadata) {
-    const metadata = {};
-    for (const [field, value] of Object.entries(rawMetadata || {})) {
-        if (PAYLOAD_NON_METADATA_KEYS.has(field)) continue;
-        metadata[field] = value;
-    }
-    return metadata;
-}
-
-/**
- * The fields of a save that belong in the payload. Returns null when the save
- * carries only client-only bookkeeping (e.g. a summaries edit), so that edit
- * does not produce a pointless payload request.
- */
-function payloadPatch(metadata, clientOnlyFields) {
-    const patch = payloadMetadata(metadata);
-    for (const field of clientOnlyFields) delete patch[field];
-    const persistable = Object.keys(patch).some((field) => field !== 'updatedAt');
-    return persistable ? patch : null;
-}
-
 function queueKey(collectionId, hash) {
     return `${collectionId}\u0000${hash}`;
-}
-
-/**
- * "Holds a value" for merge purposes. Empty strings, empty arrays and empty
- * objects are absences, not values — matching the read-source contract the
- * visualizer already applies (an explicitly blanked field falls back). `false`
- * and `0` are values.
- */
-function hasValue(value) {
-    if (value === undefined || value === null || value === '') return false;
-    if (Array.isArray(value)) return value.length > 0;
-    if (typeof value === 'object') return Object.keys(value).length > 0;
-    return true;
 }
 
 /**
@@ -160,30 +129,14 @@ export function createChunkMetaStore({
         return mergeChunkMetadata(findPayload(hash), readLegacy(hash));
     }
 
-    async function fetchCollection(collectionId) {
-        const items = [];
-        const seen = new Set();
-        let offset = 0;
-        for (;;) {
-            const page = await transport.listChunks(collectionId, { offset, limit: pageSize });
-            const pageItems = Array.isArray(page?.items) ? page.items : [];
-            let added = 0;
-            for (const item of pageItems) {
-                const hash = item?.hash ?? item?.metadata?.hash;
-                if (hash === undefined || hash === null) continue;
-                const key = hashKey(hash);
-                if (seen.has(key)) continue;
-                seen.add(key);
-                items.push(item);
-                added += 1;
-            }
-            // Stop on a short/empty page, and also when a page adds nothing new:
-            // the native standard-backend fallback ignores offset and returns the
-            // whole hash list every time, which would otherwise loop forever.
-            if (pageItems.length < pageSize || added === 0) break;
-            offset += pageItems.length;
-        }
-        return items;
+    function fetchCollection(collectionId) {
+        // The paging termination rules live in core/chunk-paging.js: the sweep
+        // scan reads whole collections the same way, and they must not drift.
+        return listAllChunkItems(
+            (id, options) => transport.listChunks(id, options),
+            collectionId,
+            { pageSize },
+        );
     }
 
     /** Drops the write guards for one collection once its snapshot is applied. */
@@ -209,7 +162,14 @@ export function createChunkMetaStore({
         let trusted = false;
         const job = (async () => {
             try {
-                const items = await fetchCollection(id);
+                const { items, complete } = await fetchCollection(id);
+                if (!complete) {
+                    // A partial listing tells us nothing about the chunks it did
+                    // not return. Keep the settings fallback (do not mark the
+                    // collection hydrated) so a read never goes payload-blind.
+                    log.warn(`VectFox: chunk metadata listing for ${id} ended before every chunk was read — keeping the settings fallback`);
+                    return false;
+                }
                 const byHash = new Map();
                 const existing = mirror.get(id);
                 if (existing) {
@@ -220,11 +180,10 @@ export function createChunkMetaStore({
                 }
                 let withMetadata = 0;
                 for (const item of items) {
-                    const hash = item?.hash ?? item?.metadata?.hash;
-                    if (hash === undefined || hash === null) continue;
-                    const key = hashKey(hash);
+                    const key = chunkHashOf(item);
+                    if (key === null) continue;
                     if (locallyWritten.has(queueKey(id, key))) continue;
-                    const metadata = payloadMetadata(item?.metadata);
+                    const metadata = chunkMetadataFromPayload(item?.metadata);
                     // A payload with no metadata of its own is not an entry; reads
                     // keep falling back to settings for that chunk.
                     if (Object.keys(metadata).length === 0) continue;

@@ -23,6 +23,7 @@
  */
 
 import { isChunkMetaSettingsKey } from './chunk-meta-keys.js';
+import { VIEW_STATUS } from './view-status.js';
 
 /** Sane upper bound for the extension settings blob — the post-sweep target. */
 const WARN_BYTES = 2 * 1024 * 1024;
@@ -54,7 +55,7 @@ function formatSize(bytes) {
 }
 
 /** Thousands-grouped number for labels: 17104 -> "17,104". */
-function formatCount(value) {
+export function formatCount(value) {
     return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
@@ -141,7 +142,7 @@ function warningFor(total, chunkMeta) {
 
 function unavailableView(reason) {
     return {
-        status: 'unavailable',
+        status: VIEW_STATUS.UNAVAILABLE,
         reason,
         total: sizeInfo(0),
         chunkMeta: measureChunkMeta({}),
@@ -175,7 +176,7 @@ export function buildStorageHealth(settings) {
     const chunkMeta = measureChunkMeta(settings);
 
     return {
-        status: 'measured',
+        status: VIEW_STATUS.MEASURED,
         total,
         chunkMeta,
         topKeys: measureTopKeys(settings),
