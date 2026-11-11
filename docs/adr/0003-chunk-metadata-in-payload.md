@@ -57,6 +57,17 @@ Relevant properties of the storage that shaped this decision:
    on explicit confirmation.
 7. **Hydration is lazy**, per collection, so the fix cannot reintroduce a startup
    stall through a different endpoint.
+8. **A hash-only caller resolves the collection through one "current collection"
+   pointer.** The four public functions keep their hash-only signatures, so the
+   store — not the caller — decides which collection a read or write belongs to.
+   Opening a collection in the metadata UI makes it current and starts its
+   hydration; bulk paths (import, keyword persistence) clear it. Reads and writes
+   are scoped to the current collection, and with none current they fall back to
+   the legacy settings entry instead of searching other collections' mirrors.
+   Retrieval deliberately does not make a collection current: its query results
+   already carry payload metadata, and a listing there would move the startup
+   stall to the first generation. A caller that spans collections (retrieval,
+   export) must use an explicit collection-scoped read when it needs the payload.
 
 ## Considered Options
 
@@ -91,3 +102,7 @@ Relevant properties of the storage that shaped this decision:
 - **The mirror is a read cache, not a second store**: any disagreement resolves
   payload-first per field, settings filling gaps, until the sweep removes the
   settings side.
+- **Hash-only reads outside a current collection see only settings.** That is the
+  deliberate cost of keeping the public functions synchronous and unchanged: the
+  retrieval and export fallbacks do not borrow an open collection's payload
+  entry, and they gain an explicit collection-scoped read in a later change.
