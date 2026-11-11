@@ -15,6 +15,8 @@ import {
     getChunkMetadata,
     saveChunkMetadata,
     deleteChunkMetadata,
+    useChunkMetaCollection,
+    CLIENT_ONLY_CHUNK_FIELDS,
 } from '../core/collection-metadata.js';
 import {
     deleteVectorItems,
@@ -88,10 +90,10 @@ function isEventBaseCollection() {
 // ============================================================================
 
 // Phase B (read-source refactor): the vector backend payload is the source of truth for
-// per-chunk fields. These are the ONLY fields still persisted to extension_settings on save
-// — genuinely client-only state with no backend payload representation. Everything else goes
-// to the backend via updateChunkMetadata. See plans/chunk-metadata-read-source-fix.md.
-const CLIENT_ONLY_CHUNK_FIELDS = ['summaries'];
+// per-chunk fields. The CLIENT_ONLY_CHUNK_FIELDS list lives in core/collection-metadata.js
+// (single owner of the persisted shape); these are the ONLY fields persisted to
+// extension_settings on save. Everything else goes to the backend via updateChunkMetadata.
+// See plans/chunk-metadata-read-source-fix.md.
 
 /**
  * Normalize keywords to the new format: { text: string, weight: number }
@@ -184,6 +186,9 @@ async function saveAllChanges() {
     }
 
     try {
+        // Re-assert this collection: a background vectorization or retrieval may
+        // have made another collection active since the visualizer opened.
+        void useChunkMetaCollection(currentCollectionId);
         for (const [hash, updates] of pendingChanges) {
             // Check what kind of update is needed
             if (updates.text) {
@@ -288,6 +293,10 @@ export function openVisualizer(results, collectionId, settings, onReload = null)
     currentResults = results;
     currentCollectionId = collectionId;
     currentSettings = settings;
+    // This collection is now in use: the chunk-metadata store hydrates its
+    // payload mirror lazily from here (never during startup). Fire-and-forget —
+    // the render below already carries each chunk's payload metadata.
+    void useChunkMetaCollection(collectionId);
     onReloadCallback = onReload;
     selectedChunkId = null;
     displayLimit = 50;
@@ -382,6 +391,9 @@ export function closeVisualizer() {
     currentResults = null;
     currentCollectionId = null;
     selectedChunkId = null;
+    // No collection is in use: later saves without a collection must not land in
+    // the one that was just closed.
+    void useChunkMetaCollection(null);
 }
 
 // ============================================================================

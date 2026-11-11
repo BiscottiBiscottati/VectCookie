@@ -12,6 +12,7 @@
 import { extension_settings, getContext } from '../../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../../script.js';
 import { parseRegistryKey, COLLECTION_PREFIXES, parseCollectionId, sanitizeHandleId } from './collection-ids.js';
+import { createChunkMetaStore } from './chunk-meta-store.js';
 import { log } from './log.js';
 
 // ============================================================================
@@ -331,77 +332,145 @@ export function isCollectionAutoSyncEnabled(collectionId) {
 // - parentHash: string      - Parent chunk for summaries
 // - context: string         - Prompt context text (supports {{user}}/{{char}})
 // - xmlTag: string          - XML tag to wrap this chunk
+//
+// Storage is delegated to core/chunk-meta-store.js (ADR-0003): the chunk payload
+// is the source of truth when the Similharity plugin is present, and this
+// settings namespace is the legacy store and the only store without the plugin.
+// The four public functions below stay synchronous so their call sites do not
+// change; reads merge per field (payload, then these settings) and writes to the
+// payload are persisted asynchronously behind them.
 // ============================================================================
 
+/** Legacy settings key prefix — this module owns the shape. */
+const LEGACY_CHUNK_META_PREFIX = 'vectfox_chunk_meta_';
+
 /**
- * Gets metadata for a specific chunk
+ * Per-chunk fields with no backend payload representation. They are persisted to
+ * extension_settings only, never merged into a payload write. This is the single
+ * owner of the list; ui/chunk-visualizer.js imports it for its save split.
+ */
+export const CLIENT_ONLY_CHUNK_FIELDS = ['summaries'];
+
+function chunkMetaSettingsKey(hash) {
+    return `${LEGACY_CHUNK_META_PREFIX}${hash}`;
+}
+
+function readLegacyChunkMetadata(hash) {
+    return extension_settings?.vectfox?.[chunkMetaSettingsKey(hash)] || null;
+}
+
+function writeLegacyChunkMetadata(hash, metadata) {
+    if (!extension_settings.vectfox) {
+        extension_settings.vectfox = {};
+    }
+    extension_settings.vectfox[chunkMetaSettingsKey(hash)] = metadata;
+}
+
+function deleteLegacyChunkMetadata(hash) {
+    const key = chunkMetaSettingsKey(hash);
+    if (!extension_settings?.vectfox?.[key]) {
+        return false;
+    }
+    delete extension_settings.vectfox[key];
+    return true;
+}
+
+function listLegacyChunkMetadata() {
+    const result = {};
+    const store = extension_settings?.vectfox;
+    if (!store) {
+        return result;
+    }
+    for (const key in store) {
+        if (key.startsWith(LEGACY_CHUNK_META_PREFIX)) {
+            result[key.replace(LEGACY_CHUNK_META_PREFIX, '')] = store[key];
+        }
+    }
+    return result;
+}
+
+const chunkMetaStore = createChunkMetaStore({
+    getSettings: () => extension_settings?.vectfox || null,
+    readLegacy: readLegacyChunkMetadata,
+    writeLegacy: writeLegacyChunkMetadata,
+    deleteLegacy: deleteLegacyChunkMetadata,
+    listLegacy: listLegacyChunkMetadata,
+    persistSettings: () => saveSettingsDebounced(),
+    clientOnlyFields: CLIENT_ONLY_CHUNK_FIELDS,
+});
+
+/**
+ * Gets metadata for a specific chunk. The payload value wins per field; the
+ * legacy settings entry fills fields the payload lacks.
  * @param {string} hash Chunk hash
- * @returns {object|null} Chunk metadata or null if not found
+ * @returns {object|null} Chunk metadata or null if neither store has it
  */
 export function getChunkMetadata(hash) {
-    if (!extension_settings.vectfox) {
-        return null;
-    }
-
-    const key = `vectfox_chunk_meta_${hash}`;
-    return extension_settings.vectfox[key] || null;
+    return chunkMetaStore.getMetadata(hash);
 }
 
 /**
- * Saves metadata for a specific chunk
+ * Saves metadata for a specific chunk. On the payload path this updates the
+ * in-memory mirror synchronously and persists asynchronously (coalesced per
+ * hash); the settings copy is kept while the shadow setting is on. Without the
+ * plugin it writes the settings entry exactly as before.
  * @param {string} hash Chunk hash
  * @param {object} metadata Chunk metadata
  */
 export function saveChunkMetadata(hash, metadata) {
-    if (!extension_settings.vectfox) {
-        extension_settings.vectfox = {};
-    }
-
-    const key = `vectfox_chunk_meta_${hash}`;
-    extension_settings.vectfox[key] = {
-        ...metadata,
-        updatedAt: Date.now(),
-    };
-
-    saveSettingsDebounced();
+    chunkMetaStore.saveMetadata(hash, metadata);
 }
 
 /**
- * Deletes metadata for a specific chunk
+ * Deletes metadata for a specific chunk from the mirror and from settings.
  * @param {string} hash Chunk hash
  */
 export function deleteChunkMetadata(hash) {
-    if (!extension_settings.vectfox) {
-        return;
-    }
-
-    const key = `vectfox_chunk_meta_${hash}`;
-    if (extension_settings.vectfox[key]) {
-        delete extension_settings.vectfox[key];
-        saveSettingsDebounced();
-    }
+    chunkMetaStore.deleteMetadata(hash);
 }
 
 /**
- * Gets all chunk metadata entries
+ * Gets all chunk metadata entries: the legacy settings map overlaid with the
+ * payload mirror of the collection currently in use (if any).
  * @returns {object} Map of hash -> metadata
  */
 export function getAllChunkMetadata() {
-    if (!extension_settings.vectfox) {
-        return {};
-    }
+    return chunkMetaStore.getAllMetadata();
+}
 
-    const result = {};
-    const prefix = 'vectfox_chunk_meta_';
+/**
+ * Injects the plugin transport (core/chunk-meta-transport.js). Until this is
+ * called, the `auto` policy resolves to settings, so installs without the plugin
+ * keep their previous behaviour.
+ * @param {{ transport: object }} [options]
+ */
+export function configureChunkMetaStore({ transport } = {}) {
+    chunkMetaStore.configure({ transport });
+}
 
-    for (const key in extension_settings.vectfox) {
-        if (key.startsWith(prefix)) {
-            const hash = key.replace(prefix, '');
-            result[hash] = extension_settings.vectfox[key];
-        }
-    }
+/**
+ * Drops the payload mirror, hydration state and pending writes. Policy and
+ * settings wiring survive. Used by tests and collection-scoped cleanup.
+ */
+export function resetChunkMetaStore() {
+    chunkMetaStore.reset();
+}
 
-    return result;
+/**
+ * Marks a collection as in use and starts hydrating its chunk payload metadata.
+ * This is the lazy-hydration entry point — call it when a collection is opened
+ * or queried, never during startup. Passing null clears the active collection.
+ * Synchronous callers may ignore the returned promise.
+ * @param {string|null} collectionId
+ * @returns {Promise<boolean>} true when the collection's mirror is hydrated
+ */
+export function useChunkMetaCollection(collectionId) {
+    return chunkMetaStore.useCollection(collectionId);
+}
+
+/** Persists pending payload writes now (page unload, explicit flush). */
+export function flushChunkMetaWrites() {
+    return chunkMetaStore.flush();
 }
 
 // ============================================================================

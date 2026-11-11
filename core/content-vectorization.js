@@ -14,7 +14,7 @@ import { getContentType, getContentTypeDefaults, hasFeature } from './content-ty
 import { chunkText } from './chunking.js';
 import { insertVectorItems, purgeVectorIndex, getSavedHashes } from './core-vector-api.js';
 import { isConnectionError } from './model-config-notifier.js';
-import { setCollectionMeta, setCollectionLock, setCollectionCharacterLock, saveChunkMetadata } from './collection-metadata.js';
+import { setCollectionMeta, setCollectionLock, setCollectionCharacterLock, saveChunkMetadata, useChunkMetaCollection } from './collection-metadata.js';
 import { registerCollection } from './collection-loader.js';
 import { getBackend } from '../backends/backend-manager.js';
 // Import from collection-ids.js - single source of truth for collection ID operations
@@ -347,10 +347,13 @@ export async function vectorizeContent({ contentType, source, settings, abortSig
                 throw error;
             }
 
-            // Persist chunk keywords to extension_settings so no-plugin users get
-            // keyword boosting. Native ST /api/vector/insert only stores
-            // {hash, text, index} — keywords live nowhere else without the plugin.
-            // saveSettingsDebounced batches all writes into one disk flush.
+            // Persist chunk keywords so no-plugin users get keyword boosting.
+            // Native ST /api/vector/insert only stores {hash, text, index} —
+            // keywords live nowhere else without the plugin. Clear the active
+            // collection first: this bulk save is not a collection edit, and the
+            // plugin path already wrote these keywords into the chunk payloads at
+            // insert time. saveSettingsDebounced batches the writes into one flush.
+            void useChunkMetaCollection(null);
             for (const chunk of finalChunks) {
                 if (chunk.keywords?.length > 0) {
                     saveChunkMetadata(String(chunk.hash), { keywords: chunk.keywords });

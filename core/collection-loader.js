@@ -597,6 +597,19 @@ export async function checkPluginAvailable() {
 }
 
 /**
+ * Synchronous view of the last settled plugin probe.
+ *
+ * Returns false until checkPluginAvailable() has settled. Callers that must
+ * decide synchronously — the chunk-metadata store's `auto` policy — therefore
+ * default to the settings path rather than guessing that a plugin exists.
+ *
+ * @returns {boolean}
+ */
+export function isPluginAvailableCached() {
+    return pluginAvailable === true;
+}
+
+/**
  * Clears the session-cached plugin-availability result so the next
  * checkPluginAvailable() call re-probes /health. Used by test isolation and
  * any flow that needs to force a fresh detection (e.g. after the user is told

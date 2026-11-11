@@ -28,7 +28,8 @@ import { debounce_timeout } from '../../../constants.js';
 // VectFox modules - Core
 import { synchronizeChat, rearrangeChat } from './core/chat-vectorization.js';
 import { purgeAllVectorIndexes, purgeVectorIndex } from './core/core-vector-api.js';
-import { migrateOldEnabledKeys } from './core/collection-metadata.js';
+import { migrateOldEnabledKeys, configureChunkMetaStore, flushChunkMetaWrites } from './core/collection-metadata.js';
+import { createPluginChunkTransport } from './core/chunk-meta-transport.js';
 import { clearCollectionRegistry, cleanupCorruptedCollections } from './core/collection-loader.js';
 import { migrateLegacyApiKeys } from './core/api-keys.js';
 import { migration_setting_name_for_connection } from './Migration/mg_setting_name_for_connection.js';
@@ -72,6 +73,14 @@ const defaultSettings = {
     // Core vector settings
     embedding_provider: 'transformers', // embedding provider selection (was `source` pre-Phase-B)
     vector_backend: 'qdrant', // Backend: 'standard' (ST Vectra) | 'qdrant'
+    // Chunk metadata storage (ADR-0003): 'auto' | 'payload' | 'settings'.
+    // 'auto' = chunk payload when the Similharity plugin is reachable, the legacy
+    // settings namespace otherwise. Flipping this to 'settings' is the rollback.
+    chunk_meta_store: 'auto',
+    // Shadow dual-write: while true, payload-path writes also update the legacy
+    // settings copy. Default true for the rehearsal release; the sweep (a later
+    // ticket) removes the settings copies and a later release turns this off.
+    chunk_meta_shadow: true,
     qdrant_host: '127.0.0.1',
     qdrant_port: 6333,
     qdrant_url: '',
@@ -858,6 +867,18 @@ jQuery(async () => {
 
     // Initialize world info integration hooks
     initializeWorldInfoIntegration();
+
+    // Chunk metadata storage (ADR-0003): the store resolves `auto` against the
+    // plugin probe; injecting the transport here keeps the backend/plugin
+    // dependency in the wiring layer. Nothing hydrates yet — collections do that
+    // on first use, so startup pays no extra request.
+    configureChunkMetaStore({
+        transport: createPluginChunkTransport({ getSettings: () => settings }),
+    });
+    if (typeof window !== 'undefined') {
+        // A debounced payload write must not be lost when the page goes away.
+        window.addEventListener('pagehide', () => { void flushChunkMetaWrites(); });
+    }
 
     // Off-box startup work (discovery, EventBase index backfill, plugin version check).
     // Master switch OFF → skip it entirely; the switch re-runs this when turned back ON,

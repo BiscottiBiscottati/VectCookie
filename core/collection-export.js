@@ -26,6 +26,7 @@ import {
     getChunkMetadata,
     saveChunkMetadata,
     getAllChunkMetadata,
+    useChunkMetaCollection,
     clearCollectionLock,
     getEffectiveScope,
 } from './collection-metadata.js';
@@ -858,7 +859,10 @@ export async function importCollection(exportData, settings, options = {}) {
 
         setCollectionMeta(registryKey, importedMeta);
 
-        // Per-chunk metadata
+        // Per-chunk metadata. Clear the active collection first: an import is a
+        // bulk write, not a collection edit, so it keeps today's settings path
+        // until the import/export parity ticket routes it explicitly.
+        void useChunkMetaCollection(null);
         for (const chunk of validChunks) {
             if (chunk.chunkMeta) {
                 const newHash = getStringHash(chunk.text);
@@ -1092,6 +1096,9 @@ async function importCollectionSilent(exportData, settings, options = {}) {
 
     setCollectionMeta(registryKey, importedMeta);
 
+    // Same rule as the single-collection import above: a bulk metadata write is
+    // not a collection edit, so it targets the legacy settings path for now.
+    void useChunkMetaCollection(null);
     for (const chunk of validChunks) {
         if (chunk.chunkMeta) {
             const newHash = getStringHash(chunk.text);
