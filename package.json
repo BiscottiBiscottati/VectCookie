@@ -4,7 +4,7 @@
   "description": "Automated tests for VectFox RAG extension",
   "type": "module",
   "scripts": {
-    "check": "npm run check:syntax && npm run check:docs && vitest run",
+    "check": "npm run check:syntax && npm run check:docs && npm run check:patterns && vitest run",
     "check:syntax": "node scripts/check-syntax.mjs",
     "hooks:install": "node scripts/install-git-hooks.mjs",
     "test": "vitest run",
@@ -14,7 +14,8 @@
     "test:e2e": "node scripts/run-e2e-logged.mjs",
     "test:e2e:no-log": "playwright test",
     "test:e2e:report": "playwright show-report",
-    "check:docs": "node scripts/check-docs.mjs"
+    "check:docs": "node scripts/check-docs.mjs",
+    "check:patterns": "node scripts/check-patterns.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
