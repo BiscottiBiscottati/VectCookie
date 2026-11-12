@@ -44,6 +44,9 @@ const _cache = {
  * @param {function({ onProgress?: function, onEncode?: function }): Promise<object>} [deps.runBackup]
  *     Runs the same scan and returns the backup file's name and contents, its
  *     entry-count label, and the report of the scan it used.
+ * @param {function({ onProgress?: function }): Promise<object>} [deps.runSweep]
+ *     Runs the explicit sweep and returns its result. The only mutating runner;
+ *     it deletes legacy settings copies after the payload write succeeds.
  * @param {(filename: string, text: string) => void} [deps.saveFile]
  *     Saves the backup; the panel defaults to a Blob download.
  */

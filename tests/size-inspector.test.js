@@ -31,6 +31,8 @@ vi.mock('../core/collection-ids.js', () => ({
 
 import { renderSizeInspectorTab } from '../ui/size-inspector.js';
 import { runChunkMetaDryRun } from '../core/chunk-meta-sweep-report.js';
+import { createStorageSweep } from '../core/chunk-meta-storage-actions.js';
+import { getSweepStamp, setSweepStamp } from '../core/chunk-meta-sweep-execute.js';
 import { createFakeChunkListing } from './fixtures/chunk-listing.js';
 
 /**
@@ -659,5 +661,248 @@ describe("Size Inspector — the backup download", () => {
         } finally {
             clickSpy.mockRestore();
         }
+    });
+});
+
+
+/**
+ * The production sweep entry point over a fake plugin listing and a settings
+ * object that really loses its legacy keys, so a panel test sees the size drop
+ * the action exists to produce — not a hand-built view model.
+ */
+function makeSweep(isPatchable) {
+    return (settings) => {
+        const { listChunks, patchMetadata } = createFakeChunkListing({
+            chunksByCollection: {
+                'qdrant:A': isPatchable
+                    ? { alpha: { context: 'about dragons', keywords: ['dragon'] }, beta: { context: 'about elves' } }
+                    : { alpha: { context: 'about dragons', keywords: ['dragon'] } },
+            },
+            reportTotal: true,
+        });
+        const run = createStorageSweep({
+            createTransport: () => ({ isAvailable: () => true, listChunks, patchMetadata }),
+            listCollections: () => [{ registryKey: 'qdrant:A', collectionId: 'A' }],
+            listEntries: () => Object.fromEntries(
+                Object.entries(settings)
+                    .filter(([key]) => key.startsWith('vectfox_chunk_meta_'))
+                    .map(([key, metadata]) => [key.slice('vectfox_chunk_meta_'.length), metadata]),
+            ),
+            clientOnlyFields: ['summaries'],
+            deleteEntry: (hash) => {
+                delete settings[`vectfox_chunk_meta_${hash}`];
+                return true;
+            },
+            readStamp: () => getSweepStamp(settings),
+            writeStamp: stamp => setSweepStamp(settings, stamp),
+            persistSettings: vi.fn(),
+            batchSize: 2,
+        });
+        return ({ onProgress } = {}) => run({ getSettings: () => settings, onProgress });
+    };
+}
+
+/** Settings with one redundant entry, one patchable entry and one orphan. */
+function sweepSettings() {
+    return {
+        chunk_size: 500,
+        "vectfox_chunk_meta_alpha": { context: "about dragons", keywords: ["dragon"] },
+        "vectfox_chunk_meta_beta": { context: "about elves", keywords: ["elf"] },
+        "vectfox_chunk_meta_gone": { context: "about nothing" },
+    };
+}
+
+function sweepStatusOf(health) {
+    return health.querySelector('#vectfox_size_sweep_status').textContent;
+}
+
+describe("Size Inspector — the sweep action", () => {
+    it("offers the button but runs nothing until it is clicked", async () => {
+        const settings = sweepSettings();
+        const runSweep = vi.fn(makeSweep(true)(settings));
+
+        const health = healthOf(openTab(settings, { runSweep }));
+        await settle();
+
+        const button = health.querySelector('#vectfox_size_run_sweep');
+        expect(button).not.toBeNull();
+        expect(button.disabled).toBe(false);
+        expect(runSweep).not.toHaveBeenCalled();
+    });
+
+    it("patches, removes the redundant settings copies and re-measures smaller", async () => {
+        const settings = sweepSettings();
+        const runSweep = vi.fn(makeSweep(true)(settings));
+        const health = healthOf(openTab(settings, { runSweep }));
+
+        health.querySelector('#vectfox_size_run_sweep').click();
+        await settle();
+
+        expect(runSweep).toHaveBeenCalledTimes(1);
+        expect(settings["vectfox_chunk_meta_alpha"]).toBeUndefined();
+        expect(settings["vectfox_chunk_meta_beta"]).toBeUndefined();
+        // The orphan is not the sweep's business; ticket 06 deletes those.
+        expect(settings["vectfox_chunk_meta_gone"]).toBeDefined();
+
+        const result = health.querySelector('#vectfox_size_sweep_result');
+        expect(result.querySelector('[data-sweep="headline"]').textContent)
+            .toBe('Sweep complete — 1 entry patched, 2 settings entries removed.');
+        expect(result.querySelector('[data-sweep="patched"]').textContent).toBe('1');
+        expect(result.querySelector('[data-sweep="deleted"]').textContent).toBe('2');
+
+        // The block re-measured itself, so the smaller payload is visible.
+        expect(health.querySelector('[data-health="chunk-meta"]').textContent)
+            .toContain('1 entry');
+        expect(sweepStatusOf(health)).toContain('Sweep complete');
+    });
+
+    it("shows the stamp the run left, so a migrated install is recognisable", async () => {
+        const settings = sweepSettings();
+        const runSweep = vi.fn(makeSweep(true)(settings));
+        const health = healthOf(openTab(settings, { runSweep }));
+        expect(health.querySelector('[data-sweep="stamp"]').textContent).toBe('');
+
+        health.querySelector('#vectfox_size_run_sweep').click();
+        await settle();
+
+        const stamp = health.querySelector('[data-sweep="stamp"]').textContent;
+        expect(stamp).toContain('Last sweep complete');
+        expect(stamp).toContain('payload mode');
+        expect(stamp).toContain('1 entry patched');
+        expect(stamp).toContain('2 settings entries removed');
+        // Re-measuring keeps it: it lives in settings, not in the render.
+        health.querySelector('#vectfox_size_health_refresh').click();
+        expect(health.querySelector('[data-sweep="stamp"]').textContent).toContain('payload mode');
+    });
+
+    it("drops the stale dry-run report the sweep just invalidated", async () => {
+        const settings = sweepSettings();
+        const runSweep = vi.fn(makeSweep(true)(settings));
+        const runDryRun = vi.fn(makeDryRun({
+            entries: {
+                alpha: { context: 'about dragons', keywords: ['dragon'] },
+                beta: { context: 'about elves', keywords: ['elf'] },
+                gone: { context: 'about nothing' },
+            },
+            collections: [{ collectionId: 'A' }],
+            chunksByCollection: {
+                A: {
+                    alpha: { context: 'about dragons', keywords: ['dragon'] },
+                    beta: { context: 'about elves' },
+                },
+            },
+        }));
+        const health = healthOf(openTab(settings, { runSweep, runDryRun }));
+
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+        expect(health.querySelector('[data-dry-run="headline"]').textContent).toContain('1 redundant');
+
+        health.querySelector('#vectfox_size_run_sweep').click();
+        await settle();
+
+        // The pre-sweep counts are gone; the run's own result is what stands.
+        expect(health.querySelector('[data-dry-run="headline"]')).toBeNull();
+        expect(health.querySelector('[data-sweep="headline"]').textContent).toContain('Sweep complete');
+    });
+
+    it("shows a save failure beside the counts instead of calling the run a failure", async () => {
+        const runSweep = vi.fn(async () => ({
+            status: 'measured',
+            outcome: 'complete',
+            headline: 'Sweep complete — 1 entry patched, 0 settings entries removed.',
+            failure: null,
+            refusal: null,
+            resumedNote: null,
+            saveWarning: 'The run finished, but the settings could not be saved: disk full. '
+                + 'The deletions and the stamp are in memory only until a settings save succeeds.',
+            counts: {
+                entries: { count: 1, label: '1' },
+                patched: { count: 1, label: '1' },
+                deleted: { count: 0, label: '0' },
+            },
+            stampNote: '',
+        }));
+        const health = healthOf(openTab(sweepSettings(), { runSweep }));
+
+        health.querySelector('#vectfox_size_run_sweep').click();
+        await settle();
+
+        expect(sweepStatusOf(health)).toContain('Sweep complete');
+        expect(health.querySelector('[data-sweep="save-warning"]').textContent)
+            .toContain('could not be saved');
+        expect(health.querySelector('[data-sweep="failure"]')).toBeNull();
+    });
+
+    it("reports an unavailable sweep instead of pretending it ran", async () => {
+        const runSweep = vi.fn(async () => ({
+            status: 'unavailable',
+            reason: 'The Similharity plugin is not available, so there is no chunk payload to compare against.',
+        }));
+        const health = healthOf(openTab(sweepSettings(), { runSweep }));
+
+        health.querySelector('#vectfox_size_run_sweep').click();
+        await settle();
+
+        expect(sweepStatusOf(health)).toContain('Similharity plugin is not available');
+        expect(health.querySelector('[data-sweep="headline"]')).toBeNull();
+        expect(health.querySelector('#vectfox_size_run_sweep').disabled).toBe(false);
+    });
+
+    it("says the sweep is unavailable when no runner is wired", async () => {
+        const health = healthOf(openTab(sweepSettings()));
+
+        health.querySelector('#vectfox_size_run_sweep').click();
+        await settle();
+
+        expect(sweepStatusOf(health)).toContain('not available in this build');
+    });
+
+    it("reports a runner failure and leaves the button usable", async () => {
+        const runSweep = vi.fn(async () => { throw new Error('backend went away'); });
+        const health = healthOf(openTab(sweepSettings(), { runSweep }));
+
+        health.querySelector('#vectfox_size_run_sweep').click();
+        await settle();
+
+        expect(sweepStatusOf(health)).toContain('Sweep failed: backend went away');
+        expect(health.querySelector('#vectfox_size_run_sweep').disabled).toBe(false);
+    });
+
+    it("refuses to start a second action while one is in flight", async () => {
+        let release;
+        const runSweep = vi.fn(() => new Promise((resolve) => { release = resolve; }));
+        const runDryRun = vi.fn(makeSweep(true)(sweepSettings()));
+        const health = healthOf(openTab(sweepSettings(), { runSweep, runDryRun }));
+        const sweepButton = health.querySelector('#vectfox_size_run_sweep');
+
+        sweepButton.click();
+        await settle();
+
+        expect(sweepButton.disabled).toBe(true);
+        expect(health.querySelector('#vectfox_size_dry_run').disabled).toBe(true);
+        expect(health.querySelector('#vectfox_size_backup_download').disabled).toBe(true);
+
+        // A second click while busy is ignored rather than starting another scan.
+        sweepButton.click();
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+        expect(runSweep).toHaveBeenCalledTimes(1);
+        expect(runDryRun).not.toHaveBeenCalled();
+
+        release({
+            status: 'measured',
+            outcome: 'noop',
+            headline: 'Nothing to sweep — every chunk-metadata entry is already migrated.',
+            failure: null,
+            refusal: null,
+            resumedNote: null,
+            counts: { entries: { count: 0, label: '0' }, patched: { count: 0, label: '0' }, deleted: { count: 0, label: '0' } },
+            stampNote: '',
+        });
+        await settle();
+
+        expect(health.querySelector('#vectfox_size_run_sweep').disabled).toBe(false);
+        expect(health.querySelector('[data-sweep="headline"]').textContent).toContain('Nothing to sweep');
     });
 });

@@ -363,7 +363,14 @@ function writeLegacyChunkMetadata(hash, metadata) {
     extension_settings.vectfox[chunkMetaSettingsKey(hash)] = metadata;
 }
 
-function deleteLegacyChunkMetadata(hash) {
+/**
+ * Deletes one legacy settings entry without saving. Callers own persistence:
+ * the store's delete path saves after calling this, and the sweep removes
+ * thousands of entries in one run and saves once at the end.
+ * @param {string} hash Chunk hash
+ * @returns {boolean} Whether an entry was there to remove
+ */
+export function removeLegacyChunkMetadata(hash) {
     const key = chunkMetaSettingsKey(hash);
     if (!extension_settings?.vectfox?.[key]) {
         return false;
@@ -399,7 +406,7 @@ const chunkMetaStore = createChunkMetaStore({
     getSettings: () => extension_settings?.vectfox || null,
     readLegacy: readLegacyChunkMetadata,
     writeLegacy: writeLegacyChunkMetadata,
-    deleteLegacy: deleteLegacyChunkMetadata,
+    deleteLegacy: removeLegacyChunkMetadata,
     listLegacy: listLegacyChunkMetadata,
     persistSettings: () => saveSettingsDebounced(),
     clientOnlyFields: CLIENT_ONLY_CHUNK_FIELDS,

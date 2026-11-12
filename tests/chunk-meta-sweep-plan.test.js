@@ -470,6 +470,49 @@ describe('sweep planner — the delete list exists only for a trusted run', () =
     });
 });
 
+describe('sweep planner — every entry the sweep may remove is on the delete list', () => {
+    it('lists a patched entry for deletion so the sweep removes its settings copy', () => {
+        const plan = planChunkMetaSweep({
+            entries: { h1: { context: 'about dragons', keywords: ['dragon'] } },
+            collections: [collection('A')],
+            scans: [scan('A', { h1: { context: 'about dragons' } })],
+        });
+
+        expect(plan.trusted).toBe(true);
+        expect(plan.patch).toHaveLength(1);
+        expect(plan.deletable).toEqual([{ hash: 'h1', collections: ['A'] }]);
+    });
+
+    it('keeps a patched entry out of the delete list when the run is untrusted', () => {
+        const plan = planChunkMetaSweep({
+            entries: { h1: { context: 'about dragons', keywords: ['dragon'] } },
+            collections: [collection('A'), collection('B')],
+            scans: [
+                scan('A', { h1: { context: 'about dragons' } }),
+                { registryKey: 'B', collectionId: 'B', status: 'failed', chunks: new Map() },
+            ],
+        });
+
+        expect(plan.trusted).toBe(false);
+        expect(plan.patch).toHaveLength(1);
+        expect(plan.deletable).toEqual([]);
+    });
+
+    it('names every collection holding a patched hash, once per settings entry', () => {
+        const plan = planChunkMetaSweep({
+            entries: { shared: { context: 'about elves', keywords: ['elf'] } },
+            collections: [collection('A'), collection('B')],
+            scans: [
+                scan('A', { shared: { context: 'about elves' } }),
+                scan('B', { shared: { context: 'about elves' } }),
+            ],
+        });
+
+        expect(plan.patch).toHaveLength(2);
+        expect(plan.deletable).toEqual([{ hash: 'shared', collections: ['A', 'B'] }]);
+    });
+});
+
 describe('sweep planner — skip reasons are counted apart', () => {
     it('separates unverified from client-only skips', () => {
         const plan = planChunkMetaSweep({

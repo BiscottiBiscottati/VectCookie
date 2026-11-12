@@ -27,7 +27,7 @@ import {
   purgeVectorIndex,
   queryMultipleCollections,
 } from "../core/core-vector-api.js";
-import { getRequestHeaders, getCurrentChatId, eventSource, event_types } from "../../../../../script.js";
+import { getRequestHeaders, getCurrentChatId, eventSource, event_types, saveSettingsDebounced } from "../../../../../script.js";
 import {
   cleanupOrphanedMeta,
   deleteCollectionMeta,
@@ -83,11 +83,17 @@ import {
   isVectFoxPNG,
 } from "../core/png-export.js";
 import { renderSizeInspectorTab } from "./size-inspector.js";
-import { createStorageBackup, createStorageDryRun } from "../core/chunk-meta-dry-run.js";
+import {
+  createStorageBackup,
+  createStorageDryRun,
+  createStorageSweep,
+} from "../core/chunk-meta-storage-actions.js";
 import { createPluginChunkTransport } from "../core/chunk-meta-transport.js";
+import { getSweepStamp, setSweepStamp } from "../core/chunk-meta-sweep-execute.js";
 import {
   CLIENT_ONLY_CHUNK_FIELDS,
   listLegacyChunkMetadata,
+  removeLegacyChunkMetadata,
 } from "../core/collection-metadata.js";
 
 // The storage dry run and its backup, composed with the live services here in
@@ -103,6 +109,17 @@ const storageActionDeps = {
 };
 const storageDryRun = createStorageDryRun(storageActionDeps);
 const storageBackup = createStorageBackup(storageActionDeps);
+// The sweep is the one action with write dependencies: it deletes settings
+// entries without saving, leaves a stamp, and persists once after the run. The
+// store's own delete path saves per key, which is the traffic this action exists
+// to avoid.
+const storageSweep = createStorageSweep({
+  ...storageActionDeps,
+  deleteEntry: removeLegacyChunkMetadata,
+  readStamp: () => getSweepStamp(extension_settings?.vectfox),
+  writeStamp: stamp => setSweepStamp(extension_settings?.vectfox, stamp),
+  persistSettings: () => saveSettingsDebounced(),
+});
 
 // Browser state
 // checkPluginAvailable() is imported from ../core/collection-loader.js —
@@ -793,6 +810,10 @@ function switchTab(tabName) {
           getSettings: () => extension_settings?.vectfox,
         }),
         runBackup: options => storageBackup({
+          ...options,
+          getSettings: () => extension_settings?.vectfox,
+        }),
+        runSweep: options => storageSweep({
           ...options,
           getSettings: () => extension_settings?.vectfox,
         }),

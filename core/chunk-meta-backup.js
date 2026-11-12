@@ -15,7 +15,7 @@
  *
  * Pure: no DOM, no settings, no requests. The caller owns turning the document
  * into a file (core/chunk-meta-backup.js is imported by the host-free
- * composition in core/chunk-meta-dry-run.js).
+ * composition in core/chunk-meta-storage-actions.js).
  * ============================================================================
  */
 

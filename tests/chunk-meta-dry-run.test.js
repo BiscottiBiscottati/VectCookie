@@ -12,7 +12,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 
-import { createStorageDryRun } from '../core/chunk-meta-dry-run.js';
+import { createStorageDryRun } from '../core/chunk-meta-storage-actions.js';
 import { createFakeChunkListing } from './fixtures/chunk-listing.js';
 
 /** A fake plugin transport; only `isAvailable` and `listChunks` may be called. */

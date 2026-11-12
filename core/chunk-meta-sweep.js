@@ -116,7 +116,8 @@ function untrustedReasonFor(rows) {
  *   counts: { redundant: number, patch: number, orphan: number, skipped: number },
  *   skippedByReason: { unverified: number, clientOnly: number },
  *   redundant: Array<{ hash: string, collections: string[] }>,
- *   deletable: Array<{ hash: string, collections: string[] }>,
+ *   deletable: Array<{ hash: string, collections: string[] }> (trusted runs only;
+ *     `collections` names every complete-scanned collection that holds the hash),
  *   patch: Array<{ hash: string, registryKey: string, collectionId: string, fields: object }>,
  *   orphan: Array<{ hash: string }>,
  *   skipped: Array<{ hash: string, reason: 'unverified'|'client-only', collections: string[] }>,
@@ -190,6 +191,12 @@ export function planChunkMetaSweep({
     };
     plan.trusted = plan.untrustedReason === null;
 
+    // Collected while classifying, so the delete list is one pass over the
+    // entries. An entry is removable once a complete listing holds it: either
+    // the payload already supersedes it, or the fields the payload lacks are
+    // exactly what the sweep copies across before deleting.
+    const deletable = [];
+
     for (const [hash, entry] of Object.entries(entries || {})) {
         // Containment needs a complete listing: a failed or unattempted scan
         // cannot say whether it holds this hash.
@@ -207,6 +214,10 @@ export function planChunkMetaSweep({
                 for (const row of containing) row.skipped += 1;
                 continue;
             }
+
+            // Every complete-scan collection that holds the hash justifies the
+            // removal: it is where the value lives after the payload write.
+            deletable.push({ hash, collections: containing.map(row => row.registryKey) });
 
             let patchRecords = 0;
             for (const row of containing) {
@@ -256,9 +267,7 @@ export function planChunkMetaSweep({
         unverified: plan.skipped.filter(record => record.reason === 'unverified').length,
         clientOnly: plan.skipped.filter(record => record.reason === 'client-only').length,
     };
-    plan.deletable = plan.trusted
-        ? plan.redundant.map(record => ({ hash: record.hash, collections: [...record.collections] }))
-        : [];
+    plan.deletable = plan.trusted ? deletable : [];
     plan.perCollection = rows.map(row => ({
         registryKey: row.registryKey,
         collectionId: row.collectionId,

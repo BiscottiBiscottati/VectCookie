@@ -5,11 +5,12 @@
  * Renders the Size Inspector's storage-health block: the serialized extension
  * settings size, the top contributing keys, the chunk-metadata entry count, the
  * over-limit warning (ADR-0003), the dry run that reports how many entries the
- * staged migration would consider redundant, patchable or orphaned, and the
- * backup download that makes the one irreversible step reversible.
+ * staged migration would consider redundant, patchable or orphaned, the backup
+ * download that makes the one irreversible step reversible, and the sweep itself
+ * with the stamp of the last run.
  *
  * Opening the block costs one in-memory serialization of the settings object:
- * both actions are explicit buttons, and nothing imported here talks to the
+ * every action is an explicit button, and nothing imported here talks to the
  * plugin, Qdrant or the collection loader. The runners are injected, so a tab
  * that is merely opened can neither start a scan nor issue a request —
  * tests/size-inspector.test.js holds that line.
@@ -17,6 +18,8 @@
  */
 
 import { buildStorageHealth, formatEntryCount } from "../core/storage-health.js";
+import { formatSweepStamp } from "../core/chunk-meta-sweep-report.js";
+import { getSweepStamp } from "../core/chunk-meta-sweep-execute.js";
 import { downloadJsonFile } from "../utils/file-download.js";
 import { VIEW_STATUS } from "../core/view-status.js";
 import { icons } from "./icons.js";
@@ -39,12 +42,22 @@ const dryRunReports = new WeakMap();
 const backupStatuses = new WeakMap();
 
 /**
- * Containers with a collection scan in flight. Both actions page every
- * registered collection, so one flag covers both: two concurrent scans serve
- * neither action, and a dry run finishing after a backup would replace the
- * backup's report while the status still described the file. The flag disables
- * the rendered buttons and guards both handlers; nodes are looked up rather than
- * captured because a re-render replaces them.
+ * Last sweep result and status line per mounted health block. They survive
+ * Re-measure for the same reason the dry-run report does: a sweep can take a
+ * minute, and losing the record of what it moved the moment the user re-measures
+ * would leave the panel looking as if nothing happened.
+ */
+const sweepResults = new WeakMap();
+const sweepStatuses = new WeakMap();
+
+/**
+ * Containers with a collection scan in flight. Dry run, backup and sweep all
+ * page every registered collection, so one flag covers all three: concurrent
+ * scans serve no action, a sweep started mid-dry-run would act on a plan the
+ * panel no longer shows, and a dry run finishing after a backup would replace
+ * the backup's report while the status still described the file. The flag
+ * disables the rendered buttons and guards every handler; nodes are looked up
+ * rather than captured because a re-render replaces them.
  */
 const scansInFlight = new WeakSet();
 
@@ -56,7 +69,11 @@ const scansInFlight = new WeakSet();
 function setActionsBusy(container, busy) {
     if (busy) scansInFlight.add(container);
     else scansInFlight.delete(container);
-    for (const selector of ["#vectfox_size_dry_run", "#vectfox_size_backup_download"]) {
+    for (const selector of [
+        "#vectfox_size_dry_run",
+        "#vectfox_size_backup_download",
+        "#vectfox_size_run_sweep",
+    ]) {
         const node = container.querySelector(selector);
         if (node) node.disabled = busy;
     }
@@ -77,6 +94,9 @@ function setActionsBusy(container, busy) {
  *     Runs the same scan and resolves to `{ status, filename, text, entries, view }`
  *     — the file, its label, and the report of the scan it was built from — or
  *     an unavailable view.
+ * @param {function({ onProgress?: function }): Promise<object>} [deps.runSweep]
+ *     Runs the explicit sweep and resolves to the run's report view model, or an
+ *     unavailable view. It is the only runner here that mutates.
  * @param {(filename: string, text: string) => (boolean|void)} [deps.saveFile]
  *     Saves the backup; returns false when it cannot. Defaults to a Blob
  *     download; injected so tests can observe the file without one.
@@ -86,13 +106,18 @@ export function renderStorageHealthPanel(container, getSettings, deps = {}) {
     const { runDryRun, runBackup, saveFile } = deps;
     if (!container) return null;
 
-    const view = buildStorageHealth(getSettings?.());
+    const settings = getSettings?.();
+    const view = buildStorageHealth(settings);
     const report = dryRunReports.get(container) || null;
+    const sweep = sweepResults.get(container) || null;
     const backupStatus = backupStatuses.get(container) || "";
+    const sweepStatus = sweepStatuses.get(container) || "";
+    const stampNote = formatSweepStamp(getSweepStamp(settings));
     container.innerHTML = storageHealthHtml(
         view,
         report,
-        backupStatus,
+        sweep,
+        { backupStatus, sweepStatus, stampNote },
         scansInFlight.has(container),
     );
 
@@ -106,7 +131,28 @@ export function renderStorageHealthPanel(container, getSettings, deps = {}) {
     }
     bindDryRun(container, getSettings, deps);
     bindBackup(container, getSettings, deps);
+    bindSweep(container, getSettings, deps);
     return view;
+}
+
+/**
+ * The skeleton every collection action shares: refuse while another scan is in
+ * flight, mark the buttons busy, run the injected action, and restore the
+ * buttons whether it resolved or threw. What the result *means* — a report, a
+ * saved file, a stamp — stays in the handler, so this helper owns no wording.
+ * @param {HTMLElement} container Mount point of the health block.
+ * @param {() => Promise<any>} action The injected runner call.
+ * @returns {Promise<{ result?: any, error?: Error }>} One of the two, never both.
+ */
+async function runCollectionAction(container, action) {
+    setActionsBusy(container, true);
+    try {
+        return { result: await action() };
+    } catch (error) {
+        return { error };
+    } finally {
+        setActionsBusy(container, false);
+    }
 }
 
 /**
@@ -132,25 +178,16 @@ function bindDryRun(container, getSettings, deps) {
             return;
         }
 
-        setActionsBusy(container, true);
         setStatus("Scanning every registered collection…");
-        let report;
-        try {
-            report = await deps.runDryRun({
-                onProgress: ({ done, total }) => {
-                    setStatus(`Scanning every registered collection… (${done}/${total})`);
-                },
-            });
-        } catch (err) {
-            report = {
-                status: VIEW_STATUS.UNAVAILABLE,
-                reason: `Dry run failed: ${err?.message || err}`,
-            };
-        } finally {
-            setActionsBusy(container, false);
-        }
+        const { result, error } = await runCollectionAction(container, () => deps.runDryRun({
+            onProgress: ({ done, total }) => {
+                setStatus(`Scanning every registered collection… (${done}/${total})`);
+            },
+        }));
 
-        dryRunReports.set(container, report);
+        dryRunReports.set(container, error
+            ? { status: VIEW_STATUS.UNAVAILABLE, reason: `Dry run failed: ${error?.message || error}` }
+            : result);
         renderStorageHealthPanel(container, getSettings, deps);
     };
 }
@@ -185,12 +222,12 @@ function bindBackup(container, getSettings, deps) {
             return;
         }
 
-        setActionsBusy(container, true);
         setStatus("Scanning every registered collection…");
 
-        let backup = null;
-        try {
-            backup = await deps.runBackup({
+        // The download happens inside the action so a browser that cannot save
+        // is a failure, while a saved file can never be reported as one.
+        const { result: backup, error } = await runCollectionAction(container, async () => {
+            const run = await deps.runBackup({
                 onProgress: ({ done, total }) => {
                     setStatus(`Scanning every registered collection… (${done}/${total})`);
                 },
@@ -201,21 +238,22 @@ function bindBackup(container, getSettings, deps) {
                 },
             });
 
-            if (backup?.status !== VIEW_STATUS.MEASURED) {
-                setStatus(backup?.reason || "The backup could not be built.");
-                return;
-            }
+            if (run?.status !== VIEW_STATUS.MEASURED) return { unavailable: run };
 
-            const saved = (deps.saveFile || downloadJsonFile)(backup.filename, backup.text);
+            const saved = (deps.saveFile || downloadJsonFile)(run.filename, run.text);
             if (saved === false) throw new Error("this browser cannot save files");
-        } catch (err) {
-            setStatus(`Backup failed: ${err?.message || err}`);
+            return run;
+        });
+
+        if (error) {
+            setStatus(`Backup failed: ${error?.message || error}`);
             return;
-        } finally {
-            setActionsBusy(container, false);
+        }
+        if (backup?.unavailable) {
+            setStatus(backup.unavailable.reason || "The backup could not be built.");
+            return;
         }
 
-        // The file exists from here on: nothing below may report it as failed.
         // The label is read defensively because the runner is an injected seam.
         const label = backup.entries?.label;
         setStatus(label
@@ -230,31 +268,98 @@ function bindBackup(container, getSettings, deps) {
 }
 
 /**
- * Builds the block's markup from the view model, the last dry-run report and
- * the last backup status line.
+ * Wires the sweep action. It is the only mutating handler in this module: the
+ * button is the sole trigger, and the runner owns every safety rule (the trusted
+ * scan, the batch abort, the single save and the stamp). The panel only reports
+ * what the run returned, then re-measures — which is how the smaller settings
+ * payload becomes visible — and drops the dry-run report the run invalidated.
+ */
+function bindSweep(container, getSettings, deps) {
+    const buttonOf = () => container.querySelector("#vectfox_size_run_sweep");
+    if (!buttonOf()) return;
+
+    /** Writes the status to both the stored state and the current node. */
+    const setStatus = (text) => {
+        sweepStatuses.set(container, text);
+        const current = container.querySelector("#vectfox_size_sweep_status");
+        if (current) current.textContent = text;
+    };
+
+    buttonOf().onclick = async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (scansInFlight.has(container)) return;
+        if (typeof deps.runSweep !== "function") {
+            setStatus("The sweep is not available in this build.");
+            return;
+        }
+
+        setStatus("Scanning every registered collection…");
+        const { result, error } = await runCollectionAction(container, () => deps.runSweep({
+            onProgress: (progress) => {
+                setStatus(progress?.phase
+                    ? `Moving chunk metadata… (${progress.done}/${progress.total})`
+                    : `Scanning every registered collection… (${progress.done}/${progress.total})`);
+            },
+        }));
+
+        if (error) {
+            setStatus(`Sweep failed: ${error?.message || error}`);
+            return;
+        }
+        if (result?.status !== VIEW_STATUS.MEASURED) {
+            setStatus(result?.reason || "The sweep could not run.");
+            return;
+        }
+
+        sweepResults.set(container, result);
+        setStatus(result.headline);
+        // The dry-run counts described the entries this run just moved; leaving
+        // them on screen beside the run's own result would be two answers.
+        if (result.outcome !== "noop") dryRunReports.delete(container);
+        renderStorageHealthPanel(container, getSettings, deps);
+    };
+}
+
+/**
+ * Builds the block's markup from the view model, the last dry-run report, the
+ * last sweep result and the status lines.
  * @param {object} view View model from buildStorageHealth()
  * @param {object|null} [report] Dry-run report view model, if one has run.
- * @param {string} [backupStatus] Last backup status line, if an action has run.
+ * @param {object|null} [sweep] Sweep report view model, if one has run.
+ * @param {{ backupStatus?: string, sweepStatus?: string, stampNote?: string }} [status] Persisted status lines.
  * @param {boolean} [scanBusy] Whether a collection scan is in flight right now.
  * @returns {string} HTML
  */
-function storageHealthHtml(view, report = null, backupStatus = "", scanBusy = false) {
+function storageHealthHtml(
+    view,
+    report = null,
+    sweep = null,
+    { backupStatus = "", sweepStatus = "", stampNote = "" } = {},
+    scanBusy = false,
+) {
     const head = `
         <div class="vectfox-size-health-head">
             <h4>Storage health</h4>
             <div class="vectfox-size-health-actions">
                 <button id="vectfox_size_dry_run" class="vectfox-btn-sm" ${scanBusy ? "disabled" : ""}>${icons.listChecks(14)} Dry run</button>
                 <button id="vectfox_size_backup_download" class="vectfox-btn-sm" ${scanBusy ? "disabled" : ""}>${icons.download(14)} Download backup</button>
+                <button id="vectfox_size_run_sweep" class="vectfox-btn-sm" ${scanBusy ? "disabled" : ""}>${icons.listChecks(14)} Run sweep</button>
                 <button id="vectfox_size_health_refresh" class="vectfox-btn-sm">${icons.refreshCw(14)} Re-measure</button>
             </div>
         </div>
         <div id="vectfox_size_dry_run_status" class="vectfox-size-health-status"></div>
         <div id="vectfox_size_backup_status" class="vectfox-size-health-status">${StringUtils.escapeHtml(backupStatus)}</div>
+        <div id="vectfox_size_sweep_status" class="vectfox-size-health-status">${StringUtils.escapeHtml(sweepStatus)}</div>
+        <div class="vectfox-size-health-detail" data-sweep="stamp">${StringUtils.escapeHtml(stampNote)}</div>
     `;
 
     const reportBlock = `
         <div id="vectfox_size_dry_run_report" class="vectfox-size-health-report">
             ${dryRunReportHtml(report)}
+        </div>
+        <div id="vectfox_size_sweep_result" class="vectfox-size-health-report">
+            ${sweepResultHtml(sweep)}
         </div>
     `;
 
@@ -370,6 +475,28 @@ function dryRunRows(collections) {
             <td class="num" data-dry-run="row-skipped">${row.skipped.label}</td>
             <td class="num" title="An orphan belongs to no collection.">—</td>
         </tr>`).join("");
+}
+
+/**
+ * The sweep result: what the run moved, why it stopped, and why deletion may
+ * have been refused. Counts carry their labels from the view model.
+ * @param {object|null} sweep
+ * @returns {string} HTML, or an empty string before the first run.
+ */
+function sweepResultHtml(sweep) {
+    if (!sweep) return "";
+    return `
+        <div class="vectfox-size-health-headline" data-sweep="headline">${StringUtils.escapeHtml(sweep.headline)}</div>
+        <div class="vectfox-size-health-detail">
+            Entries handled: <span data-sweep="entries">${sweep.counts.entries.label}</span>
+            · Patched: <span data-sweep="patched">${sweep.counts.patched.label}</span>
+            · Settings entries removed: <span data-sweep="deleted">${sweep.counts.deleted.label}</span>
+        </div>
+        ${sweep.resumedNote ? `<div class="vectfox-size-health-detail" data-sweep="resumed">${StringUtils.escapeHtml(sweep.resumedNote)}</div>` : ""}
+        ${sweep.refusal ? `<div class="vectfox-size-health-warning" data-sweep="refusal">${StringUtils.escapeHtml(sweep.refusal)}</div>` : ""}
+        ${sweep.failure ? `<div class="vectfox-size-health-warning" data-sweep="failure">${StringUtils.escapeHtml(sweep.failure)}</div>` : ""}
+        ${sweep.saveWarning ? `<div class="vectfox-size-health-warning" data-sweep="save-warning">${StringUtils.escapeHtml(sweep.saveWarning)}</div>` : ""}
+    `;
 }
 
 /**
