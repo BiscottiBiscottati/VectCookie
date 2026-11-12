@@ -31,7 +31,17 @@ What that sentence does not cover, stated plainly:
   lost: it is held in settings and survives a reload. That edit also issues a
   settings save, and until the payload accepts the write again an existing
   payload value still wins the read, so the field keeps showing what the
-  collection last held.
+  collection last held. The extension then retries the payload write
+  automatically; when it succeeds, the settings copy it superseded is removed.
+  A repair that cannot get through is retried a few times with backoff, then waits
+  for the next page load, where it is rebuilt from the record and the payload's
+  actual contents — a field the payload already holds is not written again.
+  Repairs pause while the plugin is unreachable or the store is rolled back to
+  settings, and a fallback field two collections both have pending stays until
+  the second repair lands. The queue is bounded at 100 repairs and its depth is
+  shown in the Size Inspector. At the cap the oldest repair is dropped with a
+  warning rather than silently: its edit stays in settings until the sweep moves
+  it.
 - **Importing** a collection still writes its chunk metadata to settings until
   the import/export parity work lands.
 - If this browser's plugin probe is stale — the plugin was installed mid-session

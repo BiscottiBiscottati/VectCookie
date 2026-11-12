@@ -90,8 +90,15 @@ Relevant properties of the storage that shaped this decision:
   decision 5 land in later changes. The rehearsal dual-write ends with the write-path
   change: a payload-path save writes no settings copy (only client-only fields such
   as `summaries` still reach settings), and a failed payload write persists the
-  refused fields to settings instead of losing the edit — the bounded retry that
-  repairs the payload and drops that copy comes later.
+  refused fields to settings instead of losing the edit. The bounded retry now
+  repairs the payload and removes the settings copy it superseded: the queue is a
+  small durable record list in settings (collection, hash and field names, never
+  values), rebuilt on hydration from the disagreement between the two stores,
+  capped at 100 records, and its depth is shown on the Size Inspector. At the cap
+  the oldest repair is dropped with a warning; its edit stays in settings for the
+  sweep. Repairs pause while the store policy is rolled back or the plugin is
+  unreachable, and a fallback field another collection's pending repair still
+  needs is kept until that repair lands — the legacy entry is global per hash.
 - **Three behaviour changes to announce**: per-collection metadata (no more
   cross-collection sharing), a chunk edit no longer triggering a full settings
   upload on the plugin path, and — after the sweep — downgrading to an older
@@ -107,7 +114,8 @@ Relevant properties of the storage that shaped this decision:
   collection currently loaded: content-derived hashes mean one key can be
   referenced by several collections.
 - **A stuck retry queue re-inflates settings**, so its depth must be visible in
-  the Size Inspector alongside the settings size.
+  the Size Inspector alongside the settings size. The queue is bounded at 100
+  repair records; each holds field names only, so the queue itself is small.
 - **The mirror is a read cache, not a second store**: any disagreement resolves
   payload-first per field, settings filling gaps, until the sweep removes the
   settings side.

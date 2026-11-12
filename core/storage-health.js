@@ -23,6 +23,7 @@
  */
 
 import { isChunkMetaSettingsKey } from './chunk-meta-keys.js';
+import { readRetryRecords, RETRY_QUEUE_CAP } from './chunk-meta-retry.js';
 import { VIEW_STATUS } from './view-status.js';
 
 /** Sane upper bound for the extension settings blob — the post-sweep target. */
@@ -137,6 +138,48 @@ function measureChunkMeta(settings) {
 }
 
 /**
+ * The failed-write retry queue (ticket 09): how many payload repairs are pending
+ * and whether the bounded queue is in trouble. The records live in settings, so
+ * the depth is a pure settings read — no store, no request — and it is the
+ * durable depth a reload would rebuild from, not just this session's scheduling.
+ *
+ * `retryState` is the store's session view: it supplies the cap and the number of
+ * repairs the cap actually dropped here, which is the only way the panel can tell
+ * "full, nothing lost yet" from "full, and a repair was dropped". Without it the
+ * panel still reports depth, and never claims a drop it cannot prove.
+ * @param {object|null|undefined} settings
+ * @param {{ pending?: number, cap?: number, dropped?: number }|null} [retryState]
+ * @returns {{ pending: number, cap: number, dropped: number, depthLabel: string, detail: string, warning: string|null }}
+ */
+function measureRetry(settings, retryState = null) {
+    const pending = Number.isFinite(retryState?.pending)
+        ? retryState.pending
+        : readRetryRecords(settings).length;
+    const cap = Number.isFinite(retryState?.cap) ? retryState.cap : RETRY_QUEUE_CAP;
+    const dropped = Number.isFinite(retryState?.dropped) ? retryState.dropped : 0;
+
+    let warning = null;
+    if (dropped > 0) {
+        warning = `The retry queue hit its limit and dropped ${formatEntryCount(dropped, 'pending repair', 'pending repairs')}. `
+            + 'Those edits stay in settings until the sweep moves them; use the sweep once the plugin is reachable again.';
+    } else if (pending >= cap) {
+        warning = `The retry queue is full (${formatCount(pending)} of ${cap}). `
+            + 'The oldest pending repair is dropped when the next one fails; every affected edit stays in settings until the sweep moves it.';
+    }
+
+    return {
+        pending,
+        cap,
+        dropped,
+        depthLabel: `${formatCount(pending)} of ${formatCount(cap)}`,
+        detail: pending === 0
+            ? 'No edits are waiting on a payload repair.'
+            : `${formatEntryCount(pending, 'edit', 'edits')} held in settings until the payload accepts ${pending === 1 ? 'it' : 'them'}.`,
+        warning,
+    };
+}
+
+/**
  * The settings keys that account for the most bytes, largest first. The
  * chunk-metadata namespace is left out on purpose: it is reported once, with its
  * entry count, and 17,104 keys of the same shape would otherwise fill every row
@@ -173,12 +216,13 @@ function warningFor(total, chunkMeta) {
     return `Extension settings are ${total.sizeLabel} — past the ${formatSize(WARN_BYTES)} health limit. ${chunkLine}`;
 }
 
-function unavailableView(reason) {
+function unavailableView(reason, retryState = null) {
     return {
         status: VIEW_STATUS.UNAVAILABLE,
         reason,
         total: sizeInfo(0),
         chunkMeta: measureChunkMeta({}),
+        retry: measureRetry({}, retryState),
         topKeys: [],
         warning: null,
     };
@@ -188,21 +232,23 @@ function unavailableView(reason) {
  * Builds the Size Inspector's storage-health view model.
  * @param {object|null|undefined} settings The extension settings object
  *     (`extension_settings.vectfox`).
- * @returns {object} View model: status, measured sizes, top keys and warning.
+ * @param {{ retryState?: { pending: number, cap: number, dropped: number }|null }} [options]
+ *     The retry queue's session state, so a cap drop can be reported as one.
+ * @returns {object} View model: status, measured sizes, top keys and warnings.
  */
-export function buildStorageHealth(settings) {
+export function buildStorageHealth(settings, { retryState = null } = {}) {
     if (!settings || typeof settings !== 'object') {
-        return unavailableView('Extension settings are not available yet.');
+        return unavailableView('Extension settings are not available yet.', retryState);
     }
 
     let serialized;
     try {
         serialized = JSON.stringify(settings);
     } catch (err) {
-        return unavailableView(`Extension settings could not be measured: ${err.message}`);
+        return unavailableView(`Extension settings could not be measured: ${err.message}`, retryState);
     }
     if (serialized === undefined) {
-        return unavailableView('Extension settings could not be measured.');
+        return unavailableView('Extension settings could not be measured.', retryState);
     }
 
     const total = sizeInfo(utf8ByteLength(serialized));
@@ -212,6 +258,7 @@ export function buildStorageHealth(settings) {
         status: VIEW_STATUS.MEASURED,
         total,
         chunkMeta,
+        retry: measureRetry(settings, retryState),
         topKeys: measureTopKeys(settings),
         warning: warningFor(total, chunkMeta),
     };

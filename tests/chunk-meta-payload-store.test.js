@@ -31,8 +31,11 @@ import {
     configureChunkMetaStore,
     resetChunkMetaStore,
     isChunkMetaPayloadStore,
+    getChunkMetaRetryState,
 } from '../core/collection-metadata.js';
 import { createChunkMetaStore } from '../core/chunk-meta-store.js';
+import { readRetryRecords, upsertRetryRecord } from '../core/chunk-meta-retry.js';
+import { sameStoredValue } from '../core/chunk-meta-fields.js';
 import { saveSettingsDebounced } from '../../../../../script.js';
 
 // ---------------------------------------------------------------------------
@@ -611,6 +614,520 @@ describe('failed payload write — falls back to settings instead of losing the 
 
         expect(mockSettings.vectfox.vectfox_chunk_meta_22).toBeUndefined();
         expect(saveSettingsDebounced).not.toHaveBeenCalled();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Ticket 09: a failed payload write is not only preserved in settings — it is
+// also queued for a bounded retry, and the queue's depth is readable so a stuck
+// queue cannot quietly re-inflate the settings blob.
+// ---------------------------------------------------------------------------
+
+describe('failed payload write — a bounded retry is queued', () => {
+    it('queues the refused field and reports the queue depth', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '41', metadata: { context: 'before' } }] },
+        });
+        const failingTransport = {
+            ...plugin.transport,
+            async patchMetadata() { throw new Error('plugin restarted'); },
+        };
+        configureChunkMetaStore({ transport: failingTransport });
+        await useChunkMetaCollection('col-a');
+
+        saveChunkMetadata('41', { context: 'after' });
+        await flushChunkMetaWrites();
+
+        expect(getChunkMetaRetryState()).toMatchObject({ pending: 1, dropped: 0 });
+    });
+
+    it('repairs the payload on retry and removes the settings copy it superseded', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '42', metadata: { context: 'before' } }] },
+        });
+        let failNext = true;
+        const transport = {
+            ...plugin.transport,
+            async patchMetadata(...args) {
+                if (failNext) {
+                    failNext = false;
+                    throw new Error('dropped tunnel');
+                }
+                return plugin.transport.patchMetadata(...args);
+            },
+        };
+        configureChunkMetaStore({ transport });
+        await useChunkMetaCollection('col-a');
+
+        saveChunkMetadata('42', { context: 'after' });
+        await flushChunkMetaWrites();
+
+        expect(plugin.server.get('col-a').get('42')).toMatchObject({ context: 'after' });
+        expect(mockSettings.vectfox.vectfox_chunk_meta_42).toBeUndefined();
+        expect(getChunkMetaRetryState()).toMatchObject({ pending: 0 });
+        expect(getChunkMetadata('42').context).toBe('after');
+    });
+
+    it('keeps a client-only field when it prunes the retried payload fields', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '43', metadata: { context: 'before' } }] },
+        });
+        let failNext = true;
+        const transport = {
+            ...plugin.transport,
+            async patchMetadata(...args) {
+                if (failNext) {
+                    failNext = false;
+                    throw new Error('plugin restart');
+                }
+                return plugin.transport.patchMetadata(...args);
+            },
+        };
+        configureChunkMetaStore({ transport });
+        await useChunkMetaCollection('col-a');
+
+        saveChunkMetadata('43', { context: 'after', summaries: ['a dual-vector summary'] });
+        await flushChunkMetaWrites();
+
+        expect(mockSettings.vectfox.vectfox_chunk_meta_43).toEqual({
+            summaries: ['a dual-vector summary'],
+        });
+        expect(plugin.server.get('col-a').get('43')).toMatchObject({ context: 'after' });
+        expect(getChunkMetaRetryState().pending).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Ticket 09: the queue is durable. A reload rebuilds it from the record plus the
+// disagreement between the two stores — a field the payload lacks is still owed,
+// a field the payload already holds equal is not.
+// ---------------------------------------------------------------------------
+
+describe('reload — pending repairs are rebuilt from the two stores', () => {
+    function flakyPlugin(hash, metadata) {
+        const plugin = createFakePlugin({ chunksByCollection: { 'col-a': [{ hash, metadata }] } });
+        const state = { broken: true };
+        const transport = {
+            ...plugin.transport,
+            async patchMetadata(...args) {
+                if (state.broken) throw new Error('plugin restart');
+                return plugin.transport.patchMetadata(...args);
+            },
+        };
+        return { plugin, state, transport };
+    }
+
+    it('replays a repair the payload still owes after a reload', async () => {
+        const { plugin, state, transport } = flakyPlugin('51', { context: 'before' });
+        configureChunkMetaStore({ transport });
+        await useChunkMetaCollection('col-a');
+
+        saveChunkMetadata('51', { context: 'after' });
+        await flushChunkMetaWrites();
+        expect(getChunkMetaRetryState().pending).toBe(1);
+
+        // Reload: fresh mirror and schedule, same settings and payload.
+        resetChunkMetaStore();
+        state.broken = false;
+        configureChunkMetaStore({ transport });
+        await useChunkMetaCollection('col-a');
+
+        expect(getChunkMetaRetryState()).toMatchObject({ pending: 1, queued: 1 });
+        await flushChunkMetaWrites();
+
+        expect(plugin.server.get('col-a').get('51')).toMatchObject({ context: 'after' });
+        expect(mockSettings.vectfox.vectfox_chunk_meta_51).toBeUndefined();
+        expect(getChunkMetaRetryState().pending).toBe(0);
+    });
+
+    it('resolves a field the payload already holds instead of writing it again', async () => {
+        const { plugin, state, transport } = flakyPlugin('52', { context: 'before' });
+        configureChunkMetaStore({ transport });
+        await useChunkMetaCollection('col-a');
+
+        saveChunkMetadata('52', { context: 'after' });
+        await flushChunkMetaWrites();
+
+        // The payload actually accepted the write; its acknowledgement was what
+        // failed. The next load must see agreement and remove the settings copy.
+        const failedCopy = { ...mockSettings.vectfox.vectfox_chunk_meta_52 };
+        plugin.server.get('col-a').set('52', { ...failedCopy });
+        const patchesBefore = plugin.calls.patch.length;
+
+        resetChunkMetaStore();
+        state.broken = false;
+        configureChunkMetaStore({ transport });
+        await useChunkMetaCollection('col-a');
+        await flushChunkMetaWrites();
+
+        expect(mockSettings.vectfox.vectfox_chunk_meta_52).toBeUndefined();
+        expect(getChunkMetaRetryState().pending).toBe(0);
+        expect(plugin.calls.patch).toHaveLength(patchesBefore);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Ticket 09: the queue is bounded. Reaching the cap drops the oldest repair and
+// warns — its settings copy survives, only the automatic retry is lost — while
+// delete paths drop the repairs that have no chunk left to target.
+// ---------------------------------------------------------------------------
+
+describe('bounded retry queue — the cap drops the oldest, deletion clears the rest', () => {
+    function makeStore(transport, cap, persistSettings = () => {}) {
+        const settings = {};
+        const legacy = {};
+        const store = createChunkMetaStore({
+            getSettings: () => settings,
+            readLegacy: hash => legacy[hash] || null,
+            writeLegacy: (hash, metadata) => { legacy[hash] = metadata; },
+            mergeLegacy: (hash, fields) => { legacy[hash] = { ...(legacy[hash] || {}), ...fields }; },
+            pruneLegacy: (hash, metadata) => {
+                const entry = legacy[hash];
+                if (!entry) return 0;
+                let removed = 0;
+                for (const [field, value] of Object.entries(metadata)) {
+                    if (!Object.prototype.hasOwnProperty.call(entry, field)) continue;
+                    if (!sameStoredValue(entry[field], value)) continue;
+                    delete entry[field];
+                    removed += 1;
+                }
+                if (removed > 0 && Object.keys(entry).length === 0) delete legacy[hash];
+                return removed;
+            },
+            deleteLegacy: (hash) => {
+                if (!(hash in legacy)) return false;
+                delete legacy[hash];
+                return true;
+            },
+            listLegacy: () => ({ ...legacy }),
+            persistSettings,
+            clientOnlyFields: ['summaries'],
+            transport,
+            retryCap: cap,
+            retryDelayMs: 0,
+        });
+        return { store, legacy, settings };
+    }
+
+    it('drops the oldest repair at the cap and stops retrying it', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: {
+                'col-a': ['1', '2', '3'].map(hash => ({ hash, metadata: { context: 'before' } })),
+            },
+        });
+        const state = { broken: true };
+        const transport = {
+            ...plugin.transport,
+            async patchMetadata(...args) {
+                if (state.broken) throw new Error('plugin restart');
+                return plugin.transport.patchMetadata(...args);
+            },
+        };
+        const { store, legacy } = makeStore(transport, 2);
+        await store.useCollection('col-a');
+
+        for (const hash of ['1', '2', '3']) {
+            store.saveMetadata(hash, { context: 'after' });
+            await store.flush();
+        }
+
+        expect(store.getRetryState()).toMatchObject({ pending: 2, cap: 2, dropped: 1 });
+        // The dropped repair lost only its retry; the edit is still in settings.
+        expect(legacy['1']).toMatchObject({ context: 'after' });
+
+        const attemptsBefore = plugin.calls.patch.length;
+        state.broken = false;
+        await store.flush();
+
+        // Only the two repairs still in the queue were replayed.
+        expect(plugin.calls.patch.slice(attemptsBefore).map(call => call.hash)).toEqual(['2', '3']);
+        expect(plugin.server.get('col-a').get('1')).toMatchObject({ context: 'before' });
+        expect(legacy['1']).toMatchObject({ context: 'after' });
+        expect(legacy['2']).toBeUndefined();
+        expect(legacy['3']).toBeUndefined();
+        expect(store.getRetryState()).toMatchObject({ pending: 0, dropped: 1 });
+    });
+
+    it('deleting a chunk removes its queued repair', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '61', metadata: { context: 'before' } }] },
+        });
+        const failingTransport = {
+            ...plugin.transport,
+            async patchMetadata() { throw new Error('plugin restart'); },
+        };
+        configureChunkMetaStore({ transport: failingTransport });
+        await useChunkMetaCollection('col-a');
+
+        saveChunkMetadata('61', { context: 'after' });
+        await flushChunkMetaWrites();
+        expect(getChunkMetaRetryState().pending).toBe(1);
+
+        deleteChunkMetadata('61');
+
+        expect(getChunkMetaRetryState().pending).toBe(0);
+        expect(mockSettings.vectfox.vectfox_chunk_meta_61).toBeUndefined();
+    });
+
+    it('forgetting a deleted collection drops its queued repairs', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '62', metadata: { context: 'before' } }] },
+        });
+        const failingTransport = {
+            ...plugin.transport,
+            async patchMetadata() { throw new Error('plugin restart'); },
+        };
+        const { store, legacy } = makeStore(failingTransport, 10);
+        await store.useCollection('col-a');
+
+        store.saveMetadata('62', { context: 'after' });
+        await store.flush();
+        expect(store.getRetryState().pending).toBe(1);
+
+        store.forgetCollection('col-a');
+        store.forgetCollection('col-a'); // a second call is a no-op
+
+        expect(store.getRetryState().pending).toBe(0);
+        // The settings entry is the GC's work item, not the retry's.
+        expect(legacy['62']).toMatchObject({ context: 'after' });
+    });
+
+    it('keeps another collection\'s repair for the same content hash', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: {
+                'col-a': [{ hash: '63', metadata: { context: 'a-before' } }],
+                'col-b': [{ hash: '63', metadata: { context: 'b-before' } }],
+            },
+        });
+        const failingTransport = {
+            ...plugin.transport,
+            async patchMetadata() { throw new Error('plugin restart'); },
+        };
+        const { store, settings } = makeStore(failingTransport, 10);
+        await store.useCollection('col-a');
+
+        store.saveMetadata('63', { context: 'a-after' });
+        await store.flush();
+        // A repair recorded for another collection while this session had no
+        // active collection for it.
+        upsertRetryRecord(settings, { collectionId: 'col-b', hash: '63', fields: ['context'] });
+        expect(store.getRetryState().pending).toBe(2);
+
+        store.forgetChunks(['63']);
+
+        expect(readRetryRecords(settings)).toEqual([
+            { collectionId: 'col-b', hash: '63', fields: ['context'] },
+        ]);
+    });
+
+    it('pauses repairs while the store policy is rolled back to settings', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '65', metadata: { context: 'before' } }] },
+        });
+        let broken = true;
+        const transport = {
+            ...plugin.transport,
+            async patchMetadata(...args) {
+                if (broken) throw new Error('plugin restart');
+                return plugin.transport.patchMetadata(...args);
+            },
+        };
+        const { store, legacy, settings } = makeStore(transport, 10);
+        await store.useCollection('col-a');
+
+        store.saveMetadata('65', { context: 'after' });
+        await store.flush();
+        expect(store.getRetryState().pending).toBe(1);
+
+        broken = false;
+        settings.chunk_meta_store = 'settings';
+        const patchesBefore = plugin.calls.patch.length;
+        await store.flush();
+
+        // The rollback must not be undermined by a queued repair writing the
+        // payload and deleting the settings copy the policy now relies on.
+        expect(plugin.calls.patch).toHaveLength(patchesBefore);
+        expect(plugin.server.get('col-a').get('65')).toMatchObject({ context: 'before' });
+        expect(legacy['65']).toMatchObject({ context: 'after' });
+        expect(store.getRetryState().pending).toBe(1);
+    });
+
+    it('waits out an outage instead of spending the repair budget', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '66', metadata: { context: 'before' } }] },
+        });
+        let available = true;
+        let broken = true;
+        const transport = {
+            ...plugin.transport,
+            isAvailable: () => available,
+            async patchMetadata(...args) {
+                if (broken) throw new Error('plugin restart');
+                return plugin.transport.patchMetadata(...args);
+            },
+        };
+        const { store, legacy } = makeStore(transport, 10);
+        await store.useCollection('col-a');
+
+        store.saveMetadata('66', { context: 'after' });
+        await store.flush();
+        expect(store.getRetryState()).toMatchObject({ pending: 1, queued: 1 });
+
+        available = false;
+        const patchesBefore = plugin.calls.patch.length;
+        await store.flush();
+        // A probe-reported outage pauses the repair; no request, no burned attempt.
+        expect(plugin.calls.patch).toHaveLength(patchesBefore);
+        expect(store.getRetryState()).toMatchObject({ pending: 1, queued: 1 });
+
+        available = true;
+        broken = false;
+        await store.flush();
+        expect(plugin.server.get('col-a').get('66')).toMatchObject({ context: 'after' });
+        expect(legacy['66']).toBeUndefined();
+    });
+
+    it('keeps a shared fallback until the other collection\'s repair has used it', async () => {
+        // The legacy settings entry is global per content hash, so two collections
+        // can have repairs pending on the same field. Pruning it on the first
+        // success would erase the second collection's only fallback.
+        const plugin = createFakePlugin({
+            chunksByCollection: {
+                'col-a': [{ hash: '67', metadata: { context: 'before-a' } }],
+                'col-b': [{ hash: '67', metadata: { context: 'before-b' } }],
+            },
+        });
+        const { store, legacy, settings } = makeStore(plugin.transport, 10);
+        legacy['67'] = { context: 'fallback', updatedAt: 111 };
+        upsertRetryRecord(settings, { collectionId: 'col-a', hash: '67', fields: ['context', 'updatedAt'] });
+        upsertRetryRecord(settings, { collectionId: 'col-b', hash: '67', fields: ['context', 'updatedAt'] });
+
+        await store.useCollection('col-a');
+        await store.useCollection('col-b');
+        await store.flush();
+
+        expect(plugin.server.get('col-a').get('67')).toMatchObject({ context: 'fallback' });
+        expect(plugin.server.get('col-b').get('67')).toMatchObject({ context: 'fallback' });
+        expect(legacy['67']).toBeUndefined();
+        expect(store.getRetryState().pending).toBe(0);
+    });
+
+    it('does not throw when the settings save after a repair fails', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '68', metadata: { context: 'before' } }] },
+        });
+        let broken = true;
+        let saveThrows = false;
+        const transport = {
+            ...plugin.transport,
+            async patchMetadata(...args) {
+                if (broken) throw new Error('plugin restart');
+                return plugin.transport.patchMetadata(...args);
+            },
+        };
+        const { store, legacy } = makeStore(transport, 10, () => {
+            if (saveThrows) throw new Error('disk full');
+        });
+        await store.useCollection('col-a');
+
+        store.saveMetadata('68', { context: 'after' });
+        await store.flush();
+        expect(store.getRetryState().pending).toBe(1);
+
+        broken = false;
+        saveThrows = true;
+        await expect(store.flush()).resolves.toBeUndefined();
+
+        // The repair itself completed; only the save of its settings effect failed.
+        expect(legacy['68']).toBeUndefined();
+        expect(store.getRetryState().pending).toBe(0);
+    });
+
+    it('does not send one repair twice when two drains overlap', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '69', metadata: { context: 'before' } }] },
+        });
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        let patchStarted;
+        const started = new Promise((resolve) => { patchStarted = resolve; });
+        let patchCalls = 0;
+        const transport = {
+            ...plugin.transport,
+            async patchMetadata(...args) {
+                patchCalls += 1;
+                patchStarted();
+                await gate;
+                return plugin.transport.patchMetadata(...args);
+            },
+        };
+        const { store, legacy, settings } = makeStore(transport, 10);
+        legacy['69'] = { context: 'after' };
+        upsertRetryRecord(settings, { collectionId: 'col-a', hash: '69', fields: ['context'] });
+        await store.useCollection('col-a');
+
+        const first = store.flush();
+        await started;
+        const second = store.flush();
+        release();
+        await Promise.all([first, second]);
+
+        expect(patchCalls).toBe(1);
+        expect(legacy['69']).toBeUndefined();
+    });
+
+    it('keeps a shared fallback when one collection already holds it on reload', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: {
+                'col-a': [{ hash: '70', metadata: { context: 'fallback' } }],
+                'col-b': [{ hash: '70', metadata: { context: 'before-b' } }],
+            },
+        });
+        const { store, legacy, settings } = makeStore(plugin.transport, 10);
+        legacy['70'] = { context: 'fallback' };
+        upsertRetryRecord(settings, { collectionId: 'col-a', hash: '70', fields: ['context'] });
+        upsertRetryRecord(settings, { collectionId: 'col-b', hash: '70', fields: ['context'] });
+
+        await store.useCollection('col-a');
+        // col-a's payload already agrees, but col-b's repair still reads the
+        // shared fallback; hydrating col-a must not erase it.
+        expect(legacy['70']).toEqual({ context: 'fallback' });
+        expect(store.getRetryState().pending).toBe(1);
+
+        await store.useCollection('col-b');
+        await store.flush();
+
+        expect(plugin.server.get('col-b').get('70')).toMatchObject({ context: 'fallback' });
+        expect(legacy['70']).toBeUndefined();
+        expect(store.getRetryState().pending).toBe(0);
+    });
+
+    it('bounds a repair that keeps disagreeing with a newer fallback', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '71', metadata: { context: 'before' } }] },
+        });
+        // Every accepted write is overwritten by a newer fallback while the
+        // repair is in flight, so the record can never be pruned. It must still
+        // be bounded rather than retried every delay forever.
+        let patches = 0;
+        const transport = {
+            ...plugin.transport,
+            async patchMetadata() {
+                patches += 1;
+                legacy['71'] = { context: `newer-${patches}` };
+            },
+        };
+        const { store, legacy, settings } = makeStore(transport, 10);
+        legacy['71'] = { context: 'after' };
+        upsertRetryRecord(settings, { collectionId: 'col-a', hash: '71', fields: ['context'] });
+        await store.useCollection('col-a');
+
+        for (let i = 0; i < 5; i++) await store.flush();
+
+        expect(patches).toBe(5);
+        expect(store.getRetryState()).toMatchObject({ pending: 1, queued: 0 });
+        // The newest edit is still in settings, waiting for a reload or the sweep.
+        expect(legacy['71']).toEqual({ context: 'newer-5' });
     });
 });
 

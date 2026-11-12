@@ -55,6 +55,9 @@ const _cache = {
  *     cancels and deletes nothing.
  * @param {(filename: string, text: string) => void} [deps.saveFile]
  *     Saves the backup; the panel defaults to a Blob download.
+ * @param {function(): ({ pending: number, cap: number, dropped: number }|null)} [deps.getRetryState]
+ *     The failed-write retry queue's session state, so the storage-health panel
+ *     can report a repair the cap dropped (not just a full queue).
  */
 export function renderSizeInspectorTab(container, getSettings = () => null, deps = {}) {
     const $c = window.jQuery ? window.jQuery(container) : null;

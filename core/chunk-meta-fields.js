@@ -29,6 +29,37 @@ const PAYLOAD_DATA_KEYS = new Set(['hash', 'text', 'index', 'vector']);
 export const BOOKKEEPING_META_FIELDS = ['updatedAt'];
 
 /**
+ * Whether two stored field values are the same value. Metadata values are small
+ * JSON structures (strings, numbers, arrays of keyword objects), so a
+ * serialized comparison is enough; a value that cannot be serialized (a cycle)
+ * is never treated as equal. Shared by the merge/prune paths so "the value did
+ * not change" means one thing.
+ * @param {unknown} left
+ * @param {unknown} right
+ * @returns {boolean}
+ */
+export function sameStoredValue(left, right) {
+    if (left === right) return true;
+    try {
+        return JSON.stringify(left) === JSON.stringify(right);
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * Identity of one chunk's metadata: one hash in one collection. The store's
+ * in-memory maps and the durable retry records must agree on identity, so both
+ * build it here rather than spelling the composite key twice.
+ * @param {string} collectionId
+ * @param {string|number} hash
+ * @returns {string}
+ */
+export function chunkMetadataKey(collectionId, hash) {
+    return `${collectionId}\u0000${hash}`;
+}
+
+/**
  * A chunk's hash, from whichever part of a listing item carries it, as the
  * string every store keys on. Null when the item has no hash (nothing can
  * address it).

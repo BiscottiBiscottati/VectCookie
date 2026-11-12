@@ -18,6 +18,7 @@ import {
     planCollectionChunkMetaGc,
 } from './chunk-meta-collection-gc.js';
 import { chunkHashFromSettingsKey, chunkMetaSettingsKey } from './chunk-meta-keys.js';
+import { sameStoredValue } from './chunk-meta-fields.js';
 import { log } from './log.js';
 
 // ============================================================================
@@ -380,6 +381,34 @@ function mergeLegacyChunkMetadata(hash, fields) {
 }
 
 /**
+ * Removes the fields a successful payload retry superseded from one settings
+ * entry (ticket 09). A field goes only when its stored value still equals the
+ * value the payload accepted, so a newer fallback written while the retry was in
+ * flight is never dropped. The entry itself goes when nothing else remains, so a
+ * client-only field such as `summaries` keeps it in settings.
+ *
+ * No save here: the store issues one save for the whole retry outcome.
+ * @param {string} hash Chunk hash
+ * @param {object} metadata Fields the payload just accepted
+ * @returns {number} How many fields were removed
+ */
+function pruneLegacyChunkMetadata(hash, metadata) {
+    const entry = readLegacyChunkMetadata(hash);
+    if (!entry || typeof entry !== 'object') return 0;
+    let removed = 0;
+    for (const [field, value] of Object.entries(metadata || {})) {
+        if (!Object.prototype.hasOwnProperty.call(entry, field)) continue;
+        if (!sameStoredValue(entry[field], value)) continue;
+        delete entry[field];
+        removed += 1;
+    }
+    if (removed > 0 && Object.keys(entry).length === 0) {
+        removeLegacyChunkMetadata(hash);
+    }
+    return removed;
+}
+
+/**
  * Deletes one legacy settings entry without saving. Callers own persistence:
  * the store's delete path saves after calling this, and the sweep and the
  * orphan deletion remove thousands of entries in one run and save once at the
@@ -430,6 +459,7 @@ const chunkMetaStore = createChunkMetaStore({
     readLegacy: readLegacyChunkMetadata,
     writeLegacy: writeLegacyChunkMetadata,
     mergeLegacy: mergeLegacyChunkMetadata,
+    pruneLegacy: pruneLegacyChunkMetadata,
     deleteLegacy: removeLegacyChunkMetadata,
     listLegacy: listLegacyChunkMetadata,
     persistSettings: () => saveSettingsDebounced(),
@@ -451,8 +481,9 @@ export function getChunkMetadata(hash) {
  * in-memory mirror synchronously and persists asynchronously (coalesced per
  * hash); nothing is written to settings except the fields no payload can carry
  * (client-only `summaries`), so an edit costs one payload write and no settings
- * upload. A payload write that fails is persisted to settings instead (the
- * bounded retry is ticket 09). Without the plugin it writes the settings entry
+ * upload. A payload write that fails is persisted to settings instead and queued
+ * for a bounded retry that repairs the payload and removes the settings copy it
+ * superseded (ticket 09). Without the plugin it writes the settings entry
  * exactly as before.
  * @param {string} hash Chunk hash
  * @param {object} metadata Chunk metadata
@@ -532,6 +563,16 @@ export function isChunkMetaPayloadStore() {
 /** Persists pending payload writes now (page unload, explicit flush). */
 export function flushChunkMetaWrites() {
     return chunkMetaStore.flush();
+}
+
+/**
+ * The failed-write retry queue's observable state (ticket 09): how many payload
+ * repairs are recorded (durable across reloads), how many are scheduled in this
+ * session, the queue's bound, and how many the cap dropped here.
+ * @returns {{ pending: number, queued: number, cap: number, dropped: number }}
+ */
+export function getChunkMetaRetryState() {
+    return chunkMetaStore.getRetryState();
 }
 
 // ============================================================================

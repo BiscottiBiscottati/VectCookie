@@ -16,6 +16,15 @@
  * keyword persistence ask `isPayloadStore` before minting a settings key the
  * payload already holds.
  *
+ * A failed write also records a bounded retry (ticket 09), delegated to
+ * core/chunk-meta-retry-queue.js: a small durable record in settings names the
+ * chunk and the refused fields, and an in-memory queue replays them with
+ * backoff. A successful retry removes the settings copy it superseded. The
+ * records are read back on the next hydration, where the disagreement between
+ * the two stores decides what is already repaired and what is still owed. The
+ * queue is capped; reaching the cap drops the oldest repair and warns rather
+ * than failing silently.
+ *
  * The legacy settings shape (`vectfox_chunk_meta_<hash>`) is defined in
  * core/chunk-meta-keys.js and owned by core/collection-metadata.js, which reaches
  * this module through the injected readLegacy / writeLegacy / mergeLegacy /
@@ -28,18 +37,17 @@ import { log } from './log.js';
 import {
     chunkHashOf,
     chunkMetadataFromPayload,
+    chunkMetadataKey,
     hasValue,
     splitForPayload,
 } from './chunk-meta-fields.js';
 import { listAllChunkItems } from './chunk-paging.js';
+import { createChunkMetaRetrier } from './chunk-meta-retry-queue.js';
+import { RETRY_QUEUE_CAP } from './chunk-meta-retry.js';
 
 /** Chunk hash as used by the public functions (numeric or string). */
 function hashKey(hash) {
     return String(hash);
-}
-
-function queueKey(collectionId, hash) {
-    return `${collectionId}\u0000${hash}`;
 }
 
 /**
@@ -62,6 +70,8 @@ function mergeChunkMetadata(payload, legacy) {
  * @param {() => object|null} [deps.getSettings] - VectFox settings (store policy)
  * @param {(hash: string) => object|null} [deps.readLegacy] - settings entry for a chunk
  * @param {(hash: string, metadata: object) => void} [deps.writeLegacy] - replace settings entry
+ * @param {(hash: string, metadata: object) => number} [deps.pruneLegacy] - remove the fields a
+ *     successful payload retry superseded; returns how many were removed without saving
  * @param {(hash: string) => boolean} [deps.deleteLegacy] - remove settings entry; true when it existed
  * @param {() => object} [deps.listLegacy] - hash -> metadata map from settings
  * @param {() => void} [deps.persistSettings] - persist extension_settings
@@ -69,12 +79,17 @@ function mergeChunkMetadata(payload, legacy) {
  * @param {{ isAvailable: () => boolean, listChunks: Function, patchMetadata: Function }} [deps.transport]
  * @param {number} [deps.debounceMs] - payload write debounce
  * @param {number} [deps.pageSize] - chunks/list page size while hydrating
+ * @param {number} [deps.retryCap] - maximum queued payload repairs
+ * @param {number} [deps.retryMaxAttempts] - automatic attempts per repair before it waits for a reload
+ * @param {number} [deps.retryDelayMs] - first retry delay
+ * @param {number} [deps.retryMaxDelayMs] - retry backoff ceiling
  */
 export function createChunkMetaStore({
     getSettings = () => null,
     readLegacy = () => null,
     writeLegacy = () => {},
     mergeLegacy = () => {},
+    pruneLegacy = () => 0,
     deleteLegacy = () => false,
     listLegacy = () => ({}),
     persistSettings = () => {},
@@ -82,6 +97,10 @@ export function createChunkMetaStore({
     transport = null,
     debounceMs = 2000,
     pageSize = 500,
+    retryCap = RETRY_QUEUE_CAP,
+    retryMaxAttempts = 5,
+    retryDelayMs = 5000,
+    retryMaxDelayMs = 30000,
 } = {}) {
     const clientOnly = new Set(clientOnlyFields);
 
@@ -108,6 +127,25 @@ export function createChunkMetaStore({
             return false;
         }
     }
+
+    // Failed payload writes are replayed by the retry scheduler; the store only
+    // enqueues them and delegates the queue, backoff and reload reconciliation.
+    const retrier = createChunkMetaRetrier({
+        getSettings,
+        readLegacy,
+        pruneLegacy,
+        persistSettings,
+        patchMetadata: async (collectionId, hash, metadata) => {
+            if (!transport) throw new Error('chunk metadata transport is unavailable');
+            await transport.patchMetadata(collectionId, hash, metadata);
+        },
+        shouldRepair: () => mode() === 'payload',
+        warn: (message) => log.warn(`VectFox: ${message}`),
+        cap: retryCap,
+        maxAttempts: retryMaxAttempts,
+        delayMs: retryDelayMs,
+        maxDelayMs: retryMaxDelayMs,
+    });
 
     /**
      * `auto` (default) uses the payload when the plugin transport is reachable and
@@ -158,7 +196,7 @@ export function createChunkMetaStore({
 
     /** Drops the write guards for one collection once its snapshot is applied. */
     function clearLocalWrites(collectionId) {
-        const prefix = `${collectionId}\u0000`;
+        const prefix = chunkMetadataKey(collectionId, '');
         for (const key of [...locallyWritten]) {
             if (key.startsWith(prefix)) locallyWritten.delete(key);
         }
@@ -195,14 +233,16 @@ export function createChunkMetaStore({
                 if (existing) {
                     // Keep edits made while the hydration was in flight.
                     for (const [key, value] of existing) {
-                        if (locallyWritten.has(queueKey(id, key))) byHash.set(key, value);
+                        if (locallyWritten.has(chunkMetadataKey(id, key))) byHash.set(key, value);
                     }
                 }
                 let withMetadata = 0;
+                const presentHashes = new Set();
                 for (const item of items) {
                     const key = chunkHashOf(item);
                     if (key === null) continue;
-                    if (locallyWritten.has(queueKey(id, key))) continue;
+                    presentHashes.add(key);
+                    if (locallyWritten.has(chunkMetadataKey(id, key))) continue;
                     const metadata = chunkMetadataFromPayload(item?.metadata);
                     // A payload with no metadata of its own is not an entry; reads
                     // keep falling back to settings for that chunk.
@@ -215,7 +255,12 @@ export function createChunkMetaStore({
                 // native hashes-only fallback, not a hydrated collection. Marking
                 // it hydrated would leave payload reads dead for the session.
                 trusted = items.length === 0 || withMetadata > 0;
-                if (trusted) hydrated.add(id);
+                if (trusted) {
+                    hydrated.add(id);
+                    // Reload reconciliation (ticket 09): the durable records plus
+                    // this snapshot say which failed writes the payload still owes.
+                    retrier.rebuild(id, presentHashes, hash => mirror.get(id)?.get(hash) || {});
+                }
                 return trusted;
             } catch (err) {
                 log.warn(`VectFox: chunk metadata hydration failed for ${id} — keeping the settings fallback: ${err?.message || err}`);
@@ -252,7 +297,7 @@ export function createChunkMetaStore({
     }
 
     function queuePayloadWrite(collectionId, hash, metadata) {
-        const key = queueKey(collectionId, hashKey(hash));
+        const key = chunkMetadataKey(collectionId, hashKey(hash));
         locallyWritten.add(key);
         const existing = pending.get(key);
         if (existing?.timer) clearTimeout(existing.timer);
@@ -287,9 +332,9 @@ export function createChunkMetaStore({
                 // no copy of it — so until this runs, the change exists only in
                 // memory. Persist the refused fields to settings: the read path
                 // merges payload-first per field, so they are served immediately and
-                // survive a reload instead of vanishing with the mirror. The
-                // bounded retry that repairs the payload and drops this copy is
-                // ticket 09.
+                // survive a reload instead of vanishing with the mirror. Ticket 09
+                // adds the durable record and the bounded retry that repairs the
+                // payload and removes this copy again once it succeeds.
                 log.warn(`VectFox: chunk metadata payload write failed for ${entry.collectionId}/${entry.hash}: ${err?.message || err}`);
                 // The mirror entry is the "is this chunk still wanted" check: a
                 // chunk deleted (or a store reset) while the write was in flight
@@ -297,6 +342,7 @@ export function createChunkMetaStore({
                 // this feature exists to remove.
                 if (mirror.get(String(entry.collectionId))?.has(hashKey(entry.hash))) {
                     mergeLegacy(entry.hash, entry.metadata);
+                    retrier.enqueue(entry.collectionId, entry.hash, Object.keys(entry.metadata || {}));
                     persistSettings();
                 }
             } finally {
@@ -376,13 +422,16 @@ export function createChunkMetaStore({
             pending.delete(pendingKey);
             locallyWritten.delete(pendingKey);
         }
+        // A repair queued for a deleted chunk would write metadata the backend no
+        // longer has; drop it too. Its settings entry is the caller's business.
+        retrier.forgetChunks(activeCollectionId, keys);
     }
 
     /**
      * Drops every trace of a deleted collection: its mirror, its hydration state
-     * and its queued payload writes. An in-flight hydration is ignored when it
-     * lands (`forgotten`), and a failed write can no longer mint a settings entry
-     * for it (the failure path checks the mirror).
+     * and its queued payload writes and repairs. An in-flight hydration is ignored
+     * when it lands (`forgotten`), and a failed write can no longer mint a
+     * settings entry for it (the failure path checks the mirror).
      * @param {string} collectionId Deleted collection's key
      */
     function forgetCollection(collectionId) {
@@ -392,13 +441,14 @@ export function createChunkMetaStore({
         mirror.delete(id);
         hydrated.delete(id);
         hydrating.delete(id);
-        const prefix = `${id}\u0000`;
+        const prefix = chunkMetadataKey(id, '');
         for (const [key, entry] of [...pending]) {
             if (!key.startsWith(prefix)) continue;
             if (entry.timer) clearTimeout(entry.timer);
             pending.delete(key);
             locallyWritten.delete(key);
         }
+        retrier.forgetCollection(id);
     }
 
     /**
@@ -462,6 +512,14 @@ export function createChunkMetaStore({
             await Promise.all(keys.map(flushOne));
         }
         await Promise.all([...inFlight.values()]);
+        // Then replay every recorded repair, forcing past its backoff: a flush
+        // means "finish the pending work now", and a repair that cannot succeed
+        // stays recorded for the next hydration.
+        await retrier.drain({ force: true });
+    }
+
+    function getRetryState() {
+        return retrier.state();
     }
 
     function reset() {
@@ -475,6 +533,7 @@ export function createChunkMetaStore({
         hydrated.clear();
         hydrating.clear();
         forgotten.clear();
+        retrier.reset();
         activeCollectionId = null;
     }
 
@@ -488,6 +547,7 @@ export function createChunkMetaStore({
         forgetCollection,
         listCollectionHashes,
         isPayloadStore,
+        getRetryState,
         flush,
         reset,
         configure: ({ transport: nextTransport } = {}) => {

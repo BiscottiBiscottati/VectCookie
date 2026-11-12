@@ -14,6 +14,11 @@
 import { describe, it, expect } from 'vitest';
 
 import { buildStorageHealth } from '../core/storage-health.js';
+import {
+    PENDING_RETRY_KEY,
+    RETRY_QUEUE_CAP,
+    upsertRetryRecord,
+} from '../core/chunk-meta-retry.js';
 import { settingsByteSize } from './fixtures/settings-bytes.js';
 
 /**
@@ -118,6 +123,83 @@ describe('storage health — chunk-metadata entries', () => {
         expect(view.chunkMeta.count).toBe(0);
         expect(view.chunkMeta.countLabel).toBe('0');
         expect(view.chunkMeta.sizeLabel).toBe('0 B');
+    });
+});
+
+describe('storage health — failed-write retry queue', () => {
+    /** Settings carrying `count` pending payload repairs. */
+    function withRetryRecords(count) {
+        const settings = { chunk_size: 500 };
+        for (let i = 0; i < count; i++) {
+            upsertRetryRecord(settings, { collectionId: 'col-a', hash: String(i), fields: ['context'] });
+        }
+        return settings;
+    }
+
+    it('reports an empty queue on a healthy install', () => {
+        const view = buildStorageHealth({ chunk_size: 500 });
+
+        expect(view.retry).toMatchObject({ pending: 0, cap: RETRY_QUEUE_CAP });
+        expect(view.retry.depthLabel).toBe(`0 of ${RETRY_QUEUE_CAP}`);
+        expect(view.retry.warning).toBeNull();
+    });
+
+    it('reports the depth of the pending payload repairs', () => {
+        const view = buildStorageHealth(withRetryRecords(3));
+
+        expect(view.retry.pending).toBe(3);
+        expect(view.retry.depthLabel).toBe(`3 of ${RETRY_QUEUE_CAP}`);
+        expect(view.retry.detail).toContain('3 edits');
+        expect(view.retry.warning).toBeNull();
+    });
+
+    it('says one edit, not one edits', () => {
+        const view = buildStorageHealth(withRetryRecords(1));
+
+        expect(view.retry.detail).toContain('1 edit');
+        expect(view.retry.detail).not.toContain('1 edits');
+    });
+
+    it('warns when the bounded queue is full', () => {
+        const view = buildStorageHealth(withRetryRecords(RETRY_QUEUE_CAP));
+
+        expect(view.retry.pending).toBe(RETRY_QUEUE_CAP);
+        expect(view.retry.warning).toContain('full');
+        expect(view.retry.warning).toContain(`${RETRY_QUEUE_CAP} of ${RETRY_QUEUE_CAP}`);
+        // A full queue has not dropped anything yet; the warning must not say it has.
+        expect(view.retry.warning).not.toContain('and dropped');
+    });
+
+    it('reports a repair the cap actually dropped, from the store\'s session state', () => {
+        const view = buildStorageHealth(withRetryRecords(2), {
+            retryState: { pending: 2, cap: RETRY_QUEUE_CAP, dropped: 1 },
+        });
+
+        expect(view.retry.dropped).toBe(1);
+        expect(view.retry.warning).toContain('dropped 1 pending repair');
+        expect(view.retry.warning).toContain('stay in settings');
+    });
+
+    it('does not report a drop when the session reports none', () => {
+        const view = buildStorageHealth(withRetryRecords(2), {
+            retryState: { pending: 2, cap: RETRY_QUEUE_CAP, dropped: 0 },
+        });
+
+        expect(view.retry.dropped).toBe(0);
+        expect(view.retry.warning).toBeNull();
+    });
+
+    it('ignores a malformed queue rather than counting it', () => {
+        const view = buildStorageHealth({ [PENDING_RETRY_KEY]: { records: 'not a list' } });
+
+        expect(view.retry.pending).toBe(0);
+    });
+
+    it('reports an empty queue when the settings are unavailable', () => {
+        const view = buildStorageHealth(null);
+
+        expect(view.status).toBe('unavailable');
+        expect(view.retry).toMatchObject({ pending: 0, cap: RETRY_QUEUE_CAP });
     });
 });
 

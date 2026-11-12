@@ -94,6 +94,7 @@ import { createPluginChunkTransport } from "../core/chunk-meta-transport.js";
 import { getSweepStamp, setSweepStamp } from "../core/chunk-meta-sweep-execute.js";
 import {
   CLIENT_ONLY_CHUNK_FIELDS,
+  getChunkMetaRetryState,
   listLegacyChunkMetadata,
   removeLegacyChunkMetadata,
 } from "../core/collection-metadata.js";
@@ -834,6 +835,9 @@ function switchTab(tabName) {
         // The dialog lives in its own module so the panel imports no host
         // module; a build without it fails closed (the run cancels).
         confirmOrphans: confirmOrphanDeletion,
+        // Session state of the failed-write retry queue: the durable depth is
+        // measured from settings, and the drop count is only known here.
+        getRetryState: () => getChunkMetaRetryState(),
       },
     );
   }

@@ -114,6 +114,10 @@ function setActionsBusy(container, busy) {
  * @param {(filename: string, text: string) => (boolean|void)} [deps.saveFile]
  *     Saves the backup; returns false when it cannot. Defaults to a Blob
  *     download; injected so tests can observe the file without one.
+ * @param {function(): ({ pending: number, cap: number, dropped: number }|null)} [deps.getRetryState]
+ *     The failed-write retry queue's session state. The durable depth is measured
+ *     from settings; the drop count lives only in the store, so the panel cannot
+ *     report a dropped repair without it.
  * @returns {object|null} The view model rendered, or null without a mount point.
  */
 export function renderStorageHealthPanel(container, getSettings, deps = {}) {
@@ -121,7 +125,9 @@ export function renderStorageHealthPanel(container, getSettings, deps = {}) {
     if (!container) return null;
 
     const settings = getSettings?.();
-    const view = buildStorageHealth(settings);
+    const view = buildStorageHealth(settings, {
+        retryState: deps.getRetryState?.() ?? null,
+    });
     const report = dryRunReports.get(container) || null;
     const sweep = sweepResults.get(container) || null;
     const orphan = orphanResults.get(container) || null;
@@ -505,8 +511,14 @@ function storageHealthHtml(
                 <span class="vectfox-size-health-value">${StringUtils.escapeHtml(view.chunkMeta.sizeLabel)}</span>
                 <span class="vectfox-size-health-detail">${StringUtils.escapeHtml(formatEntryCount(view.chunkMeta.count))}</span>
             </div>
+            <div class="vectfox-size-health-item" data-health="retry">
+                <span class="vectfox-size-health-label">Retry queue</span>
+                <span class="vectfox-size-health-value">${StringUtils.escapeHtml(view.retry.depthLabel)}</span>
+                <span class="vectfox-size-health-detail">${StringUtils.escapeHtml(view.retry.detail)}</span>
+            </div>
         </div>
         ${view.warning ? `<div class="vectfox-size-health-warning" data-health="warning">${StringUtils.escapeHtml(view.warning)}</div>` : ""}
+        ${view.retry.warning ? `<div class="vectfox-size-health-warning" data-health="retry-warning">${StringUtils.escapeHtml(view.retry.warning)}</div>` : ""}
         <div class="vectfox-size-table-scroll">
             <table class="vectfox-size-table vectfox-size-health-table">
                 <thead>

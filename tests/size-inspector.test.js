@@ -38,6 +38,7 @@ import {
 import { getSweepStamp, setSweepStamp } from '../core/chunk-meta-sweep-execute.js';
 import { createFakeChunkListing } from './fixtures/chunk-listing.js';
 import { settingsByteSize } from './fixtures/settings-bytes.js';
+import { RETRY_QUEUE_CAP, upsertRetryRecord } from '../core/chunk-meta-retry.js';
 
 /**
  * Just enough jQuery for the render path: mount, template write, event rebind.
@@ -218,6 +219,58 @@ describe("Size Inspector — storage health on open", () => {
         health.querySelector("#vectfox_size_health_refresh").click();
 
         expect(health.querySelector('[data-health="settings-size"]')).not.toBeNull();
+    });
+});
+
+/**
+ * Settings carrying pending payload repairs (ticket 09): the durable records the
+ * failed-write retry queue keeps, built through the shape's owner.
+ */
+function withRetryRecords(count) {
+    const settings = { chunk_size: 500 };
+    for (let i = 0; i < count; i++) {
+        upsertRetryRecord(settings, { collectionId: 'col-a', hash: String(i), fields: ['context'] });
+    }
+    return settings;
+}
+
+describe("Size Inspector — the failed-write retry queue", () => {
+    it("shows how many payload repairs are pending", () => {
+        const retry = healthOf(openTab(withRetryRecords(3)))
+            .querySelector('[data-health="retry"]');
+
+        expect(retry).not.toBeNull();
+        expect(retry.textContent).toContain("Retry queue");
+        expect(retry.textContent).toContain(`3 of ${RETRY_QUEUE_CAP}`);
+        expect(retry.textContent).toContain("3 edits");
+    });
+
+    it("warns when the bounded queue is full instead of letting it sit silently", () => {
+        const health = healthOf(openTab(withRetryRecords(RETRY_QUEUE_CAP)));
+
+        const warning = health.querySelector('[data-health="retry-warning"]');
+        expect(warning).not.toBeNull();
+        expect(warning.textContent).toContain("full");
+        expect(warning.textContent).toContain(`${RETRY_QUEUE_CAP} of ${RETRY_QUEUE_CAP}`);
+    });
+
+    it("reports a repair the cap dropped, from the injected store state", () => {
+        const health = healthOf(openTab({ chunk_size: 500 }, {
+            getRetryState: () => ({ pending: 0, cap: RETRY_QUEUE_CAP, dropped: 1 }),
+        }));
+
+        const warning = health.querySelector('[data-health="retry-warning"]');
+        expect(warning).not.toBeNull();
+        expect(warning.textContent).toContain("dropped 1 pending repair");
+        expect(warning.textContent).toContain("stay in settings");
+    });
+
+    it("keeps the queue at zero and quiet while nothing is pending", () => {
+        const health = healthOf(openTab({ chunk_size: 500 }));
+
+        expect(health.querySelector('[data-health="retry"]').textContent)
+            .toContain(`0 of ${RETRY_QUEUE_CAP}`);
+        expect(health.querySelector('[data-health="retry-warning"]')).toBeNull();
     });
 });
 
