@@ -14,7 +14,7 @@
 import {
     getChunkMetadata,
     saveChunkMetadata,
-    deleteChunkMetadata,
+    deleteChunkMetadataForCollection,
     useChunkMetaCollection,
     CLIENT_ONLY_CHUNK_FIELDS,
 } from '../core/collection-metadata.js';
@@ -1194,8 +1194,10 @@ function bindDetailEvents() {
 
             // Backend fields were carried onto the new point above (Phase B: backend is the
             // source of truth). In ext_settings, only migrate client-only state (summaries)
-            // to the new hash and drop the old entry.
-            deleteChunkMetadata(String(chunk.hash));
+            // to the new hash. The old hash's entry is dropped through the collection-scoped
+            // cleanup, not a bare delete: the same text may still live in another collection,
+            // whose copy this edit must not strip (ticket 08, user story 15).
+            await deleteChunkMetadataForCollection(currentCollectionId, { hashes: [String(chunk.hash)] });
             const carriedClientOnly = {};
             for (const k of CLIENT_ONLY_CHUNK_FIELDS) {
                 if (k in oldStored) carriedClientOnly[k] = oldStored[k];
@@ -1460,8 +1462,10 @@ function openTextEditor(chunk) {
 
             // Backend fields were carried onto the new point above (Phase B: backend is the
             // source of truth). In ext_settings, only migrate client-only state (summaries)
-            // to the new hash and drop the old entry.
-            deleteChunkMetadata(String(chunk.hash));
+            // to the new hash. The old hash's entry is dropped through the collection-scoped
+            // cleanup, not a bare delete: the same text may still live in another collection,
+            // whose copy this edit must not strip (ticket 08, user story 15).
+            await deleteChunkMetadataForCollection(currentCollectionId, { hashes: [String(chunk.hash)] });
             const carriedClientOnly = {};
             for (const k of CLIENT_ONLY_CHUNK_FIELDS) {
                 if (k in oldStored) carriedClientOnly[k] = oldStored[k];
@@ -1667,7 +1671,10 @@ async function deleteChunk(chunk) {
 
     try {
         await deleteVectorItems(currentCollectionId, [chunk.hash], currentSettings);
-        deleteChunkMetadata(chunk.hash);
+        // Both stores: the point above just removed the payload, and this removes
+        // the settings copy — unless another collection still holds the same text,
+        // in which case that collection's metadata stays readable.
+        await deleteChunkMetadataForCollection(currentCollectionId, { hashes: [chunk.hash] });
 
         // Remove from local state by uniqueId
         const idx = allChunks.findIndex(c => c.uniqueId === chunk.uniqueId);
@@ -1701,8 +1708,8 @@ async function bulkDelete() {
     try {
         const hashes = targets.map(c => c.hash);
         await deleteVectorItems(currentCollectionId, hashes, currentSettings);
+        await deleteChunkMetadataForCollection(currentCollectionId, { hashes });
         for (const chunk of targets) {
-            deleteChunkMetadata(chunk.hash);
             const idx = allChunks.findIndex(c => c.uniqueId === chunk.uniqueId);
             if (idx !== -1) allChunks.splice(idx, 1);
         }

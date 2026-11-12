@@ -41,6 +41,18 @@ export function chunkHashOf(item) {
 }
 
 /**
+ * A collection's identity for scanning: its registry key (`backend:collectionId`)
+ * when the registry form is known, its bare id otherwise. Registry key, not bare
+ * id, because the same collection id can exist on two backends and two entries
+ * must never be collapsed into one scan or one report row.
+ * @param {{ registryKey?: string, collectionId?: string }|null|undefined} collection
+ * @returns {string}
+ */
+export function collectionKeyOf(collection) {
+    return String(collection?.registryKey || collection?.collectionId || '');
+}
+
+/**
  * A chunk's metadata, with payload data keys removed. Shared by hydration and
  * by the sweep scan so both see the same field set.
  * @param {object|null|undefined} rawMetadata Payload metadata as the backend returns it.

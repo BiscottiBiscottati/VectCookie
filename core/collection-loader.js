@@ -19,6 +19,7 @@ import {
     getChunkMetadata,
     saveChunkMetadata,
     deleteChunkMetadata,
+    deleteChunkMetadataForCollection,
     deleteCollectionMeta,
     ensureCollectionMeta,
     getCollectionMeta,
@@ -329,15 +330,44 @@ export async function deleteCollection(collectionId, settings, registryKey = nul
 
     log.verbose(`VectFox: Deleting collection ${collectionId} (registry key: ${registryKey || collectionId})`);
 
-    // Step 1: Delete vectors from backend (most important - actual data).
-    // purgeVectorIndex logs its own error and returns false instead of throwing.
-    // Registry/metadata cleanup continues either way.
-    if (await purgeVectorIndex(collectionId, settings)) {
-        vectorsDeleted = true;
-        log.verbose(`VectFox: ✓ Deleted vectors for ${collectionId}`);
-    } else {
-        errors.push('Vectors: purge failed (see console)');
-        log.warn(`VectFox: ✗ Failed to delete vectors for ${collectionId}`);
+    // Step 1: Delete vectors from backend (most important - actual data) and
+    // remove that collection's chunk metadata from both stores. The cleanup runs
+    // inside the deletion, not the UI click, so every caller — the DB browser,
+    // ghost cleanup — gets it. It reads the collection's chunk hashes before the
+    // purge, because afterwards there is nothing left to compare them with, and
+    // it keeps another collection's copy of the same text. purgeVectorIndex logs
+    // its own error and returns false instead of throwing, and a refused purge
+    // keeps the metadata: the collection still exists.
+    let chunkMeta = null;
+    let purgeRan = false;
+    const purge = async () => {
+        purgeRan = true;
+        return purgeVectorIndex(collectionId, settings);
+    };
+    try {
+        chunkMeta = await deleteChunkMetadataForCollection(registryKey || collectionId, { purge });
+        vectorsDeleted = chunkMeta.purged === true;
+        if (vectorsDeleted) {
+            log.verbose(`VectFox: ✓ Deleted vectors for ${collectionId}`);
+            if (chunkMeta.counts.deleted > 0) {
+                log.lifecycle(`VectFox: Removed ${chunkMeta.counts.deleted} chunk-metadata ${chunkMeta.counts.deleted === 1 ? 'entry' : 'entries'} for ${collectionId}`);
+            }
+        } else {
+            errors.push('Vectors: purge failed (see console)');
+            log.warn(`VectFox: ✗ Failed to delete vectors for ${collectionId}`);
+        }
+        if (chunkMeta.status === 'refused' && chunkMeta.reason !== 'purge-failed') {
+            // The vectors are gone but some chunk metadata was kept: the result
+            // must say so, or the next dry run is the only trace of the leftover.
+            errors.push(`Chunk metadata: cleanup refused (${chunkMeta.reason})`);
+            log.warn(`VectFox: kept chunk metadata for ${collectionId} — ${chunkMeta.reason}`);
+        }
+    } catch (error) {
+        // The cleanup reports its own failures; reaching this means something
+        // unexpected. Never let it stop the deletion, and never purge twice.
+        errors.push(`Chunk metadata: ${error.message}`);
+        log.error(`VectFox: chunk-metadata cleanup for ${collectionId} failed:`, error);
+        if (!purgeRan) vectorsDeleted = (await purge()) === true;
     }
 
     // Step 2: Unregister from registry (try both formats)
@@ -387,7 +417,13 @@ export async function deleteCollection(collectionId, settings, registryKey = nul
         }
     }
 
-    const success = vectorsDeleted && registryDeleted && metadataDeleted;
+    // A refused chunk-metadata cleanup means stale settings copies survive this
+    // deletion: report it as partial, or the UI toast says "Deleted collection" and
+    // the leftover is only visible to whoever reads the console.
+    const chunkMetadataDeleted = !chunkMeta
+        || chunkMeta.status === 'empty'
+        || chunkMeta.status === 'complete';
+    const success = vectorsDeleted && registryDeleted && metadataDeleted && chunkMetadataDeleted;
 
     if (success) {
         log.verbose(`VectFox: ✓ Fully deleted collection ${collectionId}`);
@@ -936,27 +972,65 @@ export async function cleanupCorruptedCollections() {
         log.lifecycle(`VECTFOX cleanup: purging ${targets.length} collection(s) (${result.corruption} corrupted, ${result.stFile} ST-native file)`);
 
         for (const target of targets) {
-            try {
-                const purgeResp = await fetch('/api/plugins/similharity/chunks/purge', {
-                    method: 'POST',
-                    headers: getRequestHeaders(),
-                    body: JSON.stringify({
-                        backend: target.backend,
-                        collectionId: target.collectionId,
-                        source: target.source,
-                    }),
-                });
+            let purgeError = null;
+            const purgeOnDisk = async () => {
+                try {
+                    const purgeResp = await fetch('/api/plugins/similharity/chunks/purge', {
+                        method: 'POST',
+                        headers: getRequestHeaders(),
+                        body: JSON.stringify({
+                            backend: target.backend,
+                            collectionId: target.collectionId,
+                            source: target.source,
+                        }),
+                    });
 
-                if (!purgeResp.ok) {
-                    const body = await purgeResp.text().catch(() => '');
-                    throw new Error(`HTTP ${purgeResp.status}: ${body.substring(0, 200)}`);
+                    if (!purgeResp.ok) {
+                        const body = await purgeResp.text().catch(() => '');
+                        purgeError = `HTTP ${purgeResp.status}: ${body.substring(0, 200)}`;
+                        return false;
+                    }
+                    return true;
+                } catch (err) {
+                    purgeError = err.message;
+                    throw err;
+                }
+            };
+
+            try {
+                // This is a complete deletion of a collection that VectFox never
+                // had a normal UI path for (corrupted prefix stacks and ST-native
+                // file attachments). Its per-chunk metadata goes with it — the
+                // cleanup runs the same collection-scoped GC as every other delete,
+                // and only after the on-disk purge succeeded.
+                //
+                // The GC takes the routing form (`backend:collectionId`), not the
+                // three-part display key above: the transport parses the prefix and
+                // would otherwise look for a collection named `source:collectionId`.
+                const chunkMeta = await deleteChunkMetadataForCollection(
+                    `${target.backend}:${target.collectionId}`,
+                    { purge: purgeOnDisk },
+                );
+                if (chunkMeta.purged !== true) {
+                    throw new Error(purgeError || 'the plugin refused the purge');
                 }
 
                 // Drop from registry too
                 unregisterCollection(target.registryKey);
 
-                result.purged.push({ key: target.registryKey, ok: true });
-                log.verbose(`   ✅ Purged ${target.registryKey} (${target.reason})`);
+                // A refused metadata cleanup still purged the collection, but the
+                // kept copy must not read as fully cleaned.
+                const keptMetadata = chunkMeta.status === 'refused'
+                    && chunkMeta.reason !== 'purge-failed'
+                    ? chunkMeta.reason
+                    : null;
+                if (keptMetadata) {
+                    result.purged.push({ key: target.registryKey, ok: true, metadataKept: keptMetadata });
+                    log.warn(`   ⚠️ Purged ${target.registryKey} but kept its chunk metadata (${keptMetadata})`);
+                } else {
+                    result.purged.push({ key: target.registryKey, ok: true });
+                    log.verbose(`   ✅ Purged ${target.registryKey} (${target.reason})`);
+                }
             } catch (err) {
                 result.purged.push({ key: target.registryKey, ok: false, error: err.message });
                 log.warn(`   ❌ Failed to purge ${target.registryKey}: ${err.message}`);

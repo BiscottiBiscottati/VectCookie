@@ -13,6 +13,10 @@ import { extension_settings, getContext } from '../../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../../script.js';
 import { parseRegistryKey, COLLECTION_PREFIXES, parseCollectionId, sanitizeHandleId } from './collection-ids.js';
 import { createChunkMetaStore } from './chunk-meta-store.js';
+import {
+    executeCollectionChunkMetaGc,
+    planCollectionChunkMetaGc,
+} from './chunk-meta-collection-gc.js';
 import { chunkHashFromSettingsKey, chunkMetaSettingsKey } from './chunk-meta-keys.js';
 import { log } from './log.js';
 
@@ -478,9 +482,15 @@ export function getAllChunkMetadata() {
  * Injects the plugin transport (core/chunk-meta-transport.js). Until this is
  * called, the `auto` policy resolves to settings, so installs without the plugin
  * keep their previous behaviour.
- * @param {{ transport: object }} [options]
+ *
+ * `listCollections` is the read-only registry listing the collection garbage
+ * collection reads to prove whether another collection still holds a deleted
+ * chunk's text (core/collection-loader.js owns the registry; the wiring injects
+ * it here so this module does not import the loader back).
+ * @param {{ transport?: object|null, listCollections?: Function|null }} [options]
  */
-export function configureChunkMetaStore({ transport } = {}) {
+export function configureChunkMetaStore({ transport, listCollections } = {}) {
+    if (listCollections !== undefined) chunkMetaListCollections = listCollections;
     chunkMetaStore.configure({ transport });
 }
 
@@ -523,6 +533,276 @@ export function isChunkMetaPayloadStore() {
 export function flushChunkMetaWrites() {
     return chunkMetaStore.flush();
 }
+
+// ============================================================================
+// CHUNK-METADATA GARBAGE COLLECTION (collection / chunk deletion)
+// ============================================================================
+// Ticket 08: a normal delete must not create an orphan. Deleting a collection,
+// purging it, or deleting one chunk in the visualizer removes that chunk
+// metadata from both stores — but only the copies the deletion actually killed:
+//
+//   - settings entries are keyed by content-derived hash, shared with every
+//     collection that holds the same text, so an entry is removed only when no
+//     other registered collection still holds its chunk;
+//   - an entry is a candidate only when its hash was in the collection being
+//     deleted (or is one of the deleted chunk's hashes), so the pre-existing
+//     orphans the dry run reports are not swept up by an unrelated delete;
+//   - a collection that cannot be listed blocks every removal: absence in a
+//     listing that never finished is not proof. That mirrors the sweep's outage
+//     guard, and it is why `chunks` reads happen *before* the backend deletion:
+//     afterwards the collection is gone and there is nothing left to compare.
+//
+// The payload side needs no writes: the backend delete already removed the
+// payload, so the store only drops its mirror (and any queued patch) for what is
+// gone. One settings save follows a run that removed something; a run that
+// removed nothing saves nothing.
+
+/** Reads the registered collections; injected by index.js with the transport. */
+let chunkMetaListCollections = null;
+
+/** Every key a deleted collection may be held under (registry key and bare id). */
+function collectionKeysOf(collectionKey) {
+    const key = String(collectionKey || '');
+    if (!key) return [];
+    const bare = parseRegistryKey(key).collectionId;
+    return bare && bare !== key ? [key, bare] : [key];
+}
+
+/**
+ * The registry context for a deletion: everything registered, the collections
+ * that are not the deleted one, and whether the registry could be read at all.
+ *
+ * The deleted collection is excluded so a completed purge (which leaves it
+ * unlistable) cannot refuse the run by failing its own scan. Exclusion is by
+ * registry key, never by bare id alone: the same collection id can exist on two
+ * backends, and hiding both would let a live collection's metadata be deleted. A
+ * bare key that matches several registrations is therefore not excluded at all;
+ * that never deletes more (a still-existing copy keeps the entry), but the
+ * already-purged copy can then fail its scan and veto the run. Callers that know
+ * the registry key form should pass it.
+ *
+ * @param {string} collectionKey Registry key or bare id
+ * @returns {{
+ *   available: boolean,
+ *   registered: Array<{ registryKey: string, collectionId: string }>,
+ *   others: Array<{ registryKey: string, collectionId: string }>,
+ * }}
+ */
+function registryContextFor(collectionKey) {
+    if (typeof chunkMetaListCollections !== 'function') {
+        return { available: false, registered: [], others: [] };
+    }
+    const key = String(collectionKey || '');
+    const registered = (chunkMetaListCollections(extension_settings?.vectfox || null) || [])
+        .filter(collection => collection?.registryKey);
+    let deleted;
+    if (parseRegistryKey(key).backend) {
+        deleted = new Set([key]);
+    } else {
+        const matches = registered.filter(collection => (
+            collection.registryKey === key
+            || String(collection.collectionId || '') === key
+        ));
+        deleted = matches.length === 1 ? new Set([matches[0].registryKey]) : new Set();
+    }
+    return {
+        available: true,
+        registered,
+        others: registered.filter(collection => !deleted.has(collection.registryKey)),
+    };
+}
+
+/**
+ * The `hashes` option as a de-duplicated list, or null for a whole-collection
+ * deletion.
+ * @param {Iterable<string|number>|string|null|undefined} hashes
+ * @returns {string[]|null}
+ */
+function chunkHashesArgument(hashes) {
+    if (hashes === null || hashes === undefined) return null;
+    const list = typeof hashes === 'string' ? [hashes] : [...hashes];
+    return [...new Set(list.map(String).filter(hash => hash.length > 0))];
+}
+
+/**
+ * Removes the chunk metadata of a deletion from both stores.
+ *
+ * Call it with `purge` for a whole-collection deletion: the collection's chunks
+ * are read first (that is the only chance to learn what it held), then the
+ * backend deletion runs, and only a successful one lets anything be removed.
+ * Call it with `hashes` for chunks already deleted from a collection (the
+ * visualizer's delete), where there is no backend step left to run.
+ *
+ * Nothing is removed unless the registry proves no other collection still holds
+ * the text: an unreadable or empty registry, or any unlistable registered
+ * collection, refuses the cleanup instead. The entries then stay behind for the
+ * dry run, which reports them; deleting them on an unverified guess could destroy
+ * metadata another collection still reads.
+ *
+ * Never throws for a backend or store failure: it reports a status instead, so a
+ * failed cleanup can never turn a completed deletion into an error.
+ *
+ * @param {string} collectionKey The collection being deleted, or the collection
+ *     the chunks were deleted from. Registry key or bare id.
+ * @param {object} [options]
+ * @param {Iterable<string|number>|string|null} [options.hashes]
+ *     The chunks that are gone. Omit for a whole-collection deletion.
+ * @param {(() => Promise<boolean|void>)|null} [options.purge]
+ *     The backend deletion to run between reading the collection and removing
+ *     its metadata. Resolving `false` means the backend refused: the collection
+ *     still exists, so nothing is removed and the mirror is kept. A throwing
+ *     purge counts as refused.
+ * @returns {Promise<{
+ *   status: 'empty'|'refused'|'complete'|'aborted',
+ *   purged: boolean|null,
+ *   reason: 'registry-unavailable'|'registry-empty'|'collection-unlisted'|
+ *     'collections-unverified'|'purge-failed'|null,
+ *   counts: { candidates: number, deleted: number, skipped: number, shared: number, unverified: number },
+ *   error: string|null,
+ *   saveError: string|null,
+ * }>}
+ */
+export async function deleteChunkMetadataForCollection(collectionKey, {
+    hashes = null,
+    purge = null,
+} = {}) {
+    const key = String(collectionKey || '');
+    const explicit = chunkHashesArgument(hashes);
+    const wholeCollection = explicit === null;
+    const result = {
+        status: 'empty',
+        purged: null,
+        reason: null,
+        counts: { candidates: 0, deleted: 0, skipped: 0, shared: 0, unverified: 0 },
+        error: null,
+        saveError: null,
+    };
+    if (wholeCollection && !key) return result;
+
+    const runPurge = async () => {
+        if (typeof purge !== 'function') return null;
+        try {
+            return (await purge()) !== false;
+        } catch (error) {
+            log.warn(`VectFox: the backend deletion for ${key || 'the collection'} failed — keeping its chunk metadata: ${error?.message || error}`);
+            return false;
+        }
+    };
+
+    // The collection is gone (or was never deleted): drop the payload side. A
+    // refused purge means it still exists, so its mirror stays valid.
+    const releasePayloadSide = () => {
+        if (wholeCollection) {
+            for (const id of collectionKeysOf(key)) chunkMetaStore.forgetCollection(id);
+        } else {
+            chunkMetaStore.forgetChunks(explicit);
+        }
+    };
+
+    // A refusal leaves the settings entries in place; say why, because the size
+    // not dropping is otherwise indistinguishable from a no-op.
+    const refuse = (reason) => {
+        result.status = 'refused';
+        result.reason = reason;
+        log.warn(`VectFox: chunk-metadata cleanup for ${key || 'the deleted collection'} removed nothing (${reason}) — the storage dry run reports what is left.`);
+        return result;
+    };
+
+    // Ends a run that removes nothing: the backend deletion still runs, and a
+    // refused purge turns the run into the refusal it already is.
+    const finishRun = async (status, reason) => {
+        result.purged = await runPurge();
+        if (result.purged !== false) releasePayloadSide();
+        if (result.purged === false) return refuse('purge-failed');
+        if (status === 'refused') return refuse(reason);
+        result.status = status;
+        result.reason = reason;
+        return result;
+    };
+
+    // Nothing is stored for any chunk: no registry read, no listing, no scan, no
+    // save. The backend deletion still runs and the payload side still goes.
+    const entries = listLegacyChunkMetadata();
+    if (Object.keys(entries).length === 0) return finishRun('empty', null);
+
+    // The shared-hash check needs the registry. An uninjectable or empty registry
+    // is the "discovery has not run" state the orphan cleanup already refuses to
+    // mass-wipe on: absence there is not proof that no other collection holds the
+    // text.
+    const registry = registryContextFor(key);
+    if (!registry.available) return finishRun('refused', 'registry-unavailable');
+    if (registry.registered.length === 0) return finishRun('refused', 'registry-empty');
+
+    // What the deletion provably covers, read before the chunks disappear.
+    let covered = explicit;
+    if (wholeCollection) {
+        const listing = await chunkMetaStore.listCollectionHashes(key);
+        if (!listing.complete) return finishRun('refused', 'collection-unlisted');
+        covered = listing.hashes;
+    }
+    const coveredSet = new Set(covered);
+    if (!Object.keys(entries).some(hash => coveredSet.has(hash))) return finishRun('empty', null);
+
+    // The backend deletion gates every removal: a purged collection's metadata is
+    // gone for good, a still-existing one's is not.
+    result.purged = await runPurge();
+    if (result.purged === false) return refuse('purge-failed');
+
+    // The backend copy is gone, so the payload side goes now — before the scan.
+    // A debounced payload write that fails while the scan runs can no longer mint
+    // a settings entry for a chunk this deletion covers.
+    releasePayloadSide();
+
+    // Every place the deleted text can still live. The purge already ran: an
+    // unexpected failure past this point can keep entries (they become orphans
+    // the dry run reports), but nothing is deleted on a guess.
+    let plan;
+    const scans = [];
+    let planned;
+    try {
+        for (const collection of registry.others) {
+            const listing = await chunkMetaStore.listCollectionHashes(collection.registryKey);
+            scans.push({
+                registryKey: collection.registryKey,
+                collectionId: String(collection.collectionId || ''),
+                status: listing.complete ? 'ok' : 'failed',
+                hashes: new Set(listing.hashes),
+            });
+        }
+        // Re-read the settings after the scan: an entry written while the scan ran
+        // must still be planned, or it becomes the orphan this action exists to
+        // prevent.
+        planned = listLegacyChunkMetadata();
+        result.counts.candidates = Object.keys(planned).filter(hash => coveredSet.has(hash)).length;
+        plan = planCollectionChunkMetaGc({
+            entries: planned,
+            deletedHashes: covered,
+            collections: registry.others,
+            scans,
+        });
+    } catch (error) {
+        log.error(`VectFox: chunk-metadata cleanup for ${key} stopped before deleting anything: ${error?.message || error}`);
+        result.error = error?.message || String(error);
+        return refuse('collections-unverified');
+    }
+
+    const run = await executeCollectionChunkMetaGc({
+        plan,
+        deleteEntry: removeLegacyChunkMetadata,
+        persistSettings: () => saveSettingsDebounced(),
+    });
+
+    result.counts.deleted = run.counts.deleted;
+    result.counts.skipped = run.counts.skipped;
+    result.counts.shared = plan.counts.shared;
+    result.counts.unverified = plan.counts.unverified;
+    result.error = run.error;
+    result.saveError = run.saveError;
+    if (run.status === 'refused') return refuse('collections-unverified');
+    result.status = run.status;
+    return result;
+}
+
 
 // ============================================================================
 // MIGRATION & CLEANUP

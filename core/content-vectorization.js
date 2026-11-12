@@ -14,7 +14,7 @@ import { getContentType, getContentTypeDefaults, hasFeature } from './content-ty
 import { chunkText } from './chunking.js';
 import { insertVectorItems, purgeVectorIndex, getSavedHashes } from './core-vector-api.js';
 import { isConnectionError } from './model-config-notifier.js';
-import { setCollectionMeta, setCollectionLock, setCollectionCharacterLock, saveChunkMetadata, useChunkMetaCollection, isChunkMetaPayloadStore } from './collection-metadata.js';
+import { setCollectionMeta, setCollectionLock, setCollectionCharacterLock, saveChunkMetadata, useChunkMetaCollection, isChunkMetaPayloadStore, deleteChunkMetadataForCollection } from './collection-metadata.js';
 import { persistBulkChunkKeywords } from './chunk-meta-bulk.js';
 import { registerCollection } from './collection-loader.js';
 import { getBackend } from '../backends/backend-manager.js';
@@ -1023,6 +1023,13 @@ export async function deleteContentCollection(collectionId, callerSettings = nul
         if (detected) baseSettings = { vector_backend: detected };
     }
     const effectiveSettings = resolveEffectiveSettings(baseSettings);
-    await purgeVectorIndex(collectionId, effectiveSettings);
+    // Chunk-metadata cleanup rides on the deletion (ticket 08): the collection's
+    // hashes are read while it still exists, the purge runs, and only a successful
+    // purge lets the settings copies go. `buildRegistryKey` takes the settings
+    // object, not a backend string, so a `standard` install builds the `vectra:`
+    // form the registry and the payload mirror are actually keyed by.
+    await deleteChunkMetadataForCollection(buildRegistryKey(collectionId, effectiveSettings), {
+        purge: () => purgeVectorIndex(collectionId, effectiveSettings),
+    });
     log.lifecycle(`VectFox: Deleted collection: ${collectionId} (routed via ${effectiveSettings.vector_backend})`);
 }

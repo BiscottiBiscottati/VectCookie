@@ -37,17 +37,13 @@ import {
     carriesClientOnlyMetadata,
     chunkHashOf,
     chunkMetadataFromPayload,
+    collectionKeyOf,
     missingPayloadFields,
 } from './chunk-meta-fields.js';
 import { listAllChunkItems } from './chunk-paging.js';
 
 /** Scan statuses whose chunk listing was complete, so absence in it is provable. */
 const COMPLETE_SCAN_STATUSES = new Set(['ok', 'metadata-missing']);
-
-/** A collection's identity: registry key when known, bare id otherwise. */
-function collectionKeyOf(collection) {
-    return String(collection?.registryKey || collection?.collectionId || '');
-}
 
 /** A collection's display id. */
 function collectionIdOf(collection) {

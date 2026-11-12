@@ -96,6 +96,8 @@ export function createChunkMetaStore({
     const inFlight = new Map();
     /** queueKeys whose local value is newer than the hydrated snapshot */
     const locallyWritten = new Set();
+    /** Collections forgotten by a deletion; an in-flight hydration must not refill them. */
+    const forgotten = new Set();
 
     let activeCollectionId = null;
 
@@ -178,6 +180,9 @@ export function createChunkMetaStore({
         const job = (async () => {
             try {
                 const { items, complete } = await fetchCollection(id);
+                // The collection was deleted while this listing was in flight: its
+                // payload is gone, and refilling the mirror would serve a ghost.
+                if (forgotten.has(id)) return false;
                 if (!complete) {
                     // A partial listing tells us nothing about the chunks it did
                     // not return. Keep the settings fallback (do not mark the
@@ -240,6 +245,9 @@ export function createChunkMetaStore({
             return Promise.resolve(false);
         }
         activeCollectionId = String(collectionId);
+        // A collection deleted last time it was in use may be back (re-vectorized,
+        // re-imported); its next hydration is the proof, not the old tombstone.
+        forgotten.delete(activeCollectionId);
         return hydrate(activeCollectionId);
     }
 
@@ -343,22 +351,93 @@ export function createChunkMetaStore({
         persistSettings();
     }
 
-    function deleteMetadata(hash) {
-        const key = hashKey(hash);
-        // Collection-scoped like every other payload operation: deleting a chunk
-        // in one collection must not touch the same text hash in another.
+    /**
+     * Drops payload state for chunks that are gone from the collection in use:
+     * their mirror entries, and any payload write still waiting on the debounce.
+     * The caller owns the settings side, because whether a settings entry may go
+     * depends on the other collections holding the same content hash.
+     * @param {Iterable<string|number>} hashes Deleted chunk hashes
+     */
+    function forgetChunks(hashes) {
+        const keys = new Set([...(hashes || [])].map(hashKey));
+        if (keys.size === 0) return;
         if (activeCollectionId) {
-            mirror.get(activeCollectionId)?.delete(key);
+            const byHash = mirror.get(activeCollectionId);
+            if (byHash) {
+                for (const key of keys) byHash.delete(key);
+            }
         }
-        // Cancel queued writes for this chunk so a pending save cannot resurrect
-        // metadata that was just deleted.
-        for (const [pendingKey, queued] of pending) {
-            if (hashKey(queued.hash) !== key) continue;
+        // Cancel queued writes for these chunks so a pending save cannot
+        // resurrect metadata that was just deleted.
+        for (const [pendingKey, queued] of [...pending]) {
+            if (!keys.has(hashKey(queued.hash))) continue;
             if (activeCollectionId && String(queued.collectionId) !== activeCollectionId) continue;
             if (queued.timer) clearTimeout(queued.timer);
             pending.delete(pendingKey);
             locallyWritten.delete(pendingKey);
         }
+    }
+
+    /**
+     * Drops every trace of a deleted collection: its mirror, its hydration state
+     * and its queued payload writes. An in-flight hydration is ignored when it
+     * lands (`forgotten`), and a failed write can no longer mint a settings entry
+     * for it (the failure path checks the mirror).
+     * @param {string} collectionId Deleted collection's key
+     */
+    function forgetCollection(collectionId) {
+        const id = String(collectionId || '');
+        if (!id) return;
+        forgotten.add(id);
+        mirror.delete(id);
+        hydrated.delete(id);
+        hydrating.delete(id);
+        const prefix = `${id}\u0000`;
+        for (const [key, entry] of [...pending]) {
+            if (!key.startsWith(prefix)) continue;
+            if (entry.timer) clearTimeout(entry.timer);
+            pending.delete(key);
+            locallyWritten.delete(key);
+        }
+    }
+
+    /**
+     * One collection's chunk hashes, read through the transport. Membership is all
+     * the garbage collection needs, so this deliberately returns hashes and not
+     * metadata — and it works without the plugin, because a standard-backend
+     * install lists its hashes natively.
+     *
+     * `complete` is the proof the caller must have before deleting anything: a
+     * failed or truncated listing cannot say which chunks the collection held.
+     * @param {string} collectionId Collection key (registry key or bare id)
+     * @returns {Promise<{ hashes: string[], complete: boolean }>}
+     */
+    function listCollectionHashes(collectionId) {
+        const id = String(collectionId || '');
+        if (!id || !transport || typeof transport.listChunks !== 'function') {
+            return Promise.resolve({ hashes: [], complete: false });
+        }
+        return (async () => {
+            try {
+                const { items, complete } = await fetchCollection(id);
+                const hashes = [];
+                const seen = new Set();
+                for (const item of items) {
+                    const hash = chunkHashOf(item);
+                    if (hash === null || seen.has(hash)) continue;
+                    seen.add(hash);
+                    hashes.push(hash);
+                }
+                return { hashes, complete };
+            } catch (err) {
+                log.warn(`VectFox: could not list ${id}'s chunks for chunk-metadata cleanup — deleting nothing: ${err?.message || err}`);
+                return { hashes: [], complete: false };
+            }
+        })();
+    }
+
+    function deleteMetadata(hash) {
+        forgetChunks([hash]);
         if (deleteLegacy(hash)) persistSettings();
     }
 
@@ -395,6 +474,7 @@ export function createChunkMetaStore({
         mirror.clear();
         hydrated.clear();
         hydrating.clear();
+        forgotten.clear();
         activeCollectionId = null;
     }
 
@@ -404,6 +484,9 @@ export function createChunkMetaStore({
         saveMetadata,
         deleteMetadata,
         getAllMetadata,
+        forgetChunks,
+        forgetCollection,
+        listCollectionHashes,
         isPayloadStore,
         flush,
         reset,

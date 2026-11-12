@@ -30,7 +30,7 @@ import { synchronizeChat, rearrangeChat } from './core/chat-vectorization.js';
 import { purgeAllVectorIndexes, purgeVectorIndex } from './core/core-vector-api.js';
 import { migrateOldEnabledKeys, configureChunkMetaStore, flushChunkMetaWrites } from './core/collection-metadata.js';
 import { createPluginChunkTransport } from './core/chunk-meta-transport.js';
-import { clearCollectionRegistry, cleanupCorruptedCollections } from './core/collection-loader.js';
+import { clearCollectionRegistry, cleanupCorruptedCollections, getRegisteredCollections } from './core/collection-loader.js';
 import { migrateLegacyApiKeys } from './core/api-keys.js';
 import { migration_setting_name_for_connection } from './Migration/mg_setting_name_for_connection.js';
 import { migration_embedding_source_key } from './Migration/mg_embedding_source_key.js';
@@ -873,6 +873,10 @@ jQuery(async () => {
     // on first use, so startup pays no extra request.
     configureChunkMetaStore({
         transport: createPluginChunkTransport({ getSettings: () => settings }),
+        // The deletion paths' chunk-metadata cleanup needs to know which other
+        // collections still hold a deleted chunk's text; the registry is the only
+        // source for that, and the loader owns it.
+        listCollections: getRegisteredCollections,
     });
     if (typeof window !== 'undefined') {
         // A debounced payload write must not be lost when the page goes away.
