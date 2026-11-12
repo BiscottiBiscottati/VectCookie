@@ -30,6 +30,7 @@ import {
     flushChunkMetaWrites,
     configureChunkMetaStore,
     resetChunkMetaStore,
+    isChunkMetaPayloadStore,
 } from '../core/collection-metadata.js';
 import { createChunkMetaStore } from '../core/chunk-meta-store.js';
 import { saveSettingsDebounced } from '../../../../../script.js';
@@ -87,7 +88,8 @@ beforeEach(() => {
 
 // ---------------------------------------------------------------------------
 // Ticket 01, first acceptance bullet: with the plugin present, editing a
-// chunk's context writes it to the payload (and the shadow settings copy).
+// chunk's context writes it to the payload. (Ticket 07 removed the settings
+// copy this save used to leave behind.)
 // ---------------------------------------------------------------------------
 
 describe('plugin present — write goes to the chunk payload', () => {
@@ -440,5 +442,212 @@ describe('hydration paging', () => {
         expect(trusted).toBe(false);
         expect(listCalls).toBe(2);
         expect(store.getMetadata('1')).toBeNull();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Ticket 07: on the payload path a save writes no settings copy. The chunk
+// payload is the source of truth, an edit costs one payload write, and the
+// settings object is neither extended nor re-uploaded.
+// ---------------------------------------------------------------------------
+
+describe('payload path — a save writes no settings copy', () => {
+    const withContext = () => createFakePlugin({
+        chunksByCollection: { 'col-a': [{ hash: '12', metadata: { context: 'before' } }] },
+    });
+
+    it('mints no settings key and saves nothing for a chunk with no settings entry', async () => {
+        const plugin = withContext();
+        configureChunkMetaStore({ transport: plugin.transport });
+        await useChunkMetaCollection('col-a');
+        saveSettingsDebounced.mockClear();
+
+        saveChunkMetadata('12', { context: 'after' });
+        await flushChunkMetaWrites();
+
+        expect(plugin.calls.patch).toEqual([
+            { collectionId: 'col-a', hash: '12', metadata: { context: 'after', updatedAt: expect.any(Number) } },
+        ]);
+        expect(saveSettingsDebounced).not.toHaveBeenCalled();
+        expect(mockSettings.vectfox.vectfox_chunk_meta_12).toBeUndefined();
+        expect(getChunkMetadata('12').context).toBe('after');
+    });
+
+    it('leaves an entry the sweep has not moved yet untouched rather than refreshing it', async () => {
+        // Pre-sweep the settings entry is the sweep's work item. Rewriting it on
+        // every edit is exactly the full-blob upload this ticket removes.
+        const plugin = withContext();
+        mockSettings.vectfox.vectfox_chunk_meta_12 = { context: 'settings-copy' };
+        configureChunkMetaStore({ transport: plugin.transport });
+        await useChunkMetaCollection('col-a');
+        saveSettingsDebounced.mockClear();
+
+        saveChunkMetadata('12', { context: 'after' });
+        await flushChunkMetaWrites();
+
+        expect(plugin.calls.patch).toHaveLength(1);
+        expect(saveSettingsDebounced).not.toHaveBeenCalled();
+        expect(mockSettings.vectfox.vectfox_chunk_meta_12).toEqual({ context: 'settings-copy' });
+        expect(getChunkMetadata('12').context).toBe('after');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Ticket 07: the one exception. Client-only fields (summaries) have no payload
+// representation, so they still go to settings — and nothing else does, so a
+// summary edit cannot re-inflate the settings object with payload metadata.
+// ---------------------------------------------------------------------------
+
+describe('client-only fields — settings holds only what a payload cannot', () => {
+    it('writes the summaries and no payload field to a new settings entry', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '3', metadata: { context: 'payload-context' } }] },
+        });
+        configureChunkMetaStore({ transport: plugin.transport });
+        await useChunkMetaCollection('col-a');
+        const existing = getChunkMetadata('3');
+        saveSettingsDebounced.mockClear();
+
+        saveChunkMetadata('3', { ...existing, summaries: ['a dual-vector summary'] });
+
+        expect(mockSettings.vectfox.vectfox_chunk_meta_3).toMatchObject({
+            summaries: ['a dual-vector summary'],
+        });
+        expect(mockSettings.vectfox.vectfox_chunk_meta_3).not.toHaveProperty('context');
+        expect(saveSettingsDebounced).toHaveBeenCalledTimes(1);
+        expect(getChunkMetadata('3').context).toBe('payload-context');
+        expect(getChunkMetadata('3').summaries).toEqual(['a dual-vector summary']);
+    });
+
+    it('keeps the fields an existing entry already holds', async () => {
+        const plugin = createFakePlugin({ chunksByCollection: { 'col-a': [] } });
+        mockSettings.vectfox.vectfox_chunk_meta_4 = { xmlTag: 'legacy-tag' };
+        configureChunkMetaStore({ transport: plugin.transport });
+        await useChunkMetaCollection('col-a');
+
+        saveChunkMetadata('4', { summaries: ['summary'] });
+
+        expect(mockSettings.vectfox.vectfox_chunk_meta_4).toMatchObject({
+            xmlTag: 'legacy-tag',
+            summaries: ['summary'],
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Ticket 07: a failed payload write falls back to a settings write, so an edit
+// is never left only in memory. Reading it back merges payload-first per field,
+// and it survives a reload. The bounded retry is ticket 09.
+// ---------------------------------------------------------------------------
+
+describe('failed payload write — falls back to settings instead of losing the edit', () => {
+    it('persists the refused fields to settings so a reload still resolves them', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '21', metadata: { context: 'before' } }] },
+        });
+        const failingTransport = {
+            ...plugin.transport,
+            async patchMetadata() { throw new Error('plugin restarted'); },
+        };
+        configureChunkMetaStore({ transport: failingTransport });
+        await useChunkMetaCollection('col-a');
+        saveSettingsDebounced.mockClear();
+
+        saveChunkMetadata('21', { xmlTag: 'edited-tag' });
+        await flushChunkMetaWrites();
+
+        expect(mockSettings.vectfox.vectfox_chunk_meta_21).toMatchObject({ xmlTag: 'edited-tag' });
+        expect(saveSettingsDebounced).toHaveBeenCalledTimes(1);
+
+        // Reload: the mirror is gone and the payload never took the edit. The
+        // payload still serves the fields it holds; the refused field comes from
+        // the settings copy, so nothing is lost.
+        resetChunkMetaStore();
+        configureChunkMetaStore({ transport: failingTransport });
+        await useChunkMetaCollection('col-a');
+
+        expect(getChunkMetadata('21')).toMatchObject({ context: 'before', xmlTag: 'edited-tag' });
+    });
+
+    it('keeps the refused edit in settings even when the payload still masks it', async () => {
+        // The merge rule is payload-first per field, so a field the old payload
+        // still holds keeps showing the old value until the payload is repaired.
+        // The edit is therefore held in settings — the disagreement between the
+        // two stores that ticket 09's queue replays — and never only in memory.
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '23', metadata: { context: 'before' } }] },
+        });
+        const failingTransport = {
+            ...plugin.transport,
+            async patchMetadata() { throw new Error('plugin restarted'); },
+        };
+        configureChunkMetaStore({ transport: failingTransport });
+        await useChunkMetaCollection('col-a');
+
+        saveChunkMetadata('23', { context: 'after' });
+        await flushChunkMetaWrites();
+
+        expect(mockSettings.vectfox.vectfox_chunk_meta_23).toMatchObject({ context: 'after' });
+    });
+
+    it('mints no settings entry for a chunk deleted while its write was in flight', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '22', metadata: { context: 'before' } }] },
+        });
+        let rejectPatch;
+        const transport = {
+            ...plugin.transport,
+            patchMetadata: () => new Promise((_, reject) => { rejectPatch = reject; }),
+        };
+        configureChunkMetaStore({ transport });
+        await useChunkMetaCollection('col-a');
+        saveSettingsDebounced.mockClear();
+
+        saveChunkMetadata('22', { context: 'gone' });
+        const flushing = flushChunkMetaWrites();
+        deleteChunkMetadata('22');
+        rejectPatch(new Error('plugin restarted'));
+        await flushing;
+
+        expect(mockSettings.vectfox.vectfox_chunk_meta_22).toBeUndefined();
+        expect(saveSettingsDebounced).not.toHaveBeenCalled();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Ticket 07: the rollback. The `settings` policy restores the previous write
+// behaviour without a redeploy — settings entry plus one settings save, and no
+// payload request.
+// ---------------------------------------------------------------------------
+
+describe('store policy settings — the rollback restores the previous write behaviour', () => {
+    it('writes the settings entry and issues no payload request', async () => {
+        const plugin = createFakePlugin({
+            chunksByCollection: { 'col-a': [{ hash: '31', metadata: { context: 'before' } }] },
+        });
+        mockSettings.vectfox.chunk_meta_store = 'settings';
+        configureChunkMetaStore({ transport: plugin.transport });
+        await useChunkMetaCollection('col-a');
+        saveSettingsDebounced.mockClear();
+
+        saveChunkMetadata('31', { context: 'after' });
+        await flushChunkMetaWrites();
+
+        expect(plugin.calls.patch).toEqual([]);
+        expect(mockSettings.vectfox.vectfox_chunk_meta_31).toMatchObject({ context: 'after' });
+        expect(saveSettingsDebounced).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports the store it resolves to', () => {
+        const plugin = createFakePlugin();
+        configureChunkMetaStore({ transport: plugin.transport });
+        expect(isChunkMetaPayloadStore()).toBe(true);
+
+        mockSettings.vectfox.chunk_meta_store = 'settings';
+        expect(isChunkMetaPayloadStore()).toBe(false);
+
+        resetChunkMetaStore();
+        configureChunkMetaStore({ transport: null });
+        expect(isChunkMetaPayloadStore()).toBe(false);
     });
 });

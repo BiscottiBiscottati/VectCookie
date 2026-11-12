@@ -14,7 +14,8 @@ import { getContentType, getContentTypeDefaults, hasFeature } from './content-ty
 import { chunkText } from './chunking.js';
 import { insertVectorItems, purgeVectorIndex, getSavedHashes } from './core-vector-api.js';
 import { isConnectionError } from './model-config-notifier.js';
-import { setCollectionMeta, setCollectionLock, setCollectionCharacterLock, saveChunkMetadata, useChunkMetaCollection } from './collection-metadata.js';
+import { setCollectionMeta, setCollectionLock, setCollectionCharacterLock, saveChunkMetadata, useChunkMetaCollection, isChunkMetaPayloadStore } from './collection-metadata.js';
+import { persistBulkChunkKeywords } from './chunk-meta-bulk.js';
 import { registerCollection } from './collection-loader.js';
 import { getBackend } from '../backends/backend-manager.js';
 // Import from collection-ids.js - single source of truth for collection ID operations
@@ -349,16 +350,17 @@ export async function vectorizeContent({ contentType, source, settings, abortSig
 
             // Persist chunk keywords so no-plugin users get keyword boosting.
             // Native ST /api/vector/insert only stores {hash, text, index} —
-            // keywords live nowhere else without the plugin. Clear the active
-            // collection first: this bulk save is not a collection edit, and the
-            // plugin path already wrote these keywords into the chunk payloads at
-            // insert time. saveSettingsDebounced batches the writes into one flush.
-            void useChunkMetaCollection(null);
-            for (const chunk of finalChunks) {
-                if (chunk.keywords?.length > 0) {
-                    saveChunkMetadata(String(chunk.hash), { keywords: chunk.keywords });
-                }
-            }
+            // keywords live nowhere else without the plugin. On the payload path
+            // the insert already wrote each chunk's keywords into its payload, so
+            // the save is skipped there; core/chunk-meta-bulk.js owns that rule
+            // and clears the current-collection pointer first, so a hash-only
+            // write from another path cannot borrow an open visualizer's
+            // collection. saveSettingsDebounced batches the writes into one flush.
+            persistBulkChunkKeywords(finalChunks, {
+                isPayloadStore: isChunkMetaPayloadStore,
+                clearActiveCollection: () => { void useChunkMetaCollection(null); },
+                saveChunkMetadata,
+            });
         }
 
         // Save collection metadata

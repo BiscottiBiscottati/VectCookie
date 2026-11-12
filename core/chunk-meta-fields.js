@@ -71,20 +71,27 @@ export function hasValue(value) {
 }
 
 /**
- * The fields of a save that belong in the payload. Returns null when the save
- * carries only client-only bookkeeping (e.g. a summaries edit), so that edit
- * does not produce a pointless payload request.
+ * One save split into the part the payload stores and the part only settings can
+ * hold. Both halves come from one walk, so a field is classified once and the
+ * two stores can never disagree about which fields are theirs.
  * @param {object} metadata A save or a settings entry.
  * @param {Iterable<string>} clientOnlyFields Fields with no payload representation.
- * @returns {object|null} Payload fields, or null when there is nothing to persist.
+ * @returns {{ payload: object|null, clientOnly: object }} The payload fields
+ *   (null when the save carries only client-only bookkeeping, so it produces no
+ *   pointless payload request) and the client-only fields present in the save.
  */
-export function payloadPatch(metadata, clientOnlyFields) {
-    const patch = chunkMetadataFromPayload(metadata);
-    for (const field of clientOnlyFields) delete patch[field];
-    const persistable = Object.keys(patch).some(
+export function splitForPayload(metadata, clientOnlyFields) {
+    const exclusive = new Set(clientOnlyFields || []);
+    const payload = {};
+    const clientOnly = {};
+    for (const [field, value] of Object.entries(metadata || {})) {
+        if (exclusive.has(field)) clientOnly[field] = value;
+        else if (!PAYLOAD_DATA_KEYS.has(field)) payload[field] = value;
+    }
+    const persistable = Object.keys(payload).some(
         field => !BOOKKEEPING_META_FIELDS.includes(field),
     );
-    return persistable ? patch : null;
+    return { payload: persistable ? payload : null, clientOnly };
 }
 
 /**

@@ -364,6 +364,18 @@ function writeLegacyChunkMetadata(hash, metadata) {
 }
 
 /**
+ * Merges fields into one chunk's settings entry, creating the entry when it is
+ * absent. This module owns the entry's shape, so the store asks for a merge
+ * instead of assembling one: a field only settings holds is never dropped, and a
+ * payload-path save never has to know what an entry looks like.
+ * @param {string} hash Chunk hash
+ * @param {object} fields Fields to write; the rest of the entry is kept
+ */
+function mergeLegacyChunkMetadata(hash, fields) {
+    writeLegacyChunkMetadata(hash, { ...(readLegacyChunkMetadata(hash) || {}), ...fields });
+}
+
+/**
  * Deletes one legacy settings entry without saving. Callers own persistence:
  * the store's delete path saves after calling this, and the sweep and the
  * orphan deletion remove thousands of entries in one run and save once at the
@@ -413,6 +425,7 @@ const chunkMetaStore = createChunkMetaStore({
     getSettings: () => extension_settings?.vectfox || null,
     readLegacy: readLegacyChunkMetadata,
     writeLegacy: writeLegacyChunkMetadata,
+    mergeLegacy: mergeLegacyChunkMetadata,
     deleteLegacy: removeLegacyChunkMetadata,
     listLegacy: listLegacyChunkMetadata,
     persistSettings: () => saveSettingsDebounced(),
@@ -432,8 +445,11 @@ export function getChunkMetadata(hash) {
 /**
  * Saves metadata for a specific chunk. On the payload path this updates the
  * in-memory mirror synchronously and persists asynchronously (coalesced per
- * hash); the settings copy is kept while the shadow setting is on. Without the
- * plugin it writes the settings entry exactly as before.
+ * hash); nothing is written to settings except the fields no payload can carry
+ * (client-only `summaries`), so an edit costs one payload write and no settings
+ * upload. A payload write that fails is persisted to settings instead (the
+ * bounded retry is ticket 09). Without the plugin it writes the settings entry
+ * exactly as before.
  * @param {string} hash Chunk hash
  * @param {object} metadata Chunk metadata
  */
@@ -486,6 +502,21 @@ export function resetChunkMetaStore() {
  */
 export function useChunkMetaCollection(collectionId) {
     return chunkMetaStore.useCollection(collectionId);
+}
+
+/**
+ * Whether this install's chunk metadata lives in the chunk payload (plugin
+ * reachable, policy not rolled back to `settings`).
+ *
+ * Bulk writers read this before writing settings: on the payload path the
+ * payload already holds what they would persist, so the settings copy is pure
+ * duplication — and one new key per inserted chunk is what grew the settings
+ * object to 17,104 entries. Without the plugin the same callers must write
+ * settings, so they keep today's behaviour.
+ * @returns {boolean}
+ */
+export function isChunkMetaPayloadStore() {
+    return chunkMetaStore.isPayloadStore();
 }
 
 /** Persists pending payload writes now (page unload, explicit flush). */

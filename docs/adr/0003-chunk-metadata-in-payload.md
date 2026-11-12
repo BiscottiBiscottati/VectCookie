@@ -51,10 +51,13 @@ Relevant properties of the storage that shaped this decision:
    the settings namespace, not a feature.
 5. **A failed payload write falls back to a settings write** plus a bounded retry
    queue, so an outage degrades to today's behaviour instead of losing an edit.
-6. **Migration is staged**: automatic dry-run and shadow dual-writes first, then
-   a single explicit sweep that deletes the settings copies. Orphans (entries
-   whose chunk exists in no registered collection) are reported and deleted only
-   on explicit confirmation.
+6. **Migration is staged**: automatic dry-run and shadow dual-writes in the
+   release that ships the migration, then a single explicit sweep that deletes
+   the settings copies. Orphans (entries whose chunk exists in no registered
+   collection) are reported and deleted only on explicit confirmation. The
+   dual-write is a rehearsal-window device, not the end state: the release after
+   it stops writing the settings copy altogether, so an edit costs one payload
+   write and no settings upload (only client-only fields still reach settings).
 7. **Hydration is lazy**, per collection, so the fix cannot reintroduce a startup
    stall through a different endpoint.
 8. **A hash-only caller resolves the collection through one "current collection"
@@ -83,17 +86,23 @@ Relevant properties of the storage that shaped this decision:
 ## Consequences
 
 - **The store, the transport and the `auto` policy ship first**, with hydrate-on-use
-  and per-field merged reads; decision 5's fallback and retry queue and decision 6's
-  sweep land in later changes. Until the retry lands, a failed payload write leaves
-  the shadow settings copy in place but does not yet repair the payload.
+  and per-field merged reads; the sweep (decision 6) and the bounded retry half of
+  decision 5 land in later changes. The rehearsal dual-write ends with the write-path
+  change: a payload-path save writes no settings copy (only client-only fields such
+  as `summaries` still reach settings), and a failed payload write persists the
+  refused fields to settings instead of losing the edit — the bounded retry that
+  repairs the payload and drops that copy comes later.
 - **Three behaviour changes to announce**: per-collection metadata (no more
   cross-collection sharing), a chunk edit no longer triggering a full settings
   upload on the plugin path, and — after the sweep — downgrading to an older
   VectCookie losing per-chunk metadata, since the settings copy is gone. Forward
-  compatibility within a release is covered by the shadow window.
+  compatibility was covered by the shadow window of the release that shipped the
+  migration; the write-path change ends it.
 - **The 9.45 MiB only shrinks at the sweep**, and only for entries that are
-  redundant or explicitly deleted as orphans. Growth stops immediately because
-  new writes no longer mint settings keys.
+  redundant or explicitly deleted as orphans. Growth stops immediately for edits
+  and for newly vectorized content because those writes no longer mint settings
+  keys. Import/export routing is a separate change: until it lands, importing a
+  collection still mints one settings key per imported chunk.
 - **`orphan` must mean absent from every registered collection**, never from the
   collection currently loaded: content-derived hashes mean one key can be
   referenced by several collections.

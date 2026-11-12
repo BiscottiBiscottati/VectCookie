@@ -9,11 +9,19 @@
  * in-memory mirror, hydrated lazily from the transport on first use, backs them;
  * persistence is asynchronous, coalesced per chunk and debounced.
  *
+ * A payload-path save writes no settings copy of the payload metadata (ticket
+ * 07). The settings object is only touched for fields a payload cannot carry
+ * (client-only `summaries`) and when a payload write fails, where the refused
+ * fields are persisted to settings instead of being lost. Bulk writers such as
+ * keyword persistence ask `isPayloadStore` before minting a settings key the
+ * payload already holds.
+ *
  * The legacy settings shape (`vectfox_chunk_meta_<hash>`) is defined in
- * core/chunk-meta-keys.js and written by core/collection-metadata.js, which
- * reaches this module through the injected readLegacy / writeLegacy /
- * deleteLegacy / listLegacy callbacks, so this module never touches the settings
- * object's shape.
+ * core/chunk-meta-keys.js and owned by core/collection-metadata.js, which reaches
+ * this module through the injected readLegacy / writeLegacy / mergeLegacy /
+ * deleteLegacy / listLegacy callbacks. The store decides *when* settings is
+ * written and *which fields* belong there (from the injected client-only list);
+ * the shape owner decides what the entry looks like.
  */
 
 import { log } from './log.js';
@@ -21,7 +29,7 @@ import {
     chunkHashOf,
     chunkMetadataFromPayload,
     hasValue,
-    payloadPatch,
+    splitForPayload,
 } from './chunk-meta-fields.js';
 import { listAllChunkItems } from './chunk-paging.js';
 
@@ -51,7 +59,7 @@ function mergeChunkMetadata(payload, legacy) {
 
 /**
  * @param {object} [deps]
- * @param {() => object|null} [deps.getSettings] - VectFox settings (policy + shadow flags)
+ * @param {() => object|null} [deps.getSettings] - VectFox settings (store policy)
  * @param {(hash: string) => object|null} [deps.readLegacy] - settings entry for a chunk
  * @param {(hash: string, metadata: object) => void} [deps.writeLegacy] - replace settings entry
  * @param {(hash: string) => boolean} [deps.deleteLegacy] - remove settings entry; true when it existed
@@ -66,6 +74,7 @@ export function createChunkMetaStore({
     getSettings = () => null,
     readLegacy = () => null,
     writeLegacy = () => {},
+    mergeLegacy = () => {},
     deleteLegacy = () => false,
     listLegacy = () => ({}),
     persistSettings = () => {},
@@ -110,8 +119,14 @@ export function createChunkMetaStore({
         return payloadAvailable() ? 'payload' : 'settings';
     }
 
-    function shadowEnabled() {
-        return getSettings?.()?.chunk_meta_shadow !== false;
+    /**
+     * Whether this install's chunk metadata lives in the chunk payload. Bulk
+     * writers ask before falling back to settings: on the payload path the
+     * payload already holds the value they would otherwise mint a settings key
+     * for (see `saveMetadata`).
+     */
+    function isPayloadStore() {
+        return mode() === 'payload';
     }
 
     /**
@@ -157,7 +172,7 @@ export function createChunkMetaStore({
         if (hydrated.has(id)) return Promise.resolve(true);
         const running = hydrating.get(id);
         if (running) return running;
-        if (mode() !== 'payload' || !transport) return Promise.resolve(false);
+        if (!isPayloadStore() || !transport) return Promise.resolve(false);
 
         let trusted = false;
         const job = (async () => {
@@ -260,10 +275,22 @@ export function createChunkMetaStore({
                 // newer local value is not overwritten by an older listing.
                 if (!hydrating.has(entry.collectionId)) locallyWritten.delete(key);
             } catch (err) {
-                // The shadow settings copy (written at save time) holds the edit;
-                // the failed payload write and its bounded retry are ticket 09.
-                // Keep the local mirror value so this session still sees the edit.
+                // The payload refused the edit and, since ticket 07, settings holds
+                // no copy of it — so until this runs, the change exists only in
+                // memory. Persist the refused fields to settings: the read path
+                // merges payload-first per field, so they are served immediately and
+                // survive a reload instead of vanishing with the mirror. The
+                // bounded retry that repairs the payload and drops this copy is
+                // ticket 09.
                 log.warn(`VectFox: chunk metadata payload write failed for ${entry.collectionId}/${entry.hash}: ${err?.message || err}`);
+                // The mirror entry is the "is this chunk still wanted" check: a
+                // chunk deleted (or a store reset) while the write was in flight
+                // must not gain a settings entry here — that would mint the orphan
+                // this feature exists to remove.
+                if (mirror.get(String(entry.collectionId))?.has(hashKey(entry.hash))) {
+                    mergeLegacy(entry.hash, entry.metadata);
+                    persistSettings();
+                }
             } finally {
                 inFlight.delete(key);
             }
@@ -276,31 +303,38 @@ export function createChunkMetaStore({
     function saveMetadata(hash, metadata) {
         const stamped = { ...(metadata || {}), updatedAt: Date.now() };
 
-        if (mode() === 'payload' && activeCollectionId && transport) {
+        if (isPayloadStore() && activeCollectionId && transport) {
             const key = hashKey(hash);
-            const byHash = mirror.get(activeCollectionId) || new Map();
+            const collectionId = activeCollectionId;
+            const byHash = mirror.get(collectionId) || new Map();
             const previous = byHash.get(key) || null;
             // What the read path resolves right now, before this save. A save that
             // only changes a client-only field arrives carrying the unchanged
             // payload fields too (the visualizer merges the load-time read), so
             // compare against the resolved view, not just the payload mirror.
             const current = mergeChunkMetadata(previous, readLegacy(hash));
-            const patch = payloadPatch(stamped, clientOnly);
+            const split = splitForPayload(stamped, clientOnly);
+            const patch = split.payload;
 
             byHash.set(key, { ...(previous || {}), ...stamped });
-            mirror.set(activeCollectionId, byHash);
+            mirror.set(collectionId, byHash);
 
-            // Shadow dual-write: the rehearsal release keeps the legacy copy until
-            // the explicit sweep deletes it.
-            if (shadowEnabled()) {
-                writeLegacy(hash, stamped);
+            // No settings copy of the payload metadata is written here any more
+            // (ticket 07): it duplicated every field into the settings object,
+            // and persisting it re-uploaded the whole blob on every edit. Only
+            // fields no payload can carry (`summaries`) still go to settings,
+            // merged into the entry so a field only settings holds is never
+            // dropped. The sweep removes the entries left from before, after
+            // which this writes nothing at all.
+            if (Object.keys(split.clientOnly).length > 0) {
+                mergeLegacy(hash, { ...split.clientOnly, updatedAt: stamped.updatedAt });
                 persistSettings();
             }
 
             const changed = patch && Object.entries(patch).some(
                 ([field, value]) => field !== 'updatedAt' && (!current || current[field] !== value),
             );
-            if (changed) queuePayloadWrite(activeCollectionId, hash, patch);
+            if (changed) queuePayloadWrite(collectionId, hash, patch);
             return;
         }
 
@@ -370,6 +404,7 @@ export function createChunkMetaStore({
         saveMetadata,
         deleteMetadata,
         getAllMetadata,
+        isPayloadStore,
         flush,
         reset,
         configure: ({ transport: nextTransport } = {}) => {

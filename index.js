@@ -76,11 +76,10 @@ const defaultSettings = {
     // Chunk metadata storage (ADR-0003): 'auto' | 'payload' | 'settings'.
     // 'auto' = chunk payload when the Similharity plugin is reachable, the legacy
     // settings namespace otherwise. Flipping this to 'settings' is the rollback.
+    // The payload path writes no settings copy (ticket 07): an edit costs one
+    // payload write and no settings upload, and only client-only data such as
+    // `summaries` — which has no payload representation — still reaches settings.
     chunk_meta_store: 'auto',
-    // Shadow dual-write: while true, payload-path writes also update the legacy
-    // settings copy. Default true for the rehearsal release; the sweep (a later
-    // ticket) removes the settings copies and a later release turns this off.
-    chunk_meta_shadow: true,
     qdrant_host: '127.0.0.1',
     qdrant_port: 6333,
     qdrant_url: '',
