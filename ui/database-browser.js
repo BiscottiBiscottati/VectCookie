@@ -86,8 +86,10 @@ import { renderSizeInspectorTab } from "./size-inspector.js";
 import {
   createStorageBackup,
   createStorageDryRun,
+  createStorageOrphanDelete,
   createStorageSweep,
 } from "../core/chunk-meta-storage-actions.js";
+import { confirmOrphanDeletion } from "./orphan-delete-dialog.js";
 import { createPluginChunkTransport } from "../core/chunk-meta-transport.js";
 import { getSweepStamp, setSweepStamp } from "../core/chunk-meta-sweep-execute.js";
 import {
@@ -98,7 +100,7 @@ import {
 
 // The storage dry run and its backup, composed with the live services here in
 // the wiring layer so neither the Size Inspector nor the storage-health panel
-// imports the plugin transport. Both share one dependency set — the same
+// imports the plugin transport. They share one dependency set — the same
 // collections, entries and client-only fields — so the backup describes exactly
 // what the dry run reports on. `extension_settings` is read at call time.
 const storageActionDeps = {
@@ -118,6 +120,14 @@ const storageSweep = createStorageSweep({
   deleteEntry: removeLegacyChunkMetadata,
   readStamp: () => getSweepStamp(extension_settings?.vectfox),
   writeStamp: stamp => setSweepStamp(extension_settings?.vectfox, stamp),
+  persistSettings: () => saveSettingsDebounced(),
+});
+// Orphan deletion re-runs the scan (a fresh absence check is its whole point)
+// and removes nothing until the Size Inspector's counted dialog says yes. It
+// shares the no-save deletion and the single settings save with the sweep.
+const storageOrphanDelete = createStorageOrphanDelete({
+  ...storageActionDeps,
+  deleteEntry: removeLegacyChunkMetadata,
   persistSettings: () => saveSettingsDebounced(),
 });
 
@@ -817,6 +827,13 @@ function switchTab(tabName) {
           ...options,
           getSettings: () => extension_settings?.vectfox,
         }),
+        runDeleteOrphans: options => storageOrphanDelete({
+          ...options,
+          getSettings: () => extension_settings?.vectfox,
+        }),
+        // The dialog lives in its own module so the panel imports no host
+        // module; a build without it fails closed (the run cancels).
+        confirmOrphans: confirmOrphanDeletion,
       },
     );
   }

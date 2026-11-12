@@ -29,7 +29,12 @@ vi.mock('../../../../../script.js', () => ({
     saveSettingsDebounced: vi.fn(),
 }));
 
-import { saveChunkMetadata, getChunkMetadata, deleteChunkMetadata } from '../core/collection-metadata.js';
+import {
+    deleteChunkMetadata,
+    getChunkMetadata,
+    removeLegacyChunkMetadata,
+    saveChunkMetadata,
+} from '../core/collection-metadata.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -165,5 +170,27 @@ describe('resolveChunkKeywords — no-plugin fallback', () => {
         const result = resolveChunkKeywords(chunk);
         // Plugin metadata wins — this is intentional (server-side is authoritative)
         expect(result).toEqual(['plugin-keyword']);
+    });
+});
+
+
+// ---------------------------------------------------------------------------
+// The no-save deletion used by the sweep and the orphan cleanup
+// ---------------------------------------------------------------------------
+
+describe('removeLegacyChunkMetadata — presence, not truthiness', () => {
+    beforeEach(() => {
+        mockSettings.vectfox = {};
+    });
+
+    it('removes a stored entry whose value is falsy, so cleanup can reach zero', () => {
+        mockSettings.vectfox.vectfox_chunk_meta_dead = null;
+
+        expect(removeLegacyChunkMetadata('dead')).toBe(true);
+        expect('vectfox_chunk_meta_dead' in mockSettings.vectfox).toBe(false);
+    });
+
+    it('reports nothing to remove when the key is absent', () => {
+        expect(removeLegacyChunkMetadata('absent')).toBe(false);
     });
 });

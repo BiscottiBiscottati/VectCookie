@@ -6,8 +6,9 @@
  * settings size, the top contributing keys, the chunk-metadata entry count, the
  * over-limit warning (ADR-0003), the dry run that reports how many entries the
  * staged migration would consider redundant, patchable or orphaned, the backup
- * download that makes the one irreversible step reversible, and the sweep itself
- * with the stamp of the last run.
+ * download that makes the one irreversible step reversible, the sweep itself
+ * with the stamp of the last run, and the confirmed deletion of settings
+ * entries whose chunk exists in no registered collection.
  *
  * Opening the block costs one in-memory serialization of the settings object:
  * every action is an explicit button, and nothing imported here talks to the
@@ -49,6 +50,8 @@ const backupStatuses = new WeakMap();
  */
 const sweepResults = new WeakMap();
 const sweepStatuses = new WeakMap();
+const orphanResults = new WeakMap();
+const orphanStatuses = new WeakMap();
 
 /**
  * Containers with a collection scan in flight. Dry run, backup and sweep all
@@ -73,6 +76,7 @@ function setActionsBusy(container, busy) {
         "#vectfox_size_dry_run",
         "#vectfox_size_backup_download",
         "#vectfox_size_run_sweep",
+        "#vectfox_size_delete_orphans",
     ]) {
         const node = container.querySelector(selector);
         if (node) node.disabled = busy;
@@ -96,7 +100,17 @@ function setActionsBusy(container, busy) {
  *     an unavailable view.
  * @param {function({ onProgress?: function }): Promise<object>} [deps.runSweep]
  *     Runs the explicit sweep and resolves to the run's report view model, or an
- *     unavailable view. It is the only runner here that mutates.
+ *     unavailable view.
+ * @param {function({ onProgress?: function, confirm?: function }): Promise<object>} [deps.runDeleteOrphans]
+ *     Runs the counted, confirmation-gated deletion of orphan settings entries
+ *     and resolves to the run's report view model, or an unavailable view. Like
+ *     the sweep it mutates; unlike it, nothing is removed unless the injected
+ *     confirmation resolves true.
+ * @param {function(object): (boolean|Promise<boolean>)} [deps.confirmOrphans]
+ *     Shows the counted confirmation for orphan deletion and resolves whether
+ *     the user accepted. Injected by the wiring layer (a SillyTavern confirm
+ *     dialog) so this panel imports no host module and the cancel path needs
+ *     no dialog; when absent the runner cancels.
  * @param {(filename: string, text: string) => (boolean|void)} [deps.saveFile]
  *     Saves the backup; returns false when it cannot. Defaults to a Blob
  *     download; injected so tests can observe the file without one.
@@ -110,16 +124,18 @@ export function renderStorageHealthPanel(container, getSettings, deps = {}) {
     const view = buildStorageHealth(settings);
     const report = dryRunReports.get(container) || null;
     const sweep = sweepResults.get(container) || null;
+    const orphan = orphanResults.get(container) || null;
     const backupStatus = backupStatuses.get(container) || "";
     const sweepStatus = sweepStatuses.get(container) || "";
+    const orphanStatus = orphanStatuses.get(container) || "";
     const stampNote = formatSweepStamp(getSweepStamp(settings));
-    container.innerHTML = storageHealthHtml(
-        view,
+    container.innerHTML = storageHealthHtml(view, {
         report,
         sweep,
-        { backupStatus, sweepStatus, stampNote },
-        scansInFlight.has(container),
-    );
+        orphan,
+        statuses: { backupStatus, sweepStatus, orphanStatus, stampNote },
+        busy: scansInFlight.has(container),
+    });
 
     const refreshButton = container.querySelector("#vectfox_size_health_refresh");
     if (refreshButton) {
@@ -132,6 +148,7 @@ export function renderStorageHealthPanel(container, getSettings, deps = {}) {
     bindDryRun(container, getSettings, deps);
     bindBackup(container, getSettings, deps);
     bindSweep(container, getSettings, deps);
+    bindOrphanDelete(container, getSettings, deps);
     return view;
 }
 
@@ -156,6 +173,23 @@ async function runCollectionAction(container, action) {
 }
 
 /**
+ * A status writer for one action. It always writes the current node — a
+ * re-render replaces the node mid-action — and, when given a store, keeps the
+ * line for the next render so an in-flight action never looks idle.
+ * @param {HTMLElement} container Mount point of the health block.
+ * @param {string} statusId Selector of the action's status line.
+ * @param {WeakMap} [statuses] Persisted status lines for this action.
+ * @returns {(text: string) => void}
+ */
+function statusWriter(container, statusId, statuses = null) {
+    return (text) => {
+        statuses?.set(container, text);
+        const current = container.querySelector(statusId);
+        if (current) current.textContent = text;
+    };
+}
+
+/**
  * Wires the dry-run action. One of only two places in this module that may
  * cause a request, and only on a click.
  */
@@ -164,10 +198,7 @@ function bindDryRun(container, getSettings, deps) {
     if (!buttonOf()) return;
 
     /** Writes progress to the current node; a re-render replaces it. */
-    const setStatus = (text) => {
-        const current = container.querySelector("#vectfox_size_dry_run_status");
-        if (current) current.textContent = text;
-    };
+    const setStatus = statusWriter(container, "#vectfox_size_dry_run_status");
 
     buttonOf().onclick = async (event) => {
         event.preventDefault();
@@ -207,11 +238,7 @@ function bindBackup(container, getSettings, deps) {
      * Re-measure or a finishing dry run replaces the node; writing through the
      * lookup means an in-flight backup keeps reporting progress on the new one.
      */
-    const setStatus = (text) => {
-        backupStatuses.set(container, text);
-        const current = container.querySelector("#vectfox_size_backup_status");
-        if (current) current.textContent = text;
-    };
+    const setStatus = statusWriter(container, "#vectfox_size_backup_status", backupStatuses);
 
     buttonOf().onclick = async (event) => {
         event.preventDefault();
@@ -268,75 +295,164 @@ function bindBackup(container, getSettings, deps) {
 }
 
 /**
- * Wires the sweep action. It is the only mutating handler in this module: the
- * button is the sole trigger, and the runner owns every safety rule (the trusted
- * scan, the batch abort, the single save and the stamp). The panel only reports
- * what the run returned, then re-measures — which is how the smaller settings
- * payload becomes visible — and drops the dry-run report the run invalidated.
+ * Wires one run-and-report action: a button that starts the injected runner on
+ * click, a status line that survives re-renders, the shared busy guard, and the
+ * re-measure that makes a smaller payload visible. The dry run and the backup
+ * keep their own handlers because their results are a report and a file; the
+ * sweep and orphan deletion differ only in wording, runner options and what a
+ * measured result does to the cached dry-run report, all supplied as config.
+ * @param {HTMLElement} container Mount point of the health block.
+ * @param {function(): (object|null|undefined)} getSettings Settings getter.
+ * @param {object} deps Panel dependencies (used for the re-render).
+ * @param {object} config
+ * @param {string} config.buttonId Selector of the action's button.
+ * @param {string} config.statusId Selector of the action's status line.
+ * @param {WeakMap} config.statuses Persisted status lines for this action.
+ * @param {WeakMap} config.results Persisted run result for this action.
+ * @param {function(object): Promise<object>} config.runner The action's runner.
+ * @param {function(): object} [config.options] Extra runner options.
+ * @param {string} config.missingMessage Status when no runner is wired.
+ * @param {string} config.failureLabel Prefix for a thrown runner error.
+ * @param {string} config.unavailableMessage Fallback for an unavailable result.
+ * @param {function(object): string} config.progressText Status from runner progress.
+ * @param {function(object): void} config.onResult What a measured result does to
+ *     the cached dry-run report.
  */
-function bindSweep(container, getSettings, deps) {
-    const buttonOf = () => container.querySelector("#vectfox_size_run_sweep");
+function bindRunAction(container, getSettings, deps, {
+    buttonId,
+    statusId,
+    statuses,
+    results,
+    runner,
+    options = () => ({}),
+    missingMessage,
+    failureLabel,
+    unavailableMessage,
+    progressText,
+    onResult,
+}) {
+    const buttonOf = () => container.querySelector(buttonId);
     if (!buttonOf()) return;
 
-    /** Writes the status to both the stored state and the current node. */
-    const setStatus = (text) => {
-        sweepStatuses.set(container, text);
-        const current = container.querySelector("#vectfox_size_sweep_status");
-        if (current) current.textContent = text;
-    };
+    const setStatus = statusWriter(container, statusId, statuses);
 
     buttonOf().onclick = async (event) => {
         event.preventDefault();
         event.stopPropagation();
         if (scansInFlight.has(container)) return;
-        if (typeof deps.runSweep !== "function") {
-            setStatus("The sweep is not available in this build.");
+        if (typeof runner !== "function") {
+            setStatus(missingMessage);
             return;
         }
 
         setStatus("Scanning every registered collection…");
-        const { result, error } = await runCollectionAction(container, () => deps.runSweep({
-            onProgress: (progress) => {
-                setStatus(progress?.phase
-                    ? `Moving chunk metadata… (${progress.done}/${progress.total})`
-                    : `Scanning every registered collection… (${progress.done}/${progress.total})`);
-            },
+        const { result, error } = await runCollectionAction(container, () => runner({
+            ...options(),
+            onProgress: (progress) => setStatus(progressText(progress)),
         }));
 
         if (error) {
-            setStatus(`Sweep failed: ${error?.message || error}`);
+            setStatus(`${failureLabel}: ${error?.message || error}`);
             return;
         }
         if (result?.status !== VIEW_STATUS.MEASURED) {
-            setStatus(result?.reason || "The sweep could not run.");
+            setStatus(result?.reason || unavailableMessage);
             return;
         }
 
-        sweepResults.set(container, result);
+        results.set(container, result);
         setStatus(result.headline);
-        // The dry-run counts described the entries this run just moved; leaving
-        // them on screen beside the run's own result would be two answers.
-        if (result.outcome !== "noop") dryRunReports.delete(container);
+        onResult(result);
         renderStorageHealthPanel(container, getSettings, deps);
     };
 }
 
 /**
- * Builds the block's markup from the view model, the last dry-run report, the
- * last sweep result and the status lines.
+ * Wires the sweep action. The runner owns every safety rule (the trusted scan,
+ * the batch abort, the single save and the stamp); the panel reports what the
+ * run returned, re-measures, and drops the dry-run report the run invalidated.
+ */
+function bindSweep(container, getSettings, deps) {
+    bindRunAction(container, getSettings, deps, {
+        buttonId: "#vectfox_size_run_sweep",
+        statusId: "#vectfox_size_sweep_status",
+        statuses: sweepStatuses,
+        results: sweepResults,
+        runner: deps.runSweep,
+        missingMessage: "The sweep is not available in this build.",
+        failureLabel: "Sweep failed",
+        unavailableMessage: "The sweep could not run.",
+        progressText: (progress) => (progress?.phase
+            ? `Moving chunk metadata… (${progress.done}/${progress.total})`
+            : `Scanning every registered collection… (${progress.done}/${progress.total})`),
+        // The dry-run counts described the entries this run just moved; leaving
+        // them on screen beside the run's own result would be two answers.
+        onResult: (result) => {
+            if (result.outcome !== "noop") dryRunReports.delete(container);
+        },
+    });
+}
+
+/**
+ * Wires the orphan deletion action. It is destructive like the sweep, with the
+ * extra rule that nothing is removed until the counted confirmation resolves
+ * true: the panel supplies the dialog, the runner supplies the count and the
+ * size it asked about. An accepted run re-measures; a cancelled or refused run
+ * replaces the cached report with the scan the confirmation described, so the
+ * screen and the dialog cannot disagree.
+ */
+function bindOrphanDelete(container, getSettings, deps) {
+    bindRunAction(container, getSettings, deps, {
+        buttonId: "#vectfox_size_delete_orphans",
+        statusId: "#vectfox_size_orphan_status",
+        statuses: orphanStatuses,
+        results: orphanResults,
+        runner: deps.runDeleteOrphans,
+        // Absent, the runner treats the missing confirmation as "no".
+        options: () => ({ confirm: deps.confirmOrphans }),
+        missingMessage: "Orphan deletion is not available in this build.",
+        failureLabel: "Orphan deletion failed",
+        unavailableMessage: "The orphan deletion could not run.",
+        // The runner reports the scan first, then one step per deletion.
+        progressText: (progress) => (typeof progress?.deleted === "number"
+            ? `Removing orphan settings entries… (${progress.done}/${progress.total})`
+            : `Scanning every registered collection… (${progress.done}/${progress.total})`),
+        onResult: (result) => {
+            if (result.outcome === "complete" || result.outcome === "aborted") {
+                dryRunReports.delete(container);
+            } else if (result.scanView) {
+                dryRunReports.set(container, result.scanView);
+            }
+        },
+    });
+}
+
+/**
+ * Builds the block's markup from the view model, the cached action results and
+ * the persisted status lines.
  * @param {object} view View model from buildStorageHealth()
- * @param {object|null} [report] Dry-run report view model, if one has run.
- * @param {object|null} [sweep] Sweep report view model, if one has run.
- * @param {{ backupStatus?: string, sweepStatus?: string, stampNote?: string }} [status] Persisted status lines.
- * @param {boolean} [scanBusy] Whether a collection scan is in flight right now.
+ * @param {object} [state]
+ * @param {object|null} [state.report] Dry-run report view model, if one has run.
+ * @param {object|null} [state.sweep] Sweep report view model, if one has run.
+ * @param {object|null} [state.orphan] Orphan-deletion report view model, if one has run.
+ * @param {{ backupStatus?: string, sweepStatus?: string, orphanStatus?: string, stampNote?: string }} [state.statuses] Persisted status lines.
+ * @param {boolean} [state.busy] Whether a collection scan is in flight right now.
  * @returns {string} HTML
  */
 function storageHealthHtml(
     view,
-    report = null,
-    sweep = null,
-    { backupStatus = "", sweepStatus = "", stampNote = "" } = {},
-    scanBusy = false,
+    {
+        report = null,
+        sweep = null,
+        orphan = null,
+        statuses: {
+            backupStatus = "",
+            sweepStatus = "",
+            orphanStatus = "",
+            stampNote = "",
+        } = {},
+        busy: scanBusy = false,
+    } = {},
 ) {
     const head = `
         <div class="vectfox-size-health-head">
@@ -345,12 +461,14 @@ function storageHealthHtml(
                 <button id="vectfox_size_dry_run" class="vectfox-btn-sm" ${scanBusy ? "disabled" : ""}>${icons.listChecks(14)} Dry run</button>
                 <button id="vectfox_size_backup_download" class="vectfox-btn-sm" ${scanBusy ? "disabled" : ""}>${icons.download(14)} Download backup</button>
                 <button id="vectfox_size_run_sweep" class="vectfox-btn-sm" ${scanBusy ? "disabled" : ""}>${icons.listChecks(14)} Run sweep</button>
+                <button id="vectfox_size_delete_orphans" class="vectfox-btn-sm" ${scanBusy ? "disabled" : ""}>${icons.trash(14)} Delete orphans</button>
                 <button id="vectfox_size_health_refresh" class="vectfox-btn-sm">${icons.refreshCw(14)} Re-measure</button>
             </div>
         </div>
         <div id="vectfox_size_dry_run_status" class="vectfox-size-health-status"></div>
         <div id="vectfox_size_backup_status" class="vectfox-size-health-status">${StringUtils.escapeHtml(backupStatus)}</div>
         <div id="vectfox_size_sweep_status" class="vectfox-size-health-status">${StringUtils.escapeHtml(sweepStatus)}</div>
+        <div id="vectfox_size_orphan_status" class="vectfox-size-health-status">${StringUtils.escapeHtml(orphanStatus)}</div>
         <div class="vectfox-size-health-detail" data-sweep="stamp">${StringUtils.escapeHtml(stampNote)}</div>
     `;
 
@@ -360,6 +478,9 @@ function storageHealthHtml(
         </div>
         <div id="vectfox_size_sweep_result" class="vectfox-size-health-report">
             ${sweepResultHtml(sweep)}
+        </div>
+        <div id="vectfox_size_orphan_result" class="vectfox-size-health-report">
+            ${orphanResultHtml(orphan)}
         </div>
     `;
 
@@ -496,6 +617,26 @@ function sweepResultHtml(sweep) {
         ${sweep.refusal ? `<div class="vectfox-size-health-warning" data-sweep="refusal">${StringUtils.escapeHtml(sweep.refusal)}</div>` : ""}
         ${sweep.failure ? `<div class="vectfox-size-health-warning" data-sweep="failure">${StringUtils.escapeHtml(sweep.failure)}</div>` : ""}
         ${sweep.saveWarning ? `<div class="vectfox-size-health-warning" data-sweep="save-warning">${StringUtils.escapeHtml(sweep.saveWarning)}</div>` : ""}
+    `;
+}
+
+/**
+ * The orphan-deletion result: what the confirmed run removed, what it released,
+ * and why it refused, stopped or could not save.
+ * @param {object|null} orphan
+ * @returns {string} HTML, or an empty string before the first run.
+ */
+function orphanResultHtml(orphan) {
+    if (!orphan) return "";
+    return `
+        <div class="vectfox-size-health-headline" data-orphan="headline">${StringUtils.escapeHtml(orphan.headline)}</div>
+        <div class="vectfox-size-health-detail">
+            Orphan settings entries removed: <span data-orphan="deleted">${StringUtils.escapeHtml(orphan.counts.deleted.label)}</span>
+            · Size released: <span data-orphan="released">${StringUtils.escapeHtml(orphan.counts.released.sizeLabel)}</span>
+        </div>
+        ${orphan.refusal ? `<div class="vectfox-size-health-warning" data-orphan="refusal">${StringUtils.escapeHtml(orphan.refusal)}</div>` : ""}
+        ${orphan.failure ? `<div class="vectfox-size-health-warning" data-orphan="failure">${StringUtils.escapeHtml(orphan.failure)}</div>` : ""}
+        ${orphan.saveWarning ? `<div class="vectfox-size-health-warning" data-orphan="save-warning">${StringUtils.escapeHtml(orphan.saveWarning)}</div>` : ""}
     `;
 }
 

@@ -31,9 +31,13 @@ vi.mock('../core/collection-ids.js', () => ({
 
 import { renderSizeInspectorTab } from '../ui/size-inspector.js';
 import { runChunkMetaDryRun } from '../core/chunk-meta-sweep-report.js';
-import { createStorageSweep } from '../core/chunk-meta-storage-actions.js';
+import {
+    createStorageOrphanDelete,
+    createStorageSweep,
+} from '../core/chunk-meta-storage-actions.js';
 import { getSweepStamp, setSweepStamp } from '../core/chunk-meta-sweep-execute.js';
 import { createFakeChunkListing } from './fixtures/chunk-listing.js';
+import { settingsByteSize } from './fixtures/settings-bytes.js';
 
 /**
  * Just enough jQuery for the render path: mount, template write, event rebind.
@@ -116,7 +120,7 @@ describe("Size Inspector — storage health on open", () => {
             profiles: { default: { model: "x".repeat(3000) } },
             "vectfox_chunk_meta_a": { context: "alpha" },
         };
-        const independent = Buffer.byteLength(JSON.stringify(settings), "utf8");
+        const independent = settingsByteSize(settings);
 
         const settingsSize = healthOf(openTab(settings))
             .querySelector('[data-health="settings-size"]');
@@ -904,5 +908,305 @@ describe("Size Inspector — the sweep action", () => {
 
         expect(health.querySelector('#vectfox_size_run_sweep').disabled).toBe(false);
         expect(health.querySelector('[data-sweep="headline"]').textContent).toContain('Nothing to sweep');
+    });
+});
+
+
+/** One redundant entry, one patchable entry and two orphans on collection A. */
+const ORPHAN_CHUNKS = {
+    'qdrant:A': {
+        alpha: { context: 'about dragons', keywords: ['dragon'] },
+        beta: { context: 'about elves' },
+    },
+};
+
+function orphanDeleteSettings() {
+    return {
+        chunk_size: 500,
+        'vectfox_chunk_meta_alpha': { context: 'about dragons', keywords: ['dragon'] },
+        'vectfox_chunk_meta_beta': { context: 'about elves', keywords: ['elf'] },
+        'vectfox_chunk_meta_gone': { context: 'about nothing' },
+        'vectfox_chunk_meta_gone2': { context: 'still nothing', keywords: ['void'] },
+    };
+}
+
+function legacyEntriesOf(settings) {
+    return Object.fromEntries(
+        Object.entries(settings)
+            .filter(([key]) => key.startsWith('vectfox_chunk_meta_'))
+            .map(([key, metadata]) => [key.slice('vectfox_chunk_meta_'.length), metadata]),
+    );
+}
+
+/**
+ * The production orphan-deletion entry point over the fake listing and a
+ * settings object that really loses its legacy keys, so the panel test sees the
+ * shrink this action exists to produce. `confirm` is what the panel injects.
+ */
+function makeOrphanDelete(settings, { deleteEntry, persistSettings = vi.fn() } = {}) {
+    const { listChunks, patchMetadata } = createFakeChunkListing({
+        chunksByCollection: ORPHAN_CHUNKS,
+        reportTotal: true,
+    });
+    const runner = createStorageOrphanDelete({
+        createTransport: () => ({ isAvailable: () => true, listChunks, patchMetadata }),
+        listCollections: () => [{ registryKey: 'qdrant:A', collectionId: 'A' }],
+        listEntries: () => legacyEntriesOf(settings),
+        clientOnlyFields: ['summaries'],
+        deleteEntry: deleteEntry || ((hash) => {
+            const key = `vectfox_chunk_meta_${hash}`;
+            if (!(key in settings)) return false;
+            delete settings[key];
+            return true;
+        }),
+        persistSettings,
+    });
+    return ({ onProgress, confirm } = {}) => runner({
+        getSettings: () => settings,
+        onProgress,
+        confirm,
+    });
+}
+
+/** The dry run over the same collection, so the report and the deletion agree. */
+function makeOrphanDryRun(settings) {
+    return makeDryRun({
+        entries: legacyEntriesOf(settings),
+        collections: [{ collectionId: 'A' }],
+        chunksByCollection: { A: ORPHAN_CHUNKS['qdrant:A'] },
+    });
+}
+
+function orphanStatusOf(health) {
+    return health.querySelector('#vectfox_size_orphan_status').textContent;
+}
+
+describe("Size Inspector — deleting orphans behind a confirmation", () => {
+    it("offers the button but runs nothing until it is clicked", async () => {
+        const settings = orphanDeleteSettings();
+        const runDeleteOrphans = vi.fn(makeOrphanDelete(settings));
+
+        const health = healthOf(openTab(settings, { runDeleteOrphans }));
+        await settle();
+
+        const button = health.querySelector('#vectfox_size_delete_orphans');
+        expect(button).not.toBeNull();
+        expect(button.disabled).toBe(false);
+        expect(runDeleteOrphans).not.toHaveBeenCalled();
+    });
+
+    it("asks with the count and the released size, then deletes and re-measures", async () => {
+        const settings = orphanDeleteSettings();
+        const runDeleteOrphans = vi.fn(makeOrphanDelete(settings));
+        const before = settingsByteSize(settings);
+        let asked = null;
+        const confirmOrphans = vi.fn((view) => {
+            asked = view;
+            // Nothing may be gone before the dialog has an answer.
+            expect(settings['vectfox_chunk_meta_gone']).toBeDefined();
+            expect(settings['vectfox_chunk_meta_gone2']).toBeDefined();
+            return true;
+        });
+        const health = healthOf(openTab(settings, { runDeleteOrphans, confirmOrphans }));
+
+        health.querySelector('#vectfox_size_delete_orphans').click();
+        await settle();
+
+        expect(confirmOrphans).toHaveBeenCalledTimes(1);
+        expect(asked.headline).toContain('2 orphan settings entries');
+        expect(asked.entries.label).toBe('2');
+        expect(asked.bytes.bytes).toBeGreaterThan(0);
+        expect(asked.detail).toContain('none of the registered collections this scan read');
+
+        delete settings['vectfox_chunk_meta_gone'];
+        delete settings['vectfox_chunk_meta_gone2'];
+        expect(settingsByteSize(settings)).toBe(before - asked.bytes.bytes);
+        expect(settings['vectfox_chunk_meta_beta']).toBeDefined();
+
+        const result = health.querySelector('#vectfox_size_orphan_result');
+        expect(result.querySelector('[data-orphan="headline"]').textContent)
+            .toContain('Deleted 2 orphan settings entries');
+        expect(result.querySelector('[data-orphan="deleted"]').textContent).toBe('2');
+        expect(result.querySelector('[data-orphan="released"]').textContent)
+            .toBe(asked.bytes.sizeLabel);
+        expect(orphanStatusOf(health)).toContain('Deleted 2');
+        // The block re-measured itself, so the smaller payload is visible.
+        expect(health.querySelector('[data-health="chunk-meta"]').textContent)
+            .toContain('2 entries');
+    });
+
+    it("deletes nothing when the user cancels and keeps the dry-run report", async () => {
+        const settings = orphanDeleteSettings();
+        const runDeleteOrphans = vi.fn(makeOrphanDelete(settings));
+        const runDryRun = vi.fn(makeOrphanDryRun(settings));
+        const confirmOrphans = vi.fn(() => false);
+        const health = healthOf(openTab(settings, { runDeleteOrphans, runDryRun, confirmOrphans }));
+
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+        expect(health.querySelector('[data-dry-run="total-orphan"]').textContent).toBe('2');
+
+        health.querySelector('#vectfox_size_delete_orphans').click();
+        await settle();
+
+        expect(settings['vectfox_chunk_meta_gone']).toBeDefined();
+        expect(settings['vectfox_chunk_meta_gone2']).toBeDefined();
+        expect(orphanStatusOf(health)).toContain('Nothing was deleted');
+        expect(health.querySelector('[data-orphan="headline"]').textContent)
+            .toContain('Nothing was deleted');
+        expect(health.querySelector('[data-orphan="deleted"]').textContent).toBe('0');
+        // Nothing was removed, so nothing was released — never the size the
+        // dialog offered.
+        expect(health.querySelector('[data-orphan="released"]').textContent).toBe('0 B');
+        // The report still describes the settings, so it is not dropped.
+        expect(health.querySelector('[data-dry-run="total-orphan"]').textContent).toBe('2');
+    });
+
+    it("drops the stale dry-run report after the orphans are gone", async () => {
+        const settings = orphanDeleteSettings();
+        const runDeleteOrphans = vi.fn(makeOrphanDelete(settings));
+        const runDryRun = vi.fn(makeOrphanDryRun(settings));
+        const health = healthOf(openTab(settings, {
+            runDeleteOrphans,
+            runDryRun,
+            confirmOrphans: () => true,
+        }));
+
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+        health.querySelector('#vectfox_size_delete_orphans').click();
+        await settle();
+
+        expect(health.querySelector('[data-dry-run="headline"]')).toBeNull();
+        expect(health.querySelector('[data-orphan="headline"]').textContent)
+            .toContain('Deleted 2 orphan settings entries');
+    });
+
+    it("shows a failed save beside the deletion instead of calling it a failure", async () => {
+        const settings = orphanDeleteSettings();
+        const runDeleteOrphans = vi.fn(makeOrphanDelete(settings, {
+            persistSettings: vi.fn(() => { throw new Error('disk full'); }),
+        }));
+        const health = healthOf(openTab(settings, {
+            runDeleteOrphans,
+            confirmOrphans: () => true,
+        }));
+
+        health.querySelector('#vectfox_size_delete_orphans').click();
+        await settle();
+
+        expect(health.querySelector('[data-orphan="save-warning"]').textContent)
+            .toContain('could not be saved');
+        expect(health.querySelector('[data-orphan="failure"]')).toBeNull();
+    });
+
+    it("shows the refusal instead of a deletion when a collection could not be read", async () => {
+        const runDeleteOrphans = vi.fn(async () => ({
+            status: 'measured',
+            outcome: 'refused',
+            trusted: false,
+            headline: 'No orphans were deleted — the scan could not verify every collection.',
+            refusal: 'Deletion is refused for this run — 1 of 2 collections could not be read.',
+            failure: null,
+            saveWarning: null,
+            counts: {
+                entries: { count: 0, label: '0' },
+                deleted: { count: 0, label: '0' },
+                released: { bytes: 0, sizeLabel: '0 B', exactLabel: '0' },
+            },
+        }));
+        const health = healthOf(openTab(orphanDeleteSettings(), {
+            runDeleteOrphans,
+            confirmOrphans: () => true,
+        }));
+
+        health.querySelector('#vectfox_size_delete_orphans').click();
+        await settle();
+
+        expect(health.querySelector('[data-orphan="refusal"]').textContent)
+            .toContain('could not be read');
+        expect(health.querySelector('[data-orphan="headline"]').textContent)
+            .toContain('could not verify');
+        expect(orphanStatusOf(health)).toContain('could not verify');
+    });
+
+    it("reports an unavailable deletion instead of pretending it ran", async () => {
+        const runDeleteOrphans = vi.fn(async () => ({
+            status: 'unavailable',
+            reason: 'The Similharity plugin is not available, so there is no chunk payload to compare against.',
+        }));
+        const health = healthOf(openTab(orphanDeleteSettings(), { runDeleteOrphans }));
+
+        health.querySelector('#vectfox_size_delete_orphans').click();
+        await settle();
+
+        expect(orphanStatusOf(health)).toContain('Similharity plugin is not available');
+        expect(health.querySelector('[data-orphan="headline"]')).toBeNull();
+        expect(health.querySelector('#vectfox_size_delete_orphans').disabled).toBe(false);
+    });
+
+    it("says the deletion is unavailable when no runner is wired", async () => {
+        const health = healthOf(openTab(orphanDeleteSettings()));
+
+        health.querySelector('#vectfox_size_delete_orphans').click();
+        await settle();
+
+        expect(orphanStatusOf(health)).toContain('not available in this build');
+    });
+
+    it("reports a runner failure and leaves the button usable", async () => {
+        const runDeleteOrphans = vi.fn(async () => { throw new Error('backend went away'); });
+        const health = healthOf(openTab(orphanDeleteSettings(), { runDeleteOrphans }));
+
+        health.querySelector('#vectfox_size_delete_orphans').click();
+        await settle();
+
+        expect(orphanStatusOf(health)).toContain('Orphan deletion failed: backend went away');
+        expect(health.querySelector('#vectfox_size_delete_orphans').disabled).toBe(false);
+    });
+
+    it("refuses to start while another collection action is in flight", async () => {
+        let release;
+        const runDeleteOrphans = vi.fn(() => new Promise((resolve) => { release = resolve; }));
+        const runDryRun = vi.fn(makeOrphanDryRun(orphanDeleteSettings()));
+        const health = healthOf(openTab(orphanDeleteSettings(), { runDeleteOrphans, runDryRun }));
+        const button = health.querySelector('#vectfox_size_delete_orphans');
+
+        button.click();
+        await settle();
+
+        expect(button.disabled).toBe(true);
+        for (const selector of [
+            '#vectfox_size_dry_run',
+            '#vectfox_size_backup_download',
+            '#vectfox_size_run_sweep',
+        ]) {
+            expect(health.querySelector(selector).disabled).toBe(true);
+        }
+
+        button.click();
+        health.querySelector('#vectfox_size_dry_run').click();
+        await settle();
+        expect(runDeleteOrphans).toHaveBeenCalledTimes(1);
+        expect(runDryRun).not.toHaveBeenCalled();
+
+        release({
+            status: 'measured',
+            outcome: 'cancelled',
+            headline: 'Nothing was deleted — the removal of 2 orphan settings entries was cancelled.',
+            failure: null,
+            saveWarning: null,
+            refusal: null,
+            counts: {
+                entries: { count: 2, label: '2' },
+                deleted: { count: 0, label: '0' },
+                released: { bytes: 0, sizeLabel: '0 B', exactLabel: '0' },
+            },
+        });
+        await settle();
+
+        expect(health.querySelector('#vectfox_size_delete_orphans').disabled).toBe(false);
+        expect(health.querySelector('[data-orphan="headline"]').textContent)
+            .toContain('Nothing was deleted');
     });
 });

@@ -59,27 +59,39 @@ export function formatCount(value) {
     return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
-/** The noun half of an entry count: "entry" or "entries". */
-function entryNoun(count) {
-    return count === 1 ? 'entry' : 'entries';
+/**
+ * The singular or plural form of a counted noun. One owner for the decision, so
+ * the entry count, the warning and the orphan confirmation cannot disagree.
+ * @param {number} count
+ * @param {string} singular
+ * @param {string} plural
+ * @returns {string}
+ */
+export function formatNoun(count, singular, plural) {
+    return count === 1 ? singular : plural;
 }
 
 /**
- * Human label for a chunk-metadata entry count: "1 entry", "1,200 entries".
+ * Human label for an entry count: "1 entry", "1,200 entries". The noun is
+ * parameterised because the orphan confirmation counts a specific kind of
+ * entry — "1 orphan settings entry" — with the same pluralisation and grouping.
  * @param {number} count
+ * @param {string} [singular] Noun for one.
+ * @param {string} [plural] Noun for many.
  * @returns {string}
  */
-export function formatEntryCount(count) {
-    return `${count === 1 ? 1 : formatCount(count)} ${entryNoun(count)}`;
+export function formatEntryCount(count, singular = 'entry', plural = 'entries') {
+    return `${count === 1 ? 1 : formatCount(count)} ${formatNoun(count, singular, plural)}`;
 }
 
 /**
  * Everything the UI shows about one measured size: the raw bytes, the short
- * human label, and the exact grouped byte count.
+ * human label, and the exact grouped byte count. Exported so the orphan
+ * confirmation reports a released size in exactly the units the panel uses.
  * @param {number} bytes
  * @returns {{ bytes: number, sizeLabel: string, exactLabel: string }}
  */
-function sizeInfo(bytes) {
+export function sizeInfo(bytes) {
     return { bytes, sizeLabel: formatSize(bytes), exactLabel: formatCount(bytes) };
 }
 
@@ -93,8 +105,14 @@ function utf8ByteLength(text) {
     return bytes;
 }
 
-/** Serialized size of one settings value; 0 for values JSON drops (undefined). */
-function serializedSize(value) {
+/**
+ * Serialized size of one value; 0 for values JSON drops (undefined). Exported
+ * so the orphan confirmation prices the entries it removes with this exact
+ * measure instead of defining a second one.
+ * @param {unknown} value
+ * @returns {number}
+ */
+export function serializedSize(value) {
     const text = JSON.stringify(value);
     return text === undefined ? 0 : utf8ByteLength(text);
 }
@@ -150,7 +168,8 @@ function warningFor(total, chunkMeta) {
     }
     const chunkLine = chunkMeta.count === 0
         ? 'No chunk-metadata entries in settings.'
-        : `${chunkMeta.countLabel} chunk-metadata ${entryNoun(chunkMeta.count)} ${chunkMeta.count === 1 ? 'accounts' : 'account'} for ${chunkMeta.sizeLabel}.`;
+        : `${chunkMeta.countLabel} chunk-metadata ${formatNoun(chunkMeta.count, 'entry', 'entries')} `
+            + `${formatNoun(chunkMeta.count, 'accounts', 'account')} for ${chunkMeta.sizeLabel}.`;
     return `Extension settings are ${total.sizeLabel} — past the ${formatSize(WARN_BYTES)} health limit. ${chunkLine}`;
 }
 

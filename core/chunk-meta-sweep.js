@@ -204,17 +204,22 @@ export function planChunkMetaSweep({
             row => COMPLETE_SCAN_STATUSES.has(row.status) && row.chunks?.has(hash),
         );
 
-        if (containing.length > 0) {
-            if (carriesClientOnlyMetadata(entry, clientOnlyFields)) {
-                plan.skipped.push({
-                    hash,
-                    reason: 'client-only',
-                    collections: containing.map(row => row.registryKey),
-                });
-                for (const row of containing) row.skipped += 1;
-                continue;
-            }
+        // A client-only field has no payload copy anywhere, so the entry is kept
+        // whether or not a scanned collection holds its chunk: deleting it would
+        // discard data no payload can restore. This is checked before orphan
+        // classification, because an entry absent from every collection would
+        // otherwise be deletable while still being the only copy of `summaries`.
+        if (carriesClientOnlyMetadata(entry, clientOnlyFields)) {
+            plan.skipped.push({
+                hash,
+                reason: 'client-only',
+                collections: containing.map(row => row.registryKey),
+            });
+            for (const row of containing) row.skipped += 1;
+            continue;
+        }
 
+        if (containing.length > 0) {
             // Every complete-scan collection that holds the hash justifies the
             // removal: it is where the value lives after the payload write.
             deletable.push({ hash, collections: containing.map(row => row.registryKey) });

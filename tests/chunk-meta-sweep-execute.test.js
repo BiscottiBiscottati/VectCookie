@@ -23,6 +23,7 @@ import {
 import { planChunkMetaSweep } from '../core/chunk-meta-sweep.js';
 import { runChunkMetaDryRun } from '../core/chunk-meta-sweep-report.js';
 import { createFakeChunkListing } from './fixtures/chunk-listing.js';
+import { settingsByteSize } from './fixtures/settings-bytes.js';
 
 const NOW = new Date('2026-11-12T09:30:00.000Z');
 const PREFIX = 'vectfox_chunk_meta_';
@@ -686,12 +687,12 @@ describe('sweep execution — the settings payload shrinks', () => {
                 Object.entries(entries).map(([hash, metadata]) => [`${PREFIX}${hash}`, metadata]),
             ),
         };
-        const before = Buffer.byteLength(JSON.stringify(settings), 'utf8');
+        const before = settingsByteSize(settings);
         const harness = makeHarness({ plan, settings });
 
         await harness.run();
 
-        const after = Buffer.byteLength(JSON.stringify(settings), 'utf8');
+        const after = settingsByteSize(settings);
         expect(after).toBeLessThan(before);
         expect(Object.keys(settings).filter(key => key.startsWith(PREFIX))).toHaveLength(0);
     });

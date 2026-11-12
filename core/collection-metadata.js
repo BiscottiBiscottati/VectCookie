@@ -365,17 +365,24 @@ function writeLegacyChunkMetadata(hash, metadata) {
 
 /**
  * Deletes one legacy settings entry without saving. Callers own persistence:
- * the store's delete path saves after calling this, and the sweep removes
- * thousands of entries in one run and saves once at the end.
+ * the store's delete path saves after calling this, and the sweep and the
+ * orphan deletion remove thousands of entries in one run and save once at the
+ * end.
+ *
+ * Presence, not truthiness, decides whether there was an entry: a stored value
+ * of `null`, `0` or `''` is still a key that occupies the settings payload, and
+ * reporting it as "already gone" would leave it behind on every run — the
+ * orphan count would never reach zero.
  * @param {string} hash Chunk hash
  * @returns {boolean} Whether an entry was there to remove
  */
 export function removeLegacyChunkMetadata(hash) {
+    const store = extension_settings?.vectfox;
     const key = chunkMetaSettingsKey(hash);
-    if (!extension_settings?.vectfox?.[key]) {
+    if (!store || !Object.prototype.hasOwnProperty.call(store, key)) {
         return false;
     }
-    delete extension_settings.vectfox[key];
+    delete store[key];
     return true;
 }
 

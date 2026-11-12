@@ -180,6 +180,22 @@ describe('sweep planner — entries needing a payload patch', () => {
         expect(plan.skipped[0]).toEqual({ hash: 'h1', reason: 'client-only', collections: ['A'] });
     });
 
+    it('keeps an absent client-only entry, which is never an orphan to delete', () => {
+        // summaries exists only in settings. Even with no collection holding the
+        // chunk, deleting it would discard the only copy, so it is skipped.
+        const plan = planChunkMetaSweep({
+            entries: { h1: { summaries: ['the only copy'] } },
+            collections: [collection('A')],
+            scans: [scan('A', { other: { context: 'unrelated' } })],
+            clientOnlyFields: ['summaries'],
+        });
+
+        expect(plan.orphan).toEqual([]);
+        expect(plan.counts.orphan).toBe(0);
+        expect(plan.skipped).toEqual([{ hash: 'h1', reason: 'client-only', collections: [] }]);
+        expect(plan.skippedByReason).toEqual({ unverified: 0, clientOnly: 1 });
+    });
+
     it('proposes patches for every collection that lacks the field', () => {
         const plan = planChunkMetaSweep({
             entries: { shared: { context: 'about dragons', keywords: ['dragon'] } },

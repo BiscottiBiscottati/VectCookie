@@ -14,13 +14,14 @@
 import { describe, it, expect } from 'vitest';
 
 import { buildStorageHealth } from '../core/storage-health.js';
+import { settingsByteSize } from './fixtures/settings-bytes.js';
 
 /**
  * Independent measurement — UTF-8 bytes on the wire, from Node's own encoder
  * rather than this module's code-point walk.
  */
 function independentBytes(settings) {
-    return Buffer.byteLength(JSON.stringify(settings), 'utf8');
+    return settingsByteSize(settings);
 }
 
 /** 1200 chunk-metadata entries — the shape a real library accumulates. */

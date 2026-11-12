@@ -16,8 +16,16 @@ import {
     planChunkMetaSweep,
     scanChunkMetaCollections,
 } from './chunk-meta-sweep.js';
-import { formatCount } from './storage-health.js';
+import {
+    formatCount,
+    formatEntryCount,
+    formatNoun,
+    sizeInfo,
+} from './storage-health.js';
 import { VIEW_STATUS } from './view-status.js';
+
+/** Every refusal sentence opens with this claim, so the wording has one owner. */
+const DELETION_REFUSED_PREFIX = 'Deletion is refused for this run';
 
 /** Human label for each scan status. */
 const STATUS_LABELS = {
@@ -50,34 +58,51 @@ function refusalFor(plan) {
 
     const total = plan.coverage.registered;
     if (status === 'empty-registry') {
-        return 'Deletion is refused for this run — no registered collections were available to scan.';
+        return `${DELETION_REFUSED_PREFIX} — no registered collections were available to scan.`;
     }
 
     const count = countStatus(plan, status);
     switch (status) {
         case 'unscanned':
-            return `Deletion is refused for this run — ${count} of ${total} collections were not scanned.`;
+            return `${DELETION_REFUSED_PREFIX} — ${count} of ${total} collections were not scanned.`;
         case 'failed':
-            return `Deletion is refused for this run — ${count} of ${total} collections could not be read.`;
+            return `${DELETION_REFUSED_PREFIX} — ${count} of ${total} collections could not be read.`;
         case 'metadata-missing':
-            return `Deletion is refused for this run — ${count} of ${total} collections returned no chunk metadata.`;
+            return `${DELETION_REFUSED_PREFIX} — ${count} of ${total} collections returned no chunk metadata.`;
         default:
-            return `Deletion is refused for this run — ${count} of ${total} collections could not be verified.`;
+            return `${DELETION_REFUSED_PREFIX} — ${count} of ${total} collections could not be verified.`;
     }
 }
 
 /**
- * Explains skips the per-collection rows cannot attribute: an unverified entry
- * may live in a collection that was never read, so it belongs to no row.
+ * Explains skips no per-collection row can account for. Two kinds belong to no
+ * row: an unverified entry may live in a collection that was never read, and a
+ * client-only entry that no collection holds is kept because its data has no
+ * payload copy. Either makes the skipped total exceed the sum of the rows.
  * @param {object} plan
- * @returns {string|null}
+ * @returns {string|null} One sentence per kind, or null when every skip is
+ *     attributable to a row.
  */
 function skippedNoteFor(plan) {
+    const notes = [];
     const unverified = plan.skippedByReason.unverified;
-    if (unverified === 0) return null;
-    const noun = unverified === 1 ? 'entry' : 'entries';
-    const pronoun = unverified === 1 ? 'it' : 'they';
-    return `${unverified} skipped ${noun} could not be attributed to a collection: ${pronoun} may live in one that was not read.`;
+    if (unverified > 0) {
+        notes.push(`${unverified} skipped ${formatNoun(unverified, 'entry', 'entries')} could not be `
+            + `attributed to a collection: ${formatNoun(unverified, 'it', 'they')} may live in one `
+            + 'that was not read.');
+    }
+    // A client-only entry that no collection holds belongs to no row either;
+    // it is kept because its data has no payload copy, not because it may live
+    // in an unread collection.
+    const clientOnly = (plan.skipped || []).filter(
+        record => record.reason === 'client-only' && (record.collections?.length || 0) === 0,
+    ).length;
+    if (clientOnly > 0) {
+        notes.push(`${formatCount(clientOnly)} skipped ${formatNoun(clientOnly, 'entry', 'entries')} `
+            + `${formatNoun(clientOnly, 'holds', 'hold')} client-only data (no payload can carry it) `
+            + `and ${formatNoun(clientOnly, 'is', 'are')} kept.`);
+    }
+    return notes.length > 0 ? notes.join(' ') : null;
 }
 
 /**
@@ -95,7 +120,8 @@ export function buildSweepReportView(plan) {
         untrustedReason: plan.untrustedReason,
         headline: `${formatCount(plan.entries)} entries checked — `
             + `${counts.redundant} redundant, ${counts.patch} need patching, `
-            + `${counts.orphan} ${counts.orphan === 1 ? 'orphan' : 'orphans'}, ${counts.skipped} skipped.`,
+            + `${formatCount(counts.orphan)} ${formatNoun(counts.orphan, 'orphan', 'orphans')}, `
+            + `${formatCount(counts.skipped)} skipped.`,
         coverageLabel: `${plan.coverage.scanned} of ${plan.coverage.registered} collections fully read`,
         refusal: refusalFor(plan),
         skippedNote: skippedNoteFor(plan),
@@ -148,19 +174,118 @@ export async function runChunkMetaDryRun({
 }
 
 // ============================================================================
-// SWEEP RUN REPORT
+// ORPHAN DELETION
 // ============================================================================
 
 /**
- * A count with its noun in the singular or plural form.
+ * Human label for the entries this action removes: "2 orphan settings entries".
+ * The action must never be read as the sweep's redundant or patchable count.
  * @param {number} count
- * @param {string} singular
- * @param {string} plural
  * @returns {string}
  */
-function nounCount(count, singular, plural) {
-    return `${count} ${count === 1 ? singular : plural}`;
+function orphanEntryCount(count) {
+    return formatEntryCount(count, 'orphan settings entry', 'orphan settings entries');
 }
+
+/**
+ * The counted confirmation shown before orphan entries are removed. It states
+ * both numbers the ticket requires — how many entries and how much size — and
+ * names the rule that made them orphans, so the user is confirming the same
+ * claim the dry run reported.
+ * @param {object} decision Output of decideChunkMetaOrphanDelete().
+ * @returns {object} Confirmation view model: headline, detail and button labels.
+ */
+export function buildOrphanDeleteConfirmView(decision) {
+    const entries = Number(decision?.entries) || 0;
+    const size = sizeInfo(Number(decision?.bytes) || 0);
+    return {
+        status: VIEW_STATUS.MEASURED,
+        headline: `Delete ${orphanEntryCount(entries)}?`,
+        detail: 'These entries were found in none of the registered collections this scan '
+            + `read. Removing them releases ${size.sizeLabel} from the settings payload. `
+            + 'Download a backup first if you are unsure — this cannot be undone.',
+        entries: countCell(entries),
+        bytes: size,
+        okButton: `Delete ${orphanEntryCount(entries)}`,
+        cancelButton: 'Cancel',
+    };
+}
+
+/**
+ * The report of one orphan-deletion run: what it removed, what it released, why
+ * it refused or was cancelled, and whether the save succeeded. Formatting lives
+ * here so the renderer places text only.
+ * @param {object} run Output of executeChunkMetaOrphanDelete().
+ * @param {{ refusal?: string|null, untrustedReason?: string|null }} [options]
+ * @param {string|null} [options.refusal] The scan's refusal sentence, when the
+ *     run was untrusted and could not have deleted anyway.
+ * @param {string|null} [options.untrustedReason] Why the scan was untrusted
+ *     (`empty-registry` or the spoiling scan status), so the headline names the
+ *     actual reason instead of assuming a failed collection.
+ * @returns {object} View model.
+ */
+export function buildOrphanDeleteRunView(run, { refusal = null, untrustedReason = null } = {}) {
+    const entries = Number(run.entries) || 0;
+    const deleted = Number(run.counts?.deleted) || 0;
+    // What this run actually removed, never the decision's full prediction: a
+    // cancel or a stop releases only the entries whose deletion succeeded.
+    const size = sizeInfo(Number(run.releasedBytes) || 0);
+
+    let headline;
+    switch (run.status) {
+        case 'refused':
+            headline = untrustedReason === 'empty-registry'
+                ? 'No orphans were deleted — no registered collections were available to scan.'
+                : 'No orphans were deleted — the scan could not verify every collection.';
+            break;
+        case 'empty':
+            headline = 'No orphan settings entries — nothing was deleted.';
+            break;
+        case 'cancelled':
+            headline = `Nothing was deleted — the removal of ${orphanEntryCount(entries)} was cancelled.`;
+            break;
+        case 'aborted':
+            headline = `Deletion stopped — ${orphanEntryCount(deleted)} removed before it stopped.`;
+            break;
+        default:
+            if (deleted === 0) {
+                headline = `Nothing was deleted — ${orphanEntryCount(entries)} `
+                    + `${formatNoun(entries, 'was', 'were')} already gone.`;
+            } else if (deleted === entries) {
+                headline = `Deleted ${orphanEntryCount(entries)} — released ${size.sizeLabel}.`;
+            } else {
+                headline = `Deleted ${formatCount(deleted)} of ${orphanEntryCount(entries)} `
+                    + `— released ${size.sizeLabel}.`;
+            }
+    }
+
+    return {
+        status: VIEW_STATUS.MEASURED,
+        outcome: run.status,
+        trusted: run.trusted === true,
+        headline,
+        failure: run.error
+            ? `The deletion stopped early: ${run.error}. Entries it had already removed stay `
+                + 'removed; the rest were left alone.'
+            : null,
+        saveWarning: run.saveError
+            ? `The deletion finished, but the settings could not be saved: ${run.saveError}. `
+                + 'The removed entries come back on a reload until a settings save succeeds.'
+            : null,
+        refusal: run.status === 'refused'
+            ? (refusal || `${DELETION_REFUSED_PREFIX} — no orphan entry was removed.`)
+            : null,
+        counts: {
+            entries: countCell(entries),
+            deleted: countCell(deleted),
+            released: size,
+        },
+    };
+}
+
+// ============================================================================
+// SWEEP RUN REPORT
+// ============================================================================
 
 /**
  * A stamp timestamp in a compact, unambiguous form. The stamp is support
@@ -193,8 +318,8 @@ export function formatSweepStamp(stamp) {
     const deleted = Number(counts.deleted) || 0;
     const unsaved = stamp.persisted === false ? ' — not saved yet' : '';
     return `Last sweep ${outcome} (${stamp.mode || 'payload'} mode): `
-        + `${nounCount(patched, 'entry', 'entries')} patched, `
-        + `${nounCount(deleted, 'settings entry', 'settings entries')} removed${unsaved}.`;
+        + `${formatEntryCount(patched, 'entry', 'entries')} patched, `
+        + `${formatEntryCount(deleted, 'settings entry', 'settings entries')} removed${unsaved}.`;
 }
 
 /**
@@ -202,15 +327,18 @@ export function formatSweepStamp(stamp) {
  * delete, and the stamp it left behind. Formatting lives here so the renderer
  * places text only.
  * @param {object} run Output of executeChunkMetaSweep().
- * @param {{ refusal?: string|null }} [options]
+ * @param {{ refusal?: string|null, untrustedReason?: string|null }} [options]
  * @param {string|null} [options.refusal] The scan's refusal sentence, when the
  *     run was untrusted and could not have deleted anyway.
+ * @param {string|null} [options.untrustedReason] Why the scan was untrusted
+ *     (`empty-registry` or the spoiling scan status), so the headline names the
+ *     actual reason instead of assuming a failed collection.
  * @returns {object} View model.
  */
 export function buildSweepRunView(run, { refusal = null } = {}) {
     const patched = run.counts.patched;
     const deleted = run.counts.deleted;
-    const removed = nounCount(deleted, 'settings entry', 'settings entries');
+    const removed = formatEntryCount(deleted, 'settings entry', 'settings entries');
 
     let headline;
     if (run.status === 'noop') {
@@ -219,10 +347,10 @@ export function buildSweepRunView(run, { refusal = null } = {}) {
         // settings entries.
         headline = 'Nothing to sweep — no settings entry is waiting to be patched or removed.';
     } else if (run.status === 'aborted') {
-        headline = `Sweep stopped — ${nounCount(patched, 'entry', 'entries')} patched, `
+        headline = `Sweep stopped — ${formatEntryCount(patched, 'entry', 'entries')} patched, `
             + `${removed} removed before it stopped.`;
     } else {
-        headline = `Sweep complete — ${nounCount(patched, 'entry', 'entries')} patched, `
+        headline = `Sweep complete — ${formatEntryCount(patched, 'entry', 'entries')} patched, `
             + `${removed} removed.`;
     }
 
@@ -241,7 +369,7 @@ export function buildSweepRunView(run, { refusal = null } = {}) {
                 + 'deletions and the stamp are in memory only until a settings save succeeds.'
             : null,
         refusal: run.deletionRefused
-            ? (refusal || 'Deletion is refused for this run — no settings entry was removed.')
+            ? (refusal || `${DELETION_REFUSED_PREFIX} — no settings entry was removed.`)
             : null,
         resumedNote: run.resumed
             ? `Continuing the interrupted run that started ${stampTimeOf(run.stamp.startedAt)} — `

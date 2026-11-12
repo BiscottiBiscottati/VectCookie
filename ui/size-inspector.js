@@ -45,8 +45,14 @@ const _cache = {
  *     Runs the same scan and returns the backup file's name and contents, its
  *     entry-count label, and the report of the scan it used.
  * @param {function({ onProgress?: function }): Promise<object>} [deps.runSweep]
- *     Runs the explicit sweep and returns its result. The only mutating runner;
- *     it deletes legacy settings copies after the payload write succeeds.
+ *     Runs the explicit sweep and returns its result. It deletes legacy settings
+ *     copies after the payload write succeeds.
+ * @param {function({ onProgress?: function, confirm?: function }): Promise<object>} [deps.runDeleteOrphans]
+ *     Runs the confirmation-gated deletion of entries whose chunk exists in no
+ *     registered collection, and returns its result.
+ * @param {function(object): (boolean|Promise<boolean>)} [deps.confirmOrphans]
+ *     Shows the counted confirmation for orphan deletion; without it the run
+ *     cancels and deletes nothing.
  * @param {(filename: string, text: string) => void} [deps.saveFile]
  *     Saves the backup; the panel defaults to a Blob download.
  */
