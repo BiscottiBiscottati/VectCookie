@@ -1,0 +1,6 @@
+#!/bin/sh
+# Reject commit messages that break the project's Conventional Commits rules.
+# Rules live in scripts/check-commit-msg.mjs; installed by `npm run hooks:install`.
+set -u
+root=$(git rev-parse --show-toplevel) || exit 1
+exec node "$root/scripts/check-commit-msg.mjs" "$1"

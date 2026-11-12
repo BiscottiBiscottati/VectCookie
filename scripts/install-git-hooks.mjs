@@ -1,9 +1,14 @@
 /**
- * Install the tracked pre-commit hook that runs `npm run check`.
+ * Install the tracked git hooks that guard commits.
  *
- * Hooks under `.git/hooks` are per-clone and are not committed, so the tracked
- * source lives at `.githooks/pre-commit` and this installer copies it. Re-run
- * after cloning. Existing hooks are preserved unless --force.
+ * Two hooks, both copied from `.githooks/` because `.git/hooks` is per-clone and
+ * not committed:
+ *
+ *   - `pre-commit` runs `npm run check`.
+ *   - `commit-msg` rejects subjects that break the Conventional Commits rules
+ *     (scripts/check-commit-msg.mjs).
+ *
+ * Re-run after cloning. Existing hooks are preserved unless --force.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -12,12 +17,8 @@ import path from 'node:path';
 import process from 'node:process';
 
 const force = process.argv.includes('--force');
-const sourcePath = path.join(import.meta.dirname, '..', '.githooks', 'pre-commit');
-
-if (!fs.existsSync(sourcePath)) {
-    console.error(`hooks:install: missing tracked hook at ${sourcePath}`);
-    process.exit(1);
-}
+const sourceDir = path.join(import.meta.dirname, '..', '.githooks');
+const hookNames = ['pre-commit', 'commit-msg'];
 
 let gitDir;
 try {
@@ -28,23 +29,37 @@ try {
 }
 
 const hooksDir = path.join(gitDir, 'hooks');
-const hookPath = path.join(hooksDir, 'pre-commit');
-const hook = fs.readFileSync(sourcePath);
+fs.mkdirSync(hooksDir, { recursive: true });
 
-if (fs.existsSync(hookPath) && !force) {
-    const existing = fs.readFileSync(hookPath);
-    if (existing.equals(hook)) {
-        console.log(`hooks:install: already installed at ${hookPath}`);
-        process.exit(0);
+let failed = false;
+for (const hookName of hookNames) {
+    const sourcePath = path.join(sourceDir, hookName);
+    const hookPath = path.join(hooksDir, hookName);
+
+    if (!fs.existsSync(sourcePath)) {
+        console.error(`hooks:install: missing tracked hook at ${sourcePath}`);
+        failed = true;
+        continue;
     }
-    console.error(
-        `hooks:install: ${hookPath} already exists and differs.\n`
-        + 'Re-run with --force to replace it, or wire `npm run check` into it yourself.',
-    );
-    process.exit(1);
+
+    const hook = fs.readFileSync(sourcePath);
+    if (fs.existsSync(hookPath) && !force) {
+        const existing = fs.readFileSync(hookPath);
+        if (existing.equals(hook)) {
+            console.log(`hooks:install: ${hookName} already installed at ${hookPath}`);
+            continue;
+        }
+        console.error(
+            `hooks:install: ${hookPath} already exists and differs.\n`
+            + `Re-run with --force to replace it, or wire ${hookName} yourself.`,
+        );
+        failed = true;
+        continue;
+    }
+
+    fs.writeFileSync(hookPath, hook, { mode: 0o755 });
+    fs.chmodSync(hookPath, 0o755);
+    console.log(`hooks:install: installed ${hookName} at ${hookPath}`);
 }
 
-fs.mkdirSync(hooksDir, { recursive: true });
-fs.writeFileSync(hookPath, hook, { mode: 0o755 });
-fs.chmodSync(hookPath, 0o755);
-console.log(`hooks:install: installed ${hookPath}`);
+process.exitCode = failed ? 1 : 0;
