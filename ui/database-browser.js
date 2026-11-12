@@ -75,6 +75,11 @@ import {
   MAX_IMPORT_FILE_BYTES,
 } from "../core/collection-export.js";
 import {
+  exportChunkMetaNotice,
+  exportChunkMetaTotalsNotice,
+  unmatchedChunkMetaCount,
+} from "../core/chunk-meta-transfer-view.js";
+import {
   embedDataInPNG,
   extractDataFromPNG,
   downloadPNG,
@@ -1372,6 +1377,11 @@ async function performPngExport(imageFile) {
         `PNG: ${formatBytes(pngSize)} (${ratio}%)`,
       "VECTFOX Export",
     );
+
+    const chunkMetaNotice = exportChunkMetaNotice(exportData.chunkMetaReport);
+    if (chunkMetaNotice) {
+      toastr.warning(chunkMetaNotice, "VECTFOX Export", { timeOut: 8000 });
+    }
   } catch (error) {
     log.error("VectFox: PNG export failed", error);
     toastr.error(`PNG export failed: ${error.message}`, "VectFox");
@@ -1635,6 +1645,15 @@ function bindCollectionCardEvents() {
           `Exported ${exportData.stats.chunkCount} chunks (${exportData.stats.chunksWithVectors} with vectors)`,
           "VECTFOX Export",
         );
+
+        // Settings entries this collection no longer contains are reported,
+        // not silently left out of the file.
+        const chunkMetaNotice = exportChunkMetaNotice(
+          exportData.chunkMetaReport,
+        );
+        if (chunkMetaNotice) {
+          toastr.warning(chunkMetaNotice, "VECTFOX Export", { timeOut: 8000 });
+        }
       } catch (error) {
         log.error("VectFox: Export failed", error);
         toastr.error(`Export failed: ${error.message}`, "VectFox");
@@ -3699,6 +3718,7 @@ function bindBulkEvents() {
       );
 
       let successCount = 0;
+      let unmatchedChunkMeta = 0;
       for (const key of browserState.bulkSelected) {
         const collection = browserState.collections.find(
           (c) => (c.registryKey || c.id) === key,
@@ -3718,12 +3738,20 @@ function bindBulkEvents() {
 
           downloadExport(exportData, collection.name || collection.id);
           successCount++;
+          unmatchedChunkMeta += unmatchedChunkMetaCount(
+            exportData.chunkMetaReport,
+          );
         } catch (error) {
           log.error(`VectFox: Failed to export ${collection.id}`, error);
         }
       }
 
       toastr.success(`Exported ${successCount} collection(s)`, "VectFox");
+
+      const chunkMetaNotice = exportChunkMetaTotalsNotice(unmatchedChunkMeta);
+      if (chunkMetaNotice) {
+        toastr.warning(chunkMetaNotice, "VECTFOX Export", { timeOut: 8000 });
+      }
     });
 
   // Bulk delete - uses unified deleteCollection()

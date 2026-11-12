@@ -370,6 +370,28 @@ describe('per-collection mirror', () => {
         expect(mockSettings.vectfox.vectfox_chunk_meta_999).toMatchObject({ context: 'no-collection' });
     });
 
+    it('merges into an existing settings entry when no collection is in use', async () => {
+        // Mirrors the import's client-only write (ticket 10): no collection is
+        // current, so the save falls back to settings — it must not replace a
+        // field the legacy entry still holds for another collection.
+        const plugin = createFakePlugin({ chunksByCollection: { 'col-a': [] } });
+        configureChunkMetaStore({ transport: plugin.transport });
+        mockSettings.vectfox.vectfox_chunk_meta_7 = {
+            context: 'older copy',
+            keywords: [{ text: 'kept' }],
+        };
+
+        saveChunkMetadata('7', { summaries: [{ text: 'sum' }] });
+        await flushChunkMetaWrites();
+
+        expect(plugin.calls.patch).toEqual([]);
+        expect(mockSettings.vectfox.vectfox_chunk_meta_7).toMatchObject({
+            context: 'older copy',
+            keywords: [{ text: 'kept' }],
+            summaries: [{ text: 'sum' }],
+        });
+    });
+
     it('deleting a chunk is collection-scoped and repeatable', async () => {
         const plugin = createFakePlugin({
             chunksByCollection: {

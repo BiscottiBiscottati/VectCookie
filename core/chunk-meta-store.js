@@ -38,7 +38,7 @@ import {
     chunkHashOf,
     chunkMetadataFromPayload,
     chunkMetadataKey,
-    hasValue,
+    mergeChunkMetadata,
     splitForPayload,
 } from './chunk-meta-fields.js';
 import { listAllChunkItems } from './chunk-paging.js';
@@ -48,21 +48,6 @@ import { RETRY_QUEUE_CAP } from './chunk-meta-retry.js';
 /** Chunk hash as used by the public functions (numeric or string). */
 function hashKey(hash) {
     return String(hash);
-}
-
-/**
- * Resolves one chunk's metadata per field: the payload wins where it holds a
- * value, the legacy settings entry fills the fields it lacks. A field present in
- * neither store is simply absent. Returns null when neither store has the chunk.
- */
-function mergeChunkMetadata(payload, legacy) {
-    if (!payload) return legacy ? { ...legacy } : null;
-    if (!legacy) return { ...payload };
-    const merged = { ...legacy };
-    for (const [field, value] of Object.entries(payload)) {
-        if (hasValue(value) || !(field in merged)) merged[field] = value;
-    }
-    return merged;
 }
 
 /**
@@ -389,6 +374,17 @@ export function createChunkMetaStore({
                 ([field, value]) => field !== 'updatedAt' && (!current || current[field] !== value),
             );
             if (changed) queuePayloadWrite(collectionId, hash, patch);
+            return;
+        }
+
+        // A payload-path save with no collection in use cannot address a chunk
+        // in any payload, so it falls back to settings. Merge rather than
+        // replace: the entry may hold fields another collection still reads,
+        // and a bulk writer's client-only fields belong beside them (ticket
+        // 07's rule — client-only fields merge, never replace).
+        if (isPayloadStore()) {
+            mergeLegacy(hash, stamped);
+            persistSettings();
             return;
         }
 

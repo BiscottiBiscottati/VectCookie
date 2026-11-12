@@ -3,12 +3,14 @@
  * VECTFOX CHUNK METADATA FIELDS
  * ============================================================================
  * One definition of what a chunk-metadata field is, of when a field holds a
- * value, and of which part of a listing item is the chunk hash. Two modules
- * read the same payload shape and must agree:
+ * value, and of which part of a listing item is the chunk hash. Every module
+ * that reads the same payload shape builds on these predicates:
  *
- *   - core/chunk-meta-store.js   strips payload data keys and merges reads
- *   - core/chunk-meta-sweep.js   compares a settings entry with a payload to
- *                                decide redundant / needs-patching
+ *   - core/chunk-meta-store.js     strips payload data keys and merges reads
+ *   - core/chunk-meta-transfer.js  resolves a collection's metadata for export
+ *                                  and splits it for import
+ *   - core/chunk-meta-sweep.js     compares a settings entry with a payload to
+ *                                  decide redundant / needs-patching
  *
  * Dependency-free by construction (no SillyTavern host imports, no logging) so
  * the sweep planner can be tested as a pure function against plain objects, and
@@ -114,6 +116,30 @@ export function hasValue(value) {
 }
 
 /**
+ * One chunk's metadata resolved per field: the payload wins where it holds a
+ * value, the legacy settings entry fills the fields it lacks. A field neither
+ * store holds is simply absent. Null means neither store has the chunk.
+ *
+ * The priority rule has exactly one definition (ADR-0003): the store's read
+ * path and the export's collection-scoped read both call this, so "which store
+ * wins" cannot drift between them. The sweep asks the other direction — which
+ * fields a payload lacks (see missingPayloadFields) — and builds on the same
+ * predicates rather than on this merge.
+ * @param {object|null|undefined} payload Payload metadata, data keys already stripped.
+ * @param {object|null|undefined} legacy Settings entry for the same chunk.
+ * @returns {object|null} Merged metadata.
+ */
+export function mergeChunkMetadata(payload, legacy) {
+    if (!payload) return legacy ? { ...legacy } : null;
+    if (!legacy) return { ...payload };
+    const merged = { ...legacy };
+    for (const [field, value] of Object.entries(payload)) {
+        if (hasValue(value) || !(field in merged)) merged[field] = value;
+    }
+    return merged;
+}
+
+/**
  * One save split into the part the payload stores and the part only settings can
  * hold. Both halves come from one walk, so a field is classified once and the
  * two stores can never disagree about which fields are theirs.
@@ -161,8 +187,10 @@ export function carriesClientOnlyMetadata(metadata, clientOnlyFields) {
  * @returns {object}
  */
 export function transferableMetadata(metadata, clientOnlyFields) {
-    const fields = chunkMetadataFromPayload(metadata);
-    for (const field of clientOnlyFields) delete fields[field];
+    // The split itself stays splitForPayload's job (ticket 07); this asks the
+    // same question and then drops the bookkeeping fields a patch never carries.
+    const { payload } = splitForPayload(metadata, clientOnlyFields);
+    const fields = { ...(payload || {}) };
     for (const field of BOOKKEEPING_META_FIELDS) delete fields[field];
     return fields;
 }

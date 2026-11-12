@@ -106,10 +106,20 @@ Relevant properties of the storage that shaped this decision:
   compatibility was covered by the shadow window of the release that shipped the
   migration; the write-path change ends it.
 - **The 9.45 MiB only shrinks at the sweep**, and only for entries that are
-  redundant or explicitly deleted as orphans. Growth stops immediately for edits
-  and for newly vectorized content because those writes no longer mint settings
-  keys. Import/export routing is a separate change: until it lands, importing a
-  collection still mints one settings key per imported chunk.
+  redundant or explicitly deleted as orphans. Growth stops immediately for edits,
+  for newly vectorized content and for imports: on the payload path an import
+  carries its per-chunk metadata into the payload with the chunks instead of
+  minting one settings key per imported chunk. (A chunk whose file carries a
+  client-only field such as `summaries` still gets one entry for that field; a
+  no-plugin install writes every field to settings, as before.) Export/import
+  routing follows the same rule: an export resolves each chunk's metadata for the
+  collection it is exporting (payload metadata from its own listing, settings
+  filling the fields the payload lacks) instead of borrowing the open
+  collection's mirror, and an import writes to the payload exactly when the
+  payload is the store. Settings entries the exported collection no longer
+  contains are counted in the file's report and named in a local warning —
+  counted rather than listed, because the settings namespace is global and an
+  export file must not carry another collection's content hashes.
 - **`orphan` must mean absent from every registered collection**, never from the
   collection currently loaded: content-derived hashes mean one key can be
   referenced by several collections.
@@ -121,5 +131,9 @@ Relevant properties of the storage that shaped this decision:
   settings side.
 - **Hash-only reads outside a current collection see only settings.** That is the
   deliberate cost of keeping the public functions synchronous and unchanged: the
-  retrieval and export fallbacks do not borrow an open collection's payload
-  entry, and they gain an explicit collection-scoped read in a later change.
+  retrieval fallback does not borrow an open collection's payload entry. A
+  caller that spans collections resolves the payload itself, scoped to the
+  collection it is acting on — the export reads the payload metadata its own
+  `/chunks/list` returned and merges the settings fallback per field, so an open
+  visualizer's collection can no longer supply a field for the same content hash
+  in another collection.

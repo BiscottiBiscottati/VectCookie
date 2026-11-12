@@ -331,12 +331,17 @@ export class QdrantBackend extends VectorBackend {
 
                         const metadata = {
                             ...item.metadata,
-                            // Pass through VectFox-specific fields
-                            importance: item.importance,
-                            keywords: item.keywords,
-                            conditions: item.conditions,
-                            isSummaryChunk: item.isSummaryChunk,
-                            parentHash: item.parentHash,
+                            // Item-level fields are the live-ingestion convention
+                            // and win. A caller that supplies them only inside
+                            // `metadata` — a collection import, whose fields came
+                            // from a file — keeps them instead of having them
+                            // overwritten with undefined (JSON drops the key, so
+                            // the payload would silently lose it).
+                            importance: item.importance ?? item.metadata?.importance,
+                            keywords: item.keywords ?? item.metadata?.keywords,
+                            conditions: item.conditions ?? item.metadata?.conditions,
+                            isSummaryChunk: item.isSummaryChunk ?? item.metadata?.isSummaryChunk,
+                            parentHash: item.parentHash ?? item.metadata?.parentHash,
                         };
 
                         // Add content_type for multitenancy mode

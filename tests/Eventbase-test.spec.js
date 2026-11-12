@@ -3042,14 +3042,16 @@ test('TEST 015 — Auto-sync window-size change: start marker filters obsolete w
 //                                                 → marker = max(end) + 1
 //
 //  Branches A/B/C run in every environment. Branch D requires a backend that
-//  preserves item-level metadata; collection-export's insertChunksWithVectors
-//  routes standard-backend inserts through native /api/vector/insert which
-//  strips metadata, so D is only meaningful on env 3 (qdrant). Rather than
-//  bolting on a qdrant-only Phase 4 with synthetic point inserts, this test
-//  asserts the three branches that work everywhere and lets the actual
-//  max+1 arithmetic — a trivial one-line reducer — stand on its own. The
-//  high-risk parts (branch selection, the chatLength fallback in the
-//  try/catch, re-stamp overwrite) are what real regressions hit.
+//  preserves item-level metadata: collection-export's insertChunksWithVectors
+//  writes through the plugin's /chunks/insert when it is available (both
+//  backends), and only a plugin-less standard install falls back to native
+//  /api/vector/insert, which strips metadata. So D needs either qdrant or a
+//  standard backend with the plugin. Rather than bolting on a qdrant-only Phase
+//  4 with synthetic point inserts, this test asserts the three branches that
+//  work everywhere and lets the actual max+1 arithmetic — a trivial one-line
+//  reducer — stand on its own. The high-risk parts (branch selection, the
+//  chatLength fallback in the try/catch, re-stamp overwrite) are what real
+//  regressions hit.
 //
 //  Phases:
 //    1. Branch A — empty chatUUID returns 0 sentinel, no write.

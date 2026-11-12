@@ -314,6 +314,36 @@ describe('StandardBackend', () => {
             expect(fetchMock).not.toHaveBeenCalled();
         });
 
+        it('keeps per-chunk fields an item carries only in metadata', async () => {
+            // Collection import: keywords/conditions/parentHash arrive inside
+            // metadata, not as item-level fields. The payload builder must not
+            // overwrite them with undefined (ticket 10).
+            fetchMock.mockResolvedValueOnce(mockFetchResponse({}));
+
+            await backend.insertVectorItems('test-collection', [{
+                hash: 1,
+                text: 'Imported chunk',
+                index: 0,
+                vector: [0.1, 0.2],
+                metadata: {
+                    keywords: [{ text: 'imported' }],
+                    conditions: { enabled: true, logic: 'AND', rules: [] },
+                    parentHash: 'parent-1',
+                    importance: 3,
+                    context: 'from the file',
+                },
+            }], defaultSettings);
+
+            const callBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+            expect(callBody.items[0].metadata).toMatchObject({
+                keywords: [{ text: 'imported' }],
+                conditions: { enabled: true, logic: 'AND', rules: [] },
+                parentHash: 'parent-1',
+                importance: 3,
+                context: 'from the file',
+            });
+        });
+
         it('should throw on insert failure', async () => {
             fetchMock.mockResolvedValueOnce(mockFetchError(500, 'Insert failed'));
 
@@ -676,6 +706,36 @@ describe('QdrantBackend', () => {
 
             const callBody = JSON.parse(fetchMock.mock.calls[0][1].body);
             expect(callBody.items[0].metadata.content_type).toBe('vf_chat_abc123');
+        });
+
+        it('keeps per-chunk fields an item carries only in metadata', async () => {
+            // Collection import: keywords/conditions/parentHash arrive inside
+            // metadata, not as item-level fields; JSON would drop the keys if
+            // the payload builder overwrote them with undefined (ticket 10).
+            fetchMock.mockResolvedValueOnce(mockFetchResponse({}));
+
+            await backend.insertVectorItems('test-collection', [{
+                hash: 1,
+                text: 'Imported chunk',
+                index: 0,
+                vector: [0.1, 0.2],
+                metadata: {
+                    keywords: [{ text: 'imported' }],
+                    conditions: { enabled: true, logic: 'AND', rules: [] },
+                    parentHash: 'parent-1',
+                    importance: 3,
+                    context: 'from the file',
+                },
+            }], defaultSettings);
+
+            const callBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+            expect(callBody.items[0].metadata).toMatchObject({
+                keywords: [{ text: 'imported' }],
+                conditions: { enabled: true, logic: 'AND', rules: [] },
+                parentHash: 'parent-1',
+                importance: 3,
+                context: 'from the file',
+            });
         });
 
         it('should batch large insertions', async () => {

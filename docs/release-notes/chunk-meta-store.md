@@ -42,8 +42,26 @@ What that sentence does not cover, stated plainly:
   shown in the Size Inspector. At the cap the oldest repair is dropped with a
   warning rather than silently: its edit stays in settings until the sweep moves
   it.
-- **Importing** a collection still writes its chunk metadata to settings until
-  the import/export parity work lands.
+- **Exporting** a collection reads its chunk metadata from the collection: the
+  payload metadata, with the old settings entry filling any field the payload
+  lacks, so a file made before or after the sweep carries the same fields. Any
+  settings entry the exported collection no longer contains is counted in the
+  export's report and raises a warning instead of being dropped silently; the
+  warning names a sample of the hashes, while the file carries only the count
+  (the settings entries are global, so the hashes usually belong to other
+  collections and must not travel inside a shared file). The Size Inspector's
+  dry run is what proves such an entry is orphaned across every collection.
+- **Importing** a collection writes its chunk metadata to the same store the rest
+  of the extension uses: with the plugin, the fields travel into the collection
+  with the chunks, so the import no longer mints one settings key per imported
+  chunk. Only fields no payload can carry (the dual-vector `summaries` list) go
+  to settings. Without the plugin, every field goes to settings exactly as
+  before. A standard-backend import now uses the plugin's insert when the plugin
+  is available, because SillyTavern's native insert stores no metadata — without
+  that, keywords and per-chunk fields were lost on import. The one case that
+  still loses them is the stale probe described just below: a plugin installed
+  mid-session can have the import take the native insert while the metadata store
+  skips its settings copy.
 - If this browser's plugin probe is stale — the plugin was installed mid-session
   and the backend still holds its "not available" snapshot — an insert can take
   the native path that cannot store keywords. Without the plugin those keywords
@@ -85,10 +103,10 @@ vectorizing go to settings again, and stop writing the collection payload. The
 setting is honoured immediately in the open tab.
 
 The chunk visualizer and retrieval still show each chunk's collection metadata,
-because they read it from the collection itself. A reader that only has a chunk
-hash — collection export and import — sees settings alone while this policy is
-set, which is the parity work still outstanding; it does not change what you see
-in the chunk list.
+because they read it from the collection itself. Collection export and import
+follow the policy: with it rolled back to `settings`, an import writes settings
+again, while an export still resolves metadata from the collection it exports
+(payload first, settings filling gaps), so a file is complete either way.
 
 The rehearsal release's `chunk_meta_shadow` switch is retired: with the settings
 copy gone there is nothing left for it to keep in sync, and it is not read any

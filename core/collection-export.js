@@ -23,16 +23,19 @@ import { getSavedHashes, insertVectorItems, purgeVectorIndex } from './core-vect
 import {
     getCollectionMeta,
     setCollectionMeta,
-    getChunkMetadata,
     saveChunkMetadata,
-    getAllChunkMetadata,
     useChunkMetaCollection,
     clearCollectionLock,
     getEffectiveScope,
+    isChunkMetaPayloadStore,
+    listLegacyChunkMetadata,
+    CLIENT_ONLY_CHUNK_FIELDS,
 } from './collection-metadata.js';
+import { attachCollectionChunkMetadata, planChunkMetaImport } from './chunk-meta-transfer.js';
+import { chunkMetaEntryCountLabel } from './chunk-meta-transfer-view.js';
 import {
     registerCollection,
-    getCollectionRegistry,
+    isPluginAvailableCached,
 } from './collection-loader.js';
 import { COLLECTION_PREFIXES, buildRegistryKey, parseCollectionId, normalizeBackendForId, remapCollectionIdToBackend, remapCollectionIdToHandle, sanitizeHandleId } from './collection-ids.js';
 import { getModelFromSettings } from './providers.js';
@@ -175,11 +178,19 @@ export async function exportCollection(collectionId, settings, collectionInfo = 
 
         // Step 2: Get all chunks WITH vectors
         progressTracker.updateProgress(2, 'Loading chunks and vectors...');
-        const chunks = (await fetchPortableChunks(collectionId, exportSettings)).map(chunk => {
-            // Get per-chunk metadata from VectFox settings
-            const chunkMeta = getChunkMetadata(chunk.hash);
-            return chunkMeta ? { ...chunk, chunkMeta } : chunk;
+        // Per-chunk metadata is read for THIS collection: the payload metadata
+        // the listing returned, with the legacy settings entry filling the
+        // fields the payload lacks. The store's hash-only read is deliberately
+        // not used — it resolves through whichever collection happens to be
+        // open, and one content hash can live in several collections
+        // (ADR-0003 decision 8). Entries whose chunk this collection no longer
+        // has are reported by the transfer rather than silently dropped.
+        const transfer = attachCollectionChunkMetadata({
+            chunks: await fetchPortableChunks(collectionId, exportSettings),
+            legacyEntries: listLegacyChunkMetadata(),
         });
+        const chunks = transfer.chunks;
+        logUnmatchedChunkMeta(collectionId, transfer.unmatchedSettingsHashes);
 
         progressTracker.updateChunks(chunks.length);
 
@@ -249,6 +260,11 @@ export async function exportCollection(collectionId, settings, collectionInfo = 
             // Chunks (text + metadata + vectors)
             chunks: chunks,
 
+            // Per-chunk metadata coverage: what this file carries, and the
+            // settings entries it could not carry because no chunk of this
+            // collection has that hash. Reported, not silently dropped.
+            chunkMetaReport: transfer.report,
+
             // Stats
             stats: {
                 chunkCount: chunks.length,
@@ -290,9 +306,9 @@ export async function exportMultipleCollections(collectionIds, settings) {
             const collectionMeta = getCollectionMeta(collectionId) || {};
             const chunksResult = await getSavedHashes(collectionId, settings, true);
 
-            let chunks = [];
+            let portableChunks = [];
             if (chunksResult && chunksResult.metadata) {
-                chunks = chunksResult.metadata.map(meta => ({
+                portableChunks = chunksResult.metadata.map(meta => ({
                     hash: meta.hash,
                     text: meta.text || '',
                     index: meta.index,
@@ -322,14 +338,17 @@ export async function exportMultipleCollections(collectionIds, settings) {
                         chunkLinks: meta.chunkLinks,
                     },
                 }));
-
-                for (const chunk of chunks) {
-                    const chunkMeta = getChunkMetadata(chunk.hash);
-                    if (chunkMeta) {
-                        chunk.chunkMeta = chunkMeta;
-                    }
-                }
             }
+
+            // Same rule as exportCollection: per-chunk metadata resolved for
+            // this collection from its payload plus the settings fallback,
+            // with the entries this collection has no chunk for reported.
+            const transfer = attachCollectionChunkMetadata({
+                chunks: portableChunks,
+                legacyEntries: listLegacyChunkMetadata(),
+            });
+            const chunks = transfer.chunks;
+            logUnmatchedChunkMeta(collectionId, transfer.unmatchedSettingsHashes);
 
             exports.push({
                 collection: {
@@ -361,6 +380,7 @@ export async function exportMultipleCollections(collectionIds, settings) {
                     xmlTag: collectionMeta.xmlTag || '',
                 },
                 chunks: chunks,
+                chunkMetaReport: transfer.report,
                 stats: {
                     chunkCount: chunks.length,
                     hasText: chunks.filter(c => c.text).length,
@@ -559,8 +579,21 @@ export async function insertChunksWithVectors(collectionId, chunks, settings, on
         const batch = items.slice(i, i + BATCH_SIZE);
 
         let response;
-        if (backendName === 'standard') {
-            // Standard backend always uses native ST API — plugin is Qdrant-only
+        // The plugin insert carries each item's metadata; the native API stores
+        // only hash/text/index. A standard-backend install with the plugin must
+        // therefore use the plugin's vectra insert, or every imported keyword
+        // and per-chunk field is silently lost (ticket 10). Only a plugin-less
+        // install takes the native path — and there settings is the metadata
+        // store, so nothing is expected in the payload.
+        //
+        // Availability is read from the same cached probe that decides the
+        // metadata store, not from `StandardBackend.pluginAvailable` (an
+        // initialize-time snapshot that is stale after a mid-session plugin
+        // install). That keeps the transport and the metadata destination in
+        // agreement: whenever the store believes the payload is available, the
+        // write that fills it goes to the plugin.
+        const usePluginInsert = backendName !== 'standard' || isPluginAvailableCached();
+        if (!usePluginInsert) {
             response = await fetch('/api/vector/insert', {
                 method: 'POST',
                 headers: getRequestHeaders(),
@@ -633,7 +666,10 @@ export async function insertChunksWithVectors(collectionId, chunks, settings, on
  * @param {string} options.collectionId - Override collection ID (for rename/duplicate)
  * @param {boolean} options.overwrite - If true, purge existing collection first
  * @param {boolean} options.forceReembed - If true, re-embed even if vectors exist
- * @returns {Promise<{ success: boolean, collectionId: string, chunkCount: number, usedVectors: boolean, errors: string[] }>}
+ * @returns {Promise<{
+ *   success: boolean, collectionId: string, chunkCount: number, usedVectors: boolean,
+ *   chunkMeta: { payloadChunks: number, settingsChunks: number }, errors: string[],
+ * }>}
  */
 export async function importCollection(exportData, settings, options = {}) {
     const sourceCollection = exportData.collection || {};
@@ -758,12 +794,23 @@ export async function importCollection(exportData, settings, options = {}) {
         // Step 2: Prepare chunks
         progressTracker.updateProgress(2, 'Preparing chunks...');
 
+        // Per-chunk metadata goes to the best store this install has: on the
+        // payload path its transferable fields ride the insert into the chunk
+        // payload, so the import mints no settings key for them; without the
+        // plugin every field goes to settings, as before. Client-only fields
+        // (e.g. `summaries`) always go to settings — no payload carries them.
+        const chunkMetaPlan = planChunkMetaImport({
+            chunks: validChunks,
+            isPayloadStore: isChunkMetaPayloadStore(),
+            clientOnlyFields: CLIENT_ONLY_CHUNK_FIELDS,
+        });
+
         const preparedChunks = validChunks.map((chunk, index) => ({
             text: chunk.text,
             index: chunk.index ?? index,
             hash: getStringHash(chunk.text),
             vector: canUseVectors ? chunk.vector : undefined,
-            metadata: chunk.metadata || {},
+            metadata: chunkMetaPlan.entries[index].metadata,
         }));
 
         // Step 3: Insert chunks
@@ -853,16 +900,10 @@ export async function importCollection(exportData, settings, options = {}) {
 
         setCollectionMeta(registryKey, importedMeta);
 
-        // Per-chunk metadata. Clear the active collection first: an import is a
-        // bulk write, not a collection edit, so it keeps today's settings path
-        // until the import/export parity ticket routes it explicitly.
-        void useChunkMetaCollection(null);
-        for (const chunk of validChunks) {
-            if (chunk.chunkMeta) {
-                const newHash = getStringHash(chunk.text);
-                saveChunkMetadata(newHash, chunk.chunkMeta);
-            }
-        }
+        // Per-chunk metadata the payload cannot carry. The insert above already
+        // stored everything the payload holds, so this writes only the rest
+        // (client-only fields on the payload path, every field without it).
+        persistImportedChunkSettings(chunkMetaPlan, preparedChunks);
 
         // Register collection with backend prefix so parseRegistryKey resolves the right backend
         registerCollection(registryKey);
@@ -878,6 +919,7 @@ export async function importCollection(exportData, settings, options = {}) {
             collectionId,
             chunkCount: preparedChunks.length,
             usedVectors: canUseVectors,
+            chunkMeta: chunkMetaPlan.counts,
             errors,
         };
 
@@ -958,6 +1000,13 @@ export async function importMultipleCollections(multiExportData, settings, optio
 
 /**
  * Silent import (no progress tracker) for batch operations
+ * @param {object} exportData One collection's export data
+ * @param {object} settings VectFox settings
+ * @param {object} options Same import options as importCollection
+ * @returns {Promise<{
+ *   success: boolean, collectionId: string, chunkCount: number, usedVectors: boolean,
+ *   chunkMeta: { payloadChunks: number, settingsChunks: number },
+ * }>}
  */
 async function importCollectionSilent(exportData, settings, options = {}) {
     const sourceCollection = exportData.collection || {};
@@ -1030,13 +1079,22 @@ async function importCollectionSilent(exportData, settings, options = {}) {
         }
     }
 
+    // Per-chunk metadata goes to the best available store — the same rule as
+    // importCollection: payload fields ride the insert on the payload path,
+    // client-only fields (and every field without the plugin) go to settings.
+    const chunkMetaPlan = planChunkMetaImport({
+        chunks: validChunks,
+        isPayloadStore: isChunkMetaPayloadStore(),
+        clientOnlyFields: CLIENT_ONLY_CHUNK_FIELDS,
+    });
+
     // Prepare chunks
     const preparedChunks = validChunks.map((chunk, index) => ({
         text: chunk.text,
         index: chunk.index ?? index,
         hash: getStringHash(chunk.text),
         vector: canUseVectors ? chunk.vector : undefined,
-        metadata: chunk.metadata || {},
+        metadata: chunkMetaPlan.entries[index].metadata,
     }));
 
     // Insert
@@ -1090,15 +1148,8 @@ async function importCollectionSilent(exportData, settings, options = {}) {
 
     setCollectionMeta(registryKey, importedMeta);
 
-    // Same rule as the single-collection import above: a bulk metadata write is
-    // not a collection edit, so it targets the legacy settings path for now.
-    void useChunkMetaCollection(null);
-    for (const chunk of validChunks) {
-        if (chunk.chunkMeta) {
-            const newHash = getStringHash(chunk.text);
-            saveChunkMetadata(newHash, chunk.chunkMeta);
-        }
-    }
+    // Same rule as the single-collection import above.
+    persistImportedChunkSettings(chunkMetaPlan, preparedChunks);
 
     registerCollection(registryKey);
     saveSettingsDebounced();
@@ -1108,12 +1159,59 @@ async function importCollectionSilent(exportData, settings, options = {}) {
         collectionId,
         chunkCount: preparedChunks.length,
         usedVectors: canUseVectors,
+        chunkMeta: chunkMetaPlan.counts,
     };
 }
 
 // ============================================================================
 // HELPERS
 // ============================================================================
+
+/**
+ * Names the settings entries an export could not carry in the console.
+ *
+ * The file itself carries only the count: the settings namespace is global, so
+ * those hashes usually belong to other collections, and an export — including
+ * its shareable PNG form — must not travel with another collection's content
+ * hashes. The console keeps the detail local for support, capped so a 17k-entry
+ * migration does not flood it.
+ * @param {string} collectionId The collection that was exported
+ * @param {string[]} unmatchedHashes Settings hashes with no chunk in it
+ */
+function logUnmatchedChunkMeta(collectionId, unmatchedHashes) {
+    if (unmatchedHashes.length === 0) return;
+    const SAMPLE = 20;
+    const sample = unmatchedHashes.slice(0, SAMPLE).join(', ');
+    const more = unmatchedHashes.length > SAMPLE ? `, +${unmatchedHashes.length - SAMPLE} more` : '';
+    log.warn(
+        `VectFox Export: ${chunkMetaEntryCountLabel(unmatchedHashes.length)} in settings had no chunk in ` +
+        `${collectionId} and are not in the file. Hashes: ${sample}${more}`,
+    );
+}
+
+/**
+ * Writes the per-chunk metadata an import could not carry into the payload.
+ *
+ * Both import paths use it so the bulk rule lives once: an import is a bulk
+ * write, not a collection edit, so it clears the store's current-collection
+ * pointer first — a hash-only settings write must not borrow the collection a
+ * visualizer happens to have open (ADR-0003 decision 8). On the payload path
+ * the insert already stored everything the payload holds, so only client-only
+ * fields (`summaries`) arrive here; without the plugin every field does, exactly
+ * as before.
+ *
+ * @param {{ entries: Array<{ settings: object|null }> }} chunkMetaPlan
+ *     Output of planChunkMetaImport, one entry per prepared chunk.
+ * @param {Array<{ hash: string|number }>} preparedChunks The chunks inserted.
+ */
+function persistImportedChunkSettings(chunkMetaPlan, preparedChunks) {
+    void useChunkMetaCollection(null);
+    for (let index = 0; index < preparedChunks.length; index++) {
+        const settingsMetadata = chunkMetaPlan.entries[index]?.settings;
+        if (!settingsMetadata) continue;
+        saveChunkMetadata(preparedChunks[index].hash, settingsMetadata);
+    }
+}
 
 /**
  * Detects content type from collection ID pattern

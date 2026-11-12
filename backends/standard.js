@@ -399,11 +399,16 @@ export class StandardBackend extends VectorBackend {
                         vector: item.vector,
                         metadata: {
                             ...item.metadata,
-                            keywords: item.keywords || [],
-                            importance: item.importance,
-                            conditions: item.conditions,
-                            isSummaryChunk: item.isSummaryChunk,
-                            parentHash: item.parentHash,
+                            // Item-level fields win over `metadata` (the rule
+                            // backends/qdrant.js states in full), so a caller
+                            // that supplies them only inside metadata — a
+                            // collection import — keeps them instead of having
+                            // them overwritten with undefined.
+                            keywords: item.keywords ?? item.metadata?.keywords ?? [],
+                            importance: item.importance ?? item.metadata?.importance,
+                            conditions: item.conditions ?? item.metadata?.conditions,
+                            isSummaryChunk: item.isSummaryChunk ?? item.metadata?.isSummaryChunk,
+                            parentHash: item.parentHash ?? item.metadata?.parentHash,
                         },
                     };
                     // Debug: Log first item's metadata
