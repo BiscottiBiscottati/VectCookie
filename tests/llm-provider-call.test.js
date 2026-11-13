@@ -75,6 +75,16 @@ function baseArgs(overrides = {}) {
     };
 }
 
+async function captureSentInit(args) {
+    let sentInit = null;
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+        sentInit = init;
+        return okResponse({ content: 'hi' });
+    }));
+    await postChatCompletion(args);
+    return sentInit;
+}
+
 beforeEach(() => {
     vi.restoreAllMocks();
     mockGetModelConfigError.mockReturnValue(null);
@@ -567,5 +577,27 @@ describe('postChatCompletion — internal-call attribution', () => {
 
         await expect(postChatCompletion(baseArgs())).rejects.toThrow('network down');
         expect(resolveUsageOrigin({ method: 'POST' })).toEqual({ origin: 'worker-profile', featureLabel: null });
+    });
+
+    // Spendbook's host contract: VectFox writes the mark itself, with no import
+    // from Spendbook, so the accounting extension can read it when installed
+    // and VectFox keeps working when it is not. The old mark must survive the
+    // transition, because VectFox's own ledger still reads it.
+    it('carries Spendbook’s documented mark beside its own', async () => {
+        const sentInit = await captureSentInit(baseArgs({ contextLabel: 'Summarizer' }));
+
+        const spendbookMark = Symbol.for('spendbook.internal-request');
+        expect(sentInit[spendbookMark]).toEqual({ label: 'Summarizer' });
+        expect(sentInit[Symbol.for('vectfox.usage.internal-request')])
+            .toEqual({ featureLabel: 'Summarizer' });
+        // Non-enumerable: the mark cannot reach the wire or change the body.
+        expect(Object.getOwnPropertyDescriptor(sentInit, spendbookMark).enumerable).toBe(false);
+    });
+
+    it('writes a null Spendbook label when the call carries no context label', async () => {
+        const sentInit = await captureSentInit(baseArgs({ contextLabel: undefined }));
+
+        expect(sentInit[Symbol.for('spendbook.internal-request')]).toEqual({ label: null });
+        expect(sentInit[Symbol.for('vectfox.usage.internal-request')]).toEqual({ featureLabel: null });
     });
 });

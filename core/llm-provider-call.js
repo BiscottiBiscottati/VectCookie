@@ -279,7 +279,18 @@ export async function postChatCompletion({
         body: JSON.stringify(requestBody),
         signal: AbortSignal.timeout(timeoutMs),
     };
-    markInternalRequest(init, contextLabel);
+    // One resolved label feeds both marks, so they cannot drift. Spendbook's
+    // documented mark is written by hand — no import and no manifest
+    // dependency, so VectFox still loads alone. Non-enumerable, like the mark
+    // above, so neither ever reaches the wire.
+    const internalLabel = typeof contextLabel === 'string' && contextLabel ? contextLabel : null;
+    markInternalRequest(init, internalLabel);
+    Object.defineProperty(init, Symbol.for('spendbook.internal-request'), {
+        value: { label: internalLabel },
+        configurable: true,
+        enumerable: false,
+        writable: false,
+    });
     const response = await fetch('/api/backends/chat-completions/generate', init);
 
     if (!response.ok) {
