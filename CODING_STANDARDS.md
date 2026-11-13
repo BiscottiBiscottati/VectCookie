@@ -34,7 +34,8 @@ make.
 
 ## Review protocol
 
-- Freeze the working tree before spawning reviewers; do not edit while they run.
+- Freeze the working tree before spawning reviewers, then generate the diff
+  artifact from that frozen tree; do not edit while they run.
 - Review from the diff artifact you were handed: page it with the read tool
   instead of re-running `git diff` slice by slice. The artifact already holds
   the whole change, untracked files included.
