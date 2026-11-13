@@ -35,6 +35,9 @@ make.
 ## Review protocol
 
 - Freeze the working tree before spawning reviewers; do not edit while they run.
+- Review from the diff artifact you were handed: page it with the read tool
+  instead of re-running `git diff` slice by slice. The artifact already holds
+  the whole change, untracked files included.
 - Wait for the completion notification instead of polling.
 - Apply findings, then re-review the delta before committing.
 - A finding that is mechanical (JSDoc arity, duplicate selector) should become a
