@@ -30,7 +30,6 @@
 import { getRequestHeaders } from '../../../../../script.js';
 import { getModelConfigErrorMessage } from './model-http-errors.js';
 import { isConnectionError, notifyConnectionError, notifyUpstreamRejection } from './model-config-notifier.js';
-import { markInternalRequest } from './usage-attribution.js';
 import { log } from './log.js';
 
 /**
@@ -268,23 +267,19 @@ export async function postChatCompletion({
         ? { chat_completion_source: 'custom', custom_url: vllmUrl, ...body }
         : { chat_completion_source: 'openrouter', ...body };
 
-    // VectFox's own helper: mark THIS request internal, so an extraction made
-    // during a story turn is never attributed to the story — and a story turn
-    // sent while an extraction is still in flight is never stolen by it. The
-    // mark travels on the request init; shared module state cannot tell two
-    // concurrent requests apart.
     const init = {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify(requestBody),
         signal: AbortSignal.timeout(timeoutMs),
     };
-    // One resolved label feeds both marks, so they cannot drift. Spendbook's
-    // documented mark is written by hand — no import and no manifest
-    // dependency, so VectFox still loads alone. Non-enumerable, like the mark
-    // above, so neither ever reaches the wire.
+    // Spendbook's documented internal mark, written by hand: no import and no
+    // manifest dependency, so VectFox loads and generates alone and only an
+    // installed Spendbook reads the mark. It travels on this request's init, not
+    // in shared module state, so a story turn sent while an extraction is in
+    // flight is never attributed to the extraction. Non-enumerable, so it never
+    // reaches the wire or changes the serialized body.
     const internalLabel = typeof contextLabel === 'string' && contextLabel ? contextLabel : null;
-    markInternalRequest(init, internalLabel);
     Object.defineProperty(init, Symbol.for('spendbook.internal-request'), {
         value: { label: internalLabel },
         configurable: true,

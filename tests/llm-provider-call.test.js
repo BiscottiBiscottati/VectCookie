@@ -35,7 +35,6 @@ vi.mock('../core/log.js', () => ({
 
 import StringUtils from '../utils/string-utils.js';
 import { postChatCompletion, parseJsonArrayFromLlm, resolveModelParameterStyle, LlmCallError } from '../core/llm-provider-call.js';
-import { resolveUsageOrigin, resetUsageAttribution } from '../core/usage-attribution.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -547,57 +546,42 @@ describe('StringUtils.ensureArray', () => {
 });
 
 // ---------------------------------------------------------------------------
-// postChatCompletion — usage attribution flag
+// postChatCompletion — Spendbook's internal mark
 // ---------------------------------------------------------------------------
 
-describe('postChatCompletion — internal-call attribution', () => {
-    beforeEach(() => {
-        resetUsageAttribution();
-    });
-
-    it('marks its own request vectfox-internal without tainting concurrent requests', async () => {
-        let duringFetch = null;
-        vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
-            duringFetch = resolveUsageOrigin(init);
-            return okResponse({ content: 'hi' });
-        }));
-
-        await postChatCompletion(baseArgs({ contextLabel: 'EventBase' }));
-
-        expect(duringFetch).toEqual({ origin: 'vectfox-internal', featureLabel: 'EventBase' });
-        // The mark lives on that request's init, not in shared state: an
-        // unrelated request sent afterwards is still a worker-profile call.
-        expect(resolveUsageOrigin({ method: 'POST' })).toEqual({ origin: 'worker-profile', featureLabel: null });
-    });
-
-    it('leaves no mark behind when the fetch rejects', async () => {
-        vi.stubGlobal('fetch', vi.fn(async () => {
-            throw new Error('network down');
-        }));
-
-        await expect(postChatCompletion(baseArgs())).rejects.toThrow('network down');
-        expect(resolveUsageOrigin({ method: 'POST' })).toEqual({ origin: 'worker-profile', featureLabel: null });
-    });
-
+describe('postChatCompletion — Spendbook internal mark', () => {
     // Spendbook's host contract: VectFox writes the mark itself, with no import
-    // from Spendbook, so the accounting extension can read it when installed
-    // and VectFox keeps working when it is not. The old mark must survive the
-    // transition, because VectFox's own ledger still reads it.
-    it('carries Spendbook’s documented mark beside its own', async () => {
+    // from Spendbook, so the accounting extension can read it when installed and
+    // VectFox keeps working when it is not.
+    it('carries Spendbook’s documented mark with the context label', async () => {
         const sentInit = await captureSentInit(baseArgs({ contextLabel: 'Summarizer' }));
 
         const spendbookMark = Symbol.for('spendbook.internal-request');
         expect(sentInit[spendbookMark]).toEqual({ label: 'Summarizer' });
-        expect(sentInit[Symbol.for('vectfox.usage.internal-request')])
-            .toEqual({ featureLabel: 'Summarizer' });
         // Non-enumerable: the mark cannot reach the wire or change the body.
         expect(Object.getOwnPropertyDescriptor(sentInit, spendbookMark).enumerable).toBe(false);
     });
 
-    it('writes a null Spendbook label when the call carries no context label', async () => {
+    it('writes a null label when the call carries no context label', async () => {
         const sentInit = await captureSentInit(baseArgs({ contextLabel: undefined }));
 
         expect(sentInit[Symbol.for('spendbook.internal-request')]).toEqual({ label: null });
-        expect(sentInit[Symbol.for('vectfox.usage.internal-request')]).toEqual({ featureLabel: null });
+    });
+
+    it('marks each request on its own init, so concurrent calls keep their labels', async () => {
+        const marks = [];
+        vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+            marks.push(init[Symbol.for('spendbook.internal-request')]);
+            return okResponse({ content: '[]' });
+        }));
+
+        await Promise.all([
+            postChatCompletion(baseArgs({ contextLabel: 'EventBase' })),
+            postChatCompletion(baseArgs({ contextLabel: 'Summarizer' })),
+        ]);
+
+        // Order-free: the contract is that each init carries its own label, not
+        // which of two requests happened to reach the fake fetch first.
+        expect(marks.map((mark) => mark?.label).sort()).toEqual(['EventBase', 'Summarizer']);
     });
 });

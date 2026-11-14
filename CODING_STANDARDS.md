@@ -12,7 +12,6 @@ make.
   state; the UI consumes them.
 - One owner per persisted shape: the module that defines a settings, chat or
   localStorage shape also normalizes it. Callers pass the normalized value.
-- The usage observer stays read-only and off the response path.
 
 ## UI
 
