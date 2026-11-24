@@ -21,8 +21,12 @@ import {
     registerCollection,
     setDeletedOrImportedCollectionCleanup,
 } from './features/collections/index.js';
-import { clearCachesForDeletedOrImportedCollection, refreshWorldInfoEntryDepthCache, runEventBaseReplyStep, synchronizeChat } from './features/eventbase/index.js';
-import { setInsertedCollectionRegistrar } from './features/vector-backend/index.js';
+import {
+    clearCachesForDeletedOrImportedCollection, followCollectionInUse, refreshWorldInfoEntryDepthCache, runEventBaseReplyStep,
+    setEventBaseListeners, synchronizeChat,
+} from './features/eventbase/index.js';
+import { setLlmCallFinishedListener } from './features/llm-provider/index.js';
+import { setInsertedCollectionRegistrar, setPurgedCollectionListener } from './features/vector-backend/index.js';
 import { migrateLegacyApiKeys } from './shared/api-keys.js';
 import { migration_setting_name_for_connection } from './app/settings-migration-connection-setting-names.js';
 import { migration_embedding_source_key } from './app/settings-migration-embedding-provider-key.js';
@@ -38,8 +42,10 @@ import {
     AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS,
     AGENTIC_QUERY_TIMEOUT_DEFAULT_MS,
     AGENTIC_MAX_TOKENS_DEFAULT,
+    STORY_ARC_MAX_TOKENS_DEFAULT,
 } from './shared/constants.js';
 import { isVectFoxEnabled } from './shared/feature-gate.js';
+import { followGenerations } from './shared/last-generation.js';
 import { runNetworkStartup } from './app/network-startup.js';
 
 // VectFox modules - UI
@@ -47,11 +53,23 @@ import { mountSettingsPanel, mountWandMenu, refreshAutoSyncCheckbox, scheduleMan
 import { initializeDatabaseBrowser } from './features/database-browser/index.js';
 import { KEY_CALLS_AT_ONCE_DEFAULT, LORE_BUDGET_DEFAULT, initializeLoreBase, prepareLoreBesideRetrieval } from './features/lorebase/index.js';
 import { initializeReplyLore } from './features/reply-lore/index.js';
+import {
+    announceCollectionInUseChanged, announceEventBaseEventsRemoved, announceEventBaseRunEnded, announceLlmCallFinished,
+    announcePublicApiReady, announcePurgedCollection, publishPublicApi,
+} from './features/public-api/index.js';
 import { CJK_TOKENIZER_MODES, setCjkTokenizerMode, ensureJiebaTokenizerLoaded, ensureJiebaTwLoaded } from './features/keyword-search/index.js';
 
 // Calls a lower layer makes into a higher one, wired here before anything can delete or insert.
 setDeletedOrImportedCollectionCleanup(clearCachesForDeletedOrImportedCollection);
 setInsertedCollectionRegistrar(registerCollection);
+// What EventBase, the vector backend and the LLM calls tell the public API, which sends it on as vectfox_* events.
+setEventBaseListeners({
+    onRunEnded: announceEventBaseRunEnded,
+    onEventsRemoved: announceEventBaseEventsRemoved,
+    onCollectionInUseChanged: announceCollectionInUseChanged,
+});
+setPurgedCollectionListener(announcePurgedCollection);
+setLlmCallFinishedListener(announceLlmCallFinished);
 
 // Default settings
 const defaultSettings = {
@@ -352,6 +370,7 @@ const defaultSettings = {
     story_arc_link_model: 'openai/gpt-6-luna',         // which AgentMode's planner does not
     story_arc_link_connection_profile_id: '',          // read only while story_arc_link_provider is 'connection_profile'
     story_arc_block_scale: 0.5,                        // Block size slider, 0.4 to 1.0: a block has 2.5 × this × √events seats, and keeps 4/3 × this × √events lines
+    story_arc_max_tokens: STORY_ARC_MAX_TOKENS_DEFAULT, // Max tokens slider, 1,000 to 32,000: the output cap of each call on the link model, thinking included
     agent_provider: '',                    // '' → Same as EventBase model: chat_provider and chat_vllm_url, or its profile
     agent_connection_profile_id: '',       // read only while agent_provider is 'connection_profile'
     agent_model: '',                       // '' → chat_model, whichever provider runs the planner
@@ -416,6 +435,9 @@ async function vectfox_rearrangeChat(chat, contextSize, _abort, type) {
 
 // Export to window for ST to call
 window['vectfox_rearrangeChat'] = vectfox_rearrangeChat;
+
+// The VectFox object other extensions call, there from now on; it says it is ready when initialization ends, below.
+publishPublicApi();
 
 /**
  * Initialize VectFox extension
@@ -586,7 +608,13 @@ jQuery(async () => {
     // Initialize database browser
     initializeDatabaseBrowser(settings);
 
-    // LoreBase follows generations, so its pick knows a quiet-to-loud one as a reply, and arms each World Info scan
+    // The last generation past its slash commands, so LoreBase's pick and EventBase's reply step know a quiet-to-loud one
+    followGenerations();
+
+    // The collection the open chat uses, so the public API says when it changes
+    followCollectionInUse(settings);
+
+    // LoreBase settles Vector Storage's World Info search before a reply, and arms each World Info scan
     initializeLoreBase();
 
     // The latest reply's lorebook entries, for the wand menu's Last reply's lore
@@ -638,6 +666,9 @@ jQuery(async () => {
     eventSource.on(event_types.CHAT_CHANGED, refreshWiDepthDebounced);
     eventSource.on(event_types.WORLDINFO_UPDATED, refreshWiDepthDebounced);
     eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, refreshWiDepthDebounced);
+
+    // Last: VectFox.isReady() turns true and vectfox_ready goes out once
+    announcePublicApiReady();
 
     log.lifecycle('VectFox: ✅ Initialized successfully');
 });

@@ -33,6 +33,7 @@ vi.mock('../src/shared/collection-ids.js', () => ({
 
 // The price from OpenRouter's model list, read through the stubbed fetch; the rest of the barrel reaches SillyTavern.
 vi.mock('../src/features/llm-provider/index.js', async () => ({
+    LLM_CALL_FEATURES: (await vi.importActual('../src/features/llm-provider/llm-call-report.js')).LLM_CALL_FEATURES,
     readOpenRouterModelPrice: (await vi.importActual('../src/features/llm-provider/openrouter-model-price.js')).readOpenRouterModelPrice,
 }));
 
@@ -140,6 +141,7 @@ describe('runStoryLinkPass', () => {
         // The first event has nothing earlier, so it needs no call.
         expect(callLlmForJsonMock).toHaveBeenCalledTimes(1);
         const [call] = callLlmForJsonMock.mock.calls[0];
+        expect(call.feature).toBe('storyarc');
         expect(call.userMessage).toContain('E1: (message 10)');
         expect(call.userMessage).toContain('NEW:\n(message 20)');
         expect(writtenLinks()).toEqual({ 1: [], 2: [{ event_id: 'id1', type: 'continues', thread: 'The blockade' }] });
@@ -162,12 +164,12 @@ describe('runStoryLinkPass', () => {
     });
 
     // A link needs thought, so the settings that switch thinking off for other features must not apply.
-    it('lets the link model think, with room for its reasoning', async () => {
+    it('lets the link model think, with StoryArc\'s Max tokens as room for its reasoning', async () => {
         fetchPortableChunksMock.mockResolvedValue([chunk(1, 10), chunk(2, 20)]);
-        await runStoryLinkPass({ collectionId: COLLECTION, settings, shouldRelinkDecided: true });
+        await runStoryLinkPass({ collectionId: COLLECTION, settings: { ...settings, story_arc_max_tokens: 20000 }, shouldRelinkDecided: true });
         const [call] = callLlmForJsonMock.mock.calls[0];
         expect(call.llmConnection).toEqual(resolveLinkConfigMock.mock.results[0].value);
-        expect(call.maxTokens).toBeGreaterThan(8000);
+        expect(call.maxTokens).toBe(20000);
     });
 
     it('offers the nearest earlier events by stored vector, and the 3 just before', async () => {

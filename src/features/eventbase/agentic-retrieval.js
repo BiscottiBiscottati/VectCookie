@@ -28,6 +28,7 @@ import { buildPlannerUserMessage, getAgenticPlannerPrompt } from './prompts-i18n
 import { readStoryLanguage } from './story-language.js';
 import { cleanText, stripReasoningBlocks, stripGameSystemBlocks } from '../text-cleaning/index.js';
 import {
+    LLM_CALL_FEATURES,
     describeConnectionProblem,
     postChatCompletion,
     resolveConnectionProfileId,
@@ -39,7 +40,7 @@ import {
     LlmCallError,
 } from '../llm-provider/index.js';
 import { generationRateLimiter, generationRateLimitSettings } from './generation-rate-limiter.js';
-import { resolveAgenticPlannerTimeoutMs, resolveAgenticQueryTimeoutMs, resolveAgenticMaxTokens } from '../../shared/retrieval-budget.js';
+import { resolveAgenticPlannerTimeoutMs, resolveAgenticQueryTimeoutMs, resolveAgenticMaxTokens, resolveStoryArcMaxTokens } from '../../shared/retrieval-budget.js';
 import { ORDINARY_TURN_ROUTE, STORY_ROUTER_PROMPT, STORY_ROUTE_RULE, THREAD_PICK_PROMPT, buildBlockCutMessage, buildBlockCutPrompt, buildStoryRouterMessage, buildThreadPickMessage, hasRecipe, isOrdinaryTurn, isStoryArcActive, listStoryThreads, readBlockCut, readStoryRoute, readThreadPick } from './story-arc-core.js';
 import { retrieveStoryRecipeEvents, startStoryRecipeReads } from './story-arc-retrieval.js';
 import { isInvalidModelConfigError, notifyInvalidModel, notifySetupIncomplete } from '../../shared/model-config-notifier.js';
@@ -294,6 +295,7 @@ async function _searchPlannedQueries(params) {
                 llmConnection,
                 timeoutMs,
                 maxTokens: resolveAgenticMaxTokens(settings),
+                feature: LLM_CALL_FEATURES.agentMode,
             }),
             generationRateLimitSettings(settings),
             'agent',
@@ -422,7 +424,7 @@ async function _searchPlannedQueries(params) {
  * @param {object} params.settings
  * @param {string} params.label - Which call this is, for the log
  * @param {string} [params.nextStep] - What the turn does without this call
- * @param {object} params.call - What callLlmForJson needs, other than the time limit
+ * @param {object} params.call - What callLlmForJson needs, other than the time limit and the feature, StoryArc's
  * @param {(reply: unknown) => T} params.read - Reads the reply, and may throw on a malformed one
  * @returns {Promise<T|null>}
  * @template T
@@ -432,7 +434,7 @@ async function _askStoryLlm({ settings, label, nextStep, call, read }) {
     const tStart = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     try {
         const reply = await generationRateLimiter.execute(
-            () => callLlmForJson({ ...call, timeoutMs }),
+            () => callLlmForJson({ ...call, timeoutMs, feature: LLM_CALL_FEATURES.storyArc }),
             generationRateLimitSettings(settings),
             'agent',
         );
@@ -467,7 +469,7 @@ async function _routeStoryQuestion({ settings, keywordQuery }, linkConnection) {
             systemPrompt: STORY_ROUTER_PROMPT,
             userMessage: buildStoryRouterMessage({ recentTurns: _getRecentChatTurns(settings), userMessage: keywordQuery }),
             llmConnection: _linkModelForRouter(linkConnection, settings),
-            maxTokens: STORY_CHOICE_MAX_TOKENS,
+            maxTokens: resolveStoryArcMaxTokens(settings),
             contextLabel: 'StoryArc router',
         },
         read: (reply) => {
@@ -479,9 +481,6 @@ async function _routeStoryQuestion({ settings, keywordQuery }, linkConnection) {
         },
     });
 }
-
-/** A thinking model's reasoning counts against this, so it leaves room for that as well as the reply. */
-const STORY_CHOICE_MAX_TOKENS = 9000;
 
 function _linkModelAtEffort(linkConnection, reasoningEffort) {
     return { ...linkConnection, parameterStyle: { ...linkConnection.parameterStyle, reasoningEffort } };
@@ -528,7 +527,7 @@ async function _pickStoryThreads(storedEvents, route, { settings, keywordQuery }
             systemPrompt: THREAD_PICK_PROMPT,
             userMessage: buildThreadPickMessage(threads, keywordQuery, route.subject),
             llmConnection: _linkModelAtLowEffort(linkConnection),
-            maxTokens: STORY_CHOICE_MAX_TOKENS,
+            maxTokens: resolveStoryArcMaxTokens(settings),
             contextLabel: 'StoryArc thread pick',
         },
         read: reply => readThreadPick(reply, threads),
@@ -556,7 +555,7 @@ async function _chooseBlockEvents(events, route, { settings, keywordQuery }, lin
             systemPrompt: buildBlockCutPrompt(route.shape, lineCount),
             userMessage: buildBlockCutMessage(events, keywordQuery, route.subject),
             llmConnection: _linkModelAtLowEffort(linkConnection),
-            maxTokens: STORY_CHOICE_MAX_TOKENS,
+            maxTokens: resolveStoryArcMaxTokens(settings),
             contextLabel: 'StoryArc block cut',
         },
         read: reply => readBlockCut(reply, events),
@@ -656,7 +655,7 @@ export function resolveStoryLinkLlmConfig(settings) {
 export async function testAgentModeConnection(settings) {
     const connection = _resolveAgenticLLMConfig(settings);
     if (!connection.ok) throw new Error(describeLlmSetupProblem(AGENT_MODE, connection.reason, connection.problem));
-    return sendConnectionTest(connection, { contextLabel: AGENT_MODE, parameterStyle: connection.parameterStyle });
+    return sendConnectionTest(connection, { contextLabel: AGENT_MODE, feature: LLM_CALL_FEATURES.agentMode, parameterStyle: connection.parameterStyle });
 }
 
 /**
@@ -670,7 +669,7 @@ export async function testAgentModeConnection(settings) {
 export async function testStoryArcConnection(settings) {
     const connection = resolveStoryLinkLlmConfig(settings);
     if (!connection.ok) throw new Error(connection.problem ?? `StoryArc link model is not ready: ${connection.reason}`);
-    return sendConnectionTest(connection, { contextLabel: 'StoryArc', parameterStyle: connection.parameterStyle });
+    return sendConnectionTest(connection, { contextLabel: 'StoryArc', feature: LLM_CALL_FEATURES.storyArc, parameterStyle: connection.parameterStyle });
 }
 
 /**
@@ -678,14 +677,16 @@ export async function testStoryArcConnection(settings) {
  * router, thread pick and links. Throws on network/auth failure, a reply with no text,
  * or unparseable JSON, naming the provider's cut when it cut the reply short. A cut
  * reply whose JSON parses lost nothing, since the JSON closed before the cut.
+ * `feature` is the feature the call is reported under, one of LLM_CALL_FEATURES.
  */
-export async function callLlmForJson({ systemPrompt, userMessage, llmConnection, timeoutMs, maxTokens, contextLabel = 'Agent Mode' }) {
+export async function callLlmForJson({ systemPrompt, userMessage, llmConnection, timeoutMs, maxTokens, contextLabel = 'Agent Mode', feature }) {
     // Shared HTTP + response classification (llm-provider-call.js). The planner
     // is a two-message, json_object call. authBranch:false folds 401/403 into the
     // model-config and generic paths, since the caller degrades to pre-search.
     let content, usage, finishReason, cutReason;
     try {
         ({ content, usage, finishReason, cutReason } = await postChatCompletion({
+            feature,
             messages: [
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userMessage },

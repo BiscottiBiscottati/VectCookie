@@ -2,9 +2,10 @@
  * A stretch of the chat read again (InternalProject/Vectfox/plans/eventbase-read-range-again.md, B1): the run reads
  * every window from the one holding its first message to the one holding its last, on the chat's window grid, though
  * the record holds them; each window's new events replace its earlier ones once stored, and a window whose new read
- * finds none loses its earlier ones (D4); a window whose read fails keeps its events; a stop keeps the windows already
- * stored, each in one version, with the links off their replaced events moved; windows outside the stretch, the tip and
- * the auto-sync marker are left as they were. The StoryArc links and the verdict are the caller's.
+ * finds none loses its earlier ones (D4); a window whose read fails keeps its events; a stop, or an insert that fails,
+ * keeps the windows already stored, each in one version, with the links off their replaced events moved; windows outside
+ * the stretch, the tip and the auto-sync marker are left as they were. The StoryArc links and the verdict are the
+ * caller's.
  *
  * Drives the real runEventBaseIngestion with the real fingerprint record, tip and window replacement; only ST, the LLM
  * extractor and the vector backend are stubbed. The stub backend keeps its points in `state.points`.
@@ -18,6 +19,7 @@ const state = vi.hoisted(() => ({
     clock: 1000,
     eventCountFor: () => 1,
     failingWindowStart: null,
+    failingInsertWindowStart: null,
     onExtract: null,
 }));
 
@@ -83,6 +85,10 @@ vi.mock('../src/features/eventbase/eventbase-store.js', async (importOriginal) =
     return {
         ...original,
         insertEvents: vi.fn(async (events) => {
+            // As the embedding provider's rate limit outlasting every hedge ends a run.
+            if (events.some(event => event.source_window_start === state.failingInsertWindowStart)) {
+                throw Object.assign(new Error('Hedge fatal: 4 attempts via custom failed'), { name: 'HedgeFatalError', isHedgeFatal: true });
+            }
             state.points.push(...events.map(event => ({ hash: original.eventPointHash(event.event_id), text: event.summary, metadata: { ...event, eventbase: true } })));
         }),
     };
@@ -115,6 +121,11 @@ const { hashSourceMessage } = await import('../src/features/eventbase/eventbase-
 const { extractEvents } = await import('../src/features/eventbase/eventbase-extractor.js');
 const { linkNewStoryEvents } = await import('../src/features/eventbase/story-arc-links.js');
 const { progressTracker } = await import('../src/shared/progress-tracker.js');
+const { setEventBaseListeners } = await import('../src/features/eventbase/eventbase-announcements.js');
+
+/** Each run's end as EventBase's listener heard it. */
+const runsEnded = [];
+setEventBaseListeners({ onRunEnded: run => runsEnded.push(run) });
 
 const SETTINGS = { eventbase_window_size: 2, eventbase_window_overlap: 0, eventbase_min_importance_store: 1, story_arc_mode_enabled: true, vector_backend: 'qdrant' };
 
@@ -163,9 +174,11 @@ describe('a stretch read again', () => {
         state.clock = 1000;
         state.eventCountFor = () => 1;
         state.failingWindowStart = null;
+        state.failingInsertWindowStart = null;
         state.onExtract = null;
         state.extensionSettings.vectfox = {};
         vi.clearAllMocks();
+        runsEnded.length = 0;
     });
 
     it('reads every window from the one holding its first message to the one holding its last, though the record holds them, and replaces their events', async () => {
@@ -260,6 +273,30 @@ describe('a stretch read again', () => {
         expect(linker.story_links).toEqual([{ event_id: replacementId, type: 'continues', thread: '' }]);
         expect(result.insertedEventIds).toEqual([replacementId]);
         expect(result.eventIdsWithMovedLinks).toEqual([linker.event_id]);
+        // The stopped run's end is heard, with the event it stored.
+        expect(runsEnded.at(-1)).toEqual({ collectionId: collectionIdOf(chatUUID), eventsAdded: 1, windowsProcessed: result.windowsProcessed });
+    });
+
+    it('moves the links off the window it replaced when a later window\'s insert fails, which keeps its events', async () => {
+        const chatUUID = newChatUUID();
+        const chat = buildChat(12);
+        await run(chat, chatUUID);
+        const [replacedId] = eventIdsOfWindow(2);
+        const keptIds = eventIdsOfWindow(4);
+        const linker = eventOfWindow(8);
+        linker.story_links = [{ event_id: replacedId, type: 'continues', thread: '' }];
+        state.failingInsertWindowStart = 4;
+
+        const runsBefore = runsEnded.length;
+        await expect(readAgain(chat, chatUUID, { parallelWindows: 1 })).rejects.toThrow('Hedge fatal');
+
+        // The failed run's end is heard too, once, with the event it stored before the failure.
+        expect(runsEnded.slice(runsBefore)).toEqual([{ collectionId: collectionIdOf(chatUUID), eventsAdded: 1, windowsProcessed: expect.any(Number) }]);
+        const [replacementId] = eventIdsOfWindow(2);
+        expect(replacementId).not.toBe(replacedId);
+        expect(eventIdsOfWindow(4)).toEqual(keptIds);
+        expect(versionsByWindow()).toEqual({ 0: 1, 2: 1, 4: 1, 6: 1, 8: 1, 10: 1 });
+        expect(linker.story_links).toEqual([{ event_id: replacementId, type: 'continues', thread: '' }]);
     });
 
     it('leaves the tip and the auto-sync marker where they were', async () => {

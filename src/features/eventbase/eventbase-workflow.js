@@ -31,6 +31,7 @@ import { formatEventsForInjectionDetailed, formatStoryArcForInjection } from './
 import { progressTracker } from '../../shared/progress-tracker.js';
 import { isInvalidModelConfigError, notifyInvalidModel, notifyMemoryNotInjected } from '../../shared/model-config-notifier.js';
 import { log } from '../../sillytavern/log.js';
+import { announceRunEnded } from './eventbase-announcements.js';
 
 // The wait before each extra pass over the windows that failed in a run, one entry
 // per pass. A window therefore gets three sends in the run where it first fails.
@@ -460,6 +461,21 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
 
     // A window this run extracts again replaces the events it holds from earlier extractions.
     const windowReplacement = createWindowReplacement({ collectionId, settings, tipAtRunStart: getVectorizationTip(registryKey) });
+    /**
+     * The run ended, finished, stopped or failed: the StoryArc links off the events it removed move to the events
+     * that replaced them, and EventBase's listener hears what the run stored. Returns the IDs of the events whose links
+     * moved.
+     */
+    const endRun = async () => {
+        const eventIdsWithMovedLinks = await windowReplacement.moveLinksOffReplacedEvents();
+        announceRunEnded({ collectionId, eventsAdded: insertedEventIds.length, windowsProcessed });
+        return eventIdsWithMovedLinks;
+    };
+    /** A run that fails ends as one stopped does (endRun); returns the error to throw. */
+    const endRunBeforeFailing = async (error) => {
+        await endRun();
+        return error;
+    };
 
     // Auto-sync popup: shown once per ingestion call, and only when windows are left
     // to extract. Passing the quick-exit does not guarantee that — the start-marker
@@ -680,10 +696,11 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
             } catch (err) {
                 if (err?.name === 'AbortError' || abortSignal?.aborted) throw err;
                 if (isInvalidModelConfigError(err)) throw new EventBaseFatalError(err.message, 'invalid_model_config');
-                // Hedge-fatal bypass: the inner hedge already burned up to 60s on 4 fresh-connection
-                // attempts in parallel. Outer retry would just trigger another round of identical
-                // hedging — same upstream, same routing pool, no new information. Throw up to
-                // the coordinator so user can press Continue later when conditions improve.
+                // Hedge-fatal bypass: the hedge race ran past its first slot and every fresh-connection
+                // attempt failed or hung, so another round would meet the same stalled upstream. Throw
+                // up to the coordinator so the user can press Continue later when conditions improve.
+                // A rate limit, or attempts that all failed fast, arrive as the provider's own error
+                // and take the waits below.
                 // See InternalProject/Vectfox/plans/executed/embedding-resilience-hedge-and-diagnostics.md §6.5.
                 if (err?.isHedgeFatal === true) throw err;
                 lastErr = err;
@@ -873,8 +890,8 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                 try { await pendingExtract; } catch (_) { /* swallow */ }
             }
             progressTracker.complete(false, 'Stopped by user');
-            // The windows already replaced keep a walk through them.
-            const eventIdsWithMovedLinks = await windowReplacement.moveLinksOffReplacedEvents();
+            // The windows already replaced keep a walk through them, and the listener hears what the run stored.
+            const eventIdsWithMovedLinks = await endRun();
             return { eventsExtracted, windowsProcessed, windowsSkipped, windowsTimedOut, windowsFailed, insertedEventIds, eventIdsWithMovedLinks };
         }
 
@@ -976,7 +993,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                     try { await pendingInsert; } catch (_) { /* secondary */ }
                 }
                 progressTracker.complete(false, `EventBase fatal error: ${winner.error.message}`);
-                throw winner.error;
+                throw await endRunBeforeFailing(winner.error);
             }
             queuedResult = winner.result;
         } else {
@@ -992,14 +1009,14 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                 }
                 if (winner.error?.name === 'AbortError') {
                     progressTracker.complete(false, 'Stopped by user');
-                    const eventIdsWithMovedLinks = await windowReplacement.moveLinksOffReplacedEvents();
+                    const eventIdsWithMovedLinks = await endRun();
                     return { eventsExtracted, windowsProcessed, windowsSkipped, windowsTimedOut, windowsFailed, insertedEventIds, eventIdsWithMovedLinks };
                 }
                 // Surface the Qdrant error to the user. EventBaseFatalError
                 // is caught at the UI layer and turned into a popup.
                 const errMsg = winner.error?.message || String(winner.error);
                 progressTracker.complete(false, `Stopped — ${errMsg}`);
-                throw winner.error;
+                throw await endRunBeforeFailing(winner.error);
             }
             // Insert succeeded — fold tally and update progress.
             const tally = winner.tally;
@@ -1010,7 +1027,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
                     try { await pendingExtract; } catch (_) { /* swallow */ }
                 }
                 progressTracker.complete(false, `EventBase fatal error: ${tally.fatalError.message}`);
-                throw tally.fatalError;
+                throw await endRunBeforeFailing(tally.fatalError);
             }
             eventsExtracted  += tally.eventsAdded;
             windowsProcessed += tally.windowsProcessed;
@@ -1067,7 +1084,7 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
             // Only re-throw our own verification failure. Network errors on the
             // verification round-trip itself shouldn't kill an otherwise-successful
             // run — they're advisory only.
-            if (verifyErr?.code === 'insert_verification_failed') throw verifyErr;
+            if (verifyErr?.code === 'insert_verification_failed') throw await endRunBeforeFailing(verifyErr);
             log.warn('[EventBase] Verification probe failed (advisory, not fatal):', verifyErr?.message || verifyErr);
         }
     }
@@ -1097,8 +1114,9 @@ export async function runEventBaseIngestion({ messages, chatUUID, settings, abor
 
     log.lifecycle(`[EventBase] Ingestion complete: extracted=${eventsExtracted}, processed=${windowsProcessed}, skipped=${windowsSkipped}, timedOut=${windowsTimedOut}, failed=${windowsFailed}`);
 
-    // StoryArc links that went to events this run replaced now point at the events that replaced them.
-    const eventIdsWithMovedLinks = await windowReplacement.moveLinksOffReplacedEvents();
+    // StoryArc links that went to events this run replaced now point at the events that replaced them, and the listener
+    // hears what the run stored.
+    const eventIdsWithMovedLinks = await endRun();
 
     // New events get their StoryArc links in the background, so this run ends now. A run reading a stretch again
     // leaves them to its caller, which links them in the open (D3 of eventbase-read-range-again.md).

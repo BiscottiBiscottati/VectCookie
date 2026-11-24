@@ -17,6 +17,8 @@ import { oneSelectionRecord } from './lorebase-book-record.js';
 
 const host = vi.hoisted(() => ({
     handlers: {},
+    // Every listener of each event, in the order they were added: two follow GENERATION_AFTER_COMMANDS.
+    listeners: {},
     context: null,
     chatId: 'chat-harbor',
     globalBooks: [],
@@ -44,7 +46,10 @@ vi.mock('../src/sillytavern/chat.js', () => ({
 }));
 vi.mock('../src/sillytavern/events.js', () => ({
     eventSource: {
-        on: (event, handler) => { host.handlers[event] = handler; },
+        on: (event, handler) => {
+            host.handlers[event] = handler;
+            (host.listeners[event] ??= []).push(handler);
+        },
         once: (event, handler) => { host.handlers[event] = handler; },
         makeLast: (event, handler) => { host.handlers[event] = handler; },
         emit: vi.fn(async () => {}),
@@ -81,7 +86,11 @@ vi.mock('../src/shared/api-keys.js', () => ({ getOpenRouterApiKey: () => 'key', 
 vi.mock('../src/shared/model-http-errors.js', () => ({ getModelConfigErrorMessage: () => null }));
 vi.mock('../src/features/llm-provider/index.js', async () => {
     const call = await vi.importActual('../src/features/llm-provider/llm-provider-call.js');
-    return { parseJsonArrayFromLlm: call.parseJsonArrayFromLlm, postChatCompletion: vi.fn() };
+    return {
+        LLM_CALL_FEATURES: (await vi.importActual('../src/features/llm-provider/llm-call-report.js')).LLM_CALL_FEATURES,
+        parseJsonArrayFromLlm: call.parseJsonArrayFromLlm,
+        postChatCompletion: vi.fn(),
+    };
 });
 vi.mock('../src/features/text-cleaning/index.js', () => ({
     cleanText: text => text,
@@ -144,12 +153,15 @@ const { initializeLoreBaseTester, keepReplyScan, recordReplyReport } = await imp
 const { askJev } = await import('../src/features/lorebase/lorebase-jev.js');
 const { searchReplyPool } = await import('../src/features/lorebase/lorebase-vectors.js');
 const { initializeLoreBase, prepareLoreBesideRetrieval, prepareLoreForReply, tryLoreBasePick } = await import('../src/features/lorebase/lorebase-reply.js');
+const { followGenerations } = await import('../src/shared/last-generation.js');
 
+// As src/index.js starts them: the follower of each generation first, then LoreBase.
+followGenerations();
 initializeLoreBase();
 host.handlers.app_ready();
 // beforeEach clears the mocks, so start-up is counted here.
 const testerStartUps = initializeLoreBaseTester.mock.calls.length;
-const afterCommands = (type, options, isDryRun = false) => host.handlers.generation_after_commands(type, options, isDryRun);
+const afterCommands = (type, options, isDryRun = false) => Promise.all(host.listeners.generation_after_commands.map(listener => listener(type, options, isDryRun)));
 
 const LIGHTHOUSE = { uid: 0, comment: 'Lighthouse of Vell', content: '[Cliff]\nThe lighthouse stands on the north cliff of Vell.\n[Lamp]\nIts lamp burns through every storm.' };
 const TIDEWARDENS = { uid: 1, comment: 'Tidewardens', content: '[Duties]\nThe tidewardens read the harbor bells.\n[Ranks]\nA warden rises by the bells they read.' };
@@ -193,7 +205,7 @@ beforeEach(() => {
     host.unvectorizedUids = new Set();
     host.vectorsReadError = null;
     host.searchError = null;
-    host.jevConnection = { ok: true, fields: { source: 'openrouter', model: 'typesafe/jev-1.14', secret_id: 'or-jev' } };
+    host.jevConnection = { ok: true, fields: { source: 'openrouter', model: 'typesafe/jev-1.14', secret_id: 'or-jev' }, profileName: 'Jev harbor' };
     host.jevAnswer = { yes: { e1: 0.64, e2: 0.2 }, inputTokens: 40, usd: 0.00002 };
     // A fresh generation record for each test: a plain reply.
     afterCommands('normal', {});
@@ -270,8 +282,8 @@ describe('Fast and Cheap [Jev] (D16)', () => {
 
         expect(postChatCompletion).not.toHaveBeenCalled();
         expect(askJev).toHaveBeenCalledTimes(1);
-        const [fields, state, questions] = askJev.mock.calls[0];
-        expect(fields).toEqual(host.jevConnection.fields);
+        const [jev, state, questions] = askJev.mock.calls[0];
+        expect(jev).toBe(host.jevConnection);
         expect(state).toBe("The chat so far. The last message is the user's; the next reply answers it.\n\nKeeper Orrin: The lamp is lit.\n\nWren: Who keeps it tonight?");
         expect(questions.e1.instructions).toBe('Does the next reply need the lorebook entry "Lighthouse of Vell" (about: keys of Lighthouse of Vell)?');
         expect(Object.keys(questions)).toEqual(['e1', 'e2']);
@@ -549,7 +561,8 @@ describe("the calls on LoreBase's connection", () => {
 
         const sent = {
             provider: 'connection_profile', model: 'openai/gpt-6-luna', connectionProfileId: 'p-harbor', connectionProfilePage: 'WorldInfo',
-            timeoutMs: 30000, contextLabel: 'LoreBase', shouldNotifyProviderFailure: false, sendTemperature: false, tokenLimitParameter: 'max_tokens',
+            timeoutMs: 30000, contextLabel: 'LoreBase', feature: 'lorebase', shouldNotifyProviderFailure: false, sendTemperature: false,
+            tokenLimitParameter: 'max_tokens',
         };
         const [pickRequest, reviewRequest] = postChatCompletion.mock.calls.map(([request]) => request);
         expect(pickRequest).toMatchObject({ ...sent, maxTokens: 9500, reasoningEffort: 'low' });
