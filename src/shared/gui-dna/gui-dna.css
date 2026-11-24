@@ -753,7 +753,8 @@
 }
 
 /* Controls and buttons on one line, a select or input taking the free width (a preset select with New, Rename and
-   Delete). Buttons that do not fit wrap to the next line; the select or input, sized from zero, never forces a wrap. */
+   Delete). Buttons that do not fit wrap to the next line. On a wide shell the select or input, sized from zero, never
+   forces a wrap; on a narrow one it keeps a readable width and wraps (the 720px rules below). */
 .vfx-ui .vfx-control-row {
     display: flex;
     flex-wrap: wrap;
@@ -1281,6 +1282,31 @@
     overflow-wrap: anywhere;
 }
 
+/* A flag after a row's name, in its status's ink, and the words it opens under the name. */
+.vfx-ui .vfx-row-flag {
+    display: inline-grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    margin: 0 0 0 6px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: none;
+    vertical-align: -0.15em;
+    font: inherit;
+    font-size: 0.9em;
+    cursor: pointer;
+}
+
+.vfx-ui :is(.vfx-row-flag, .vfx-row-flag-words).is-warning {
+    color: var(--vfx-warning-ink);
+}
+
+.vfx-ui :is(.vfx-row-flag, .vfx-row-flag-words).is-danger {
+    color: var(--vfx-danger-ink);
+}
+
 .vfx-ui .vfx-row-pills,
 .vfx-ui .vfx-row-actions {
     display: flex;
@@ -1292,6 +1318,13 @@
 /* A row with no pills or no actions keeps no gap or empty line for them. */
 .vfx-ui :is(.vfx-row-pills, .vfx-row-actions):empty {
     display: none;
+}
+
+/* A select leading a row's actions, which of a group the row's thing uses, is as wide as its longest choice up to a
+   limit, so it sits beside the buttons and never takes their line. */
+.vfx-ui .vfx-row-actions > .vfx-select {
+    width: auto;
+    max-width: 16em;
 }
 
 /* A record holds fields, so it is drawn like a card: its fields stand out on its surface, its header sits on the tinted
@@ -1540,6 +1573,15 @@ dialog.vfx-ui.vfx-dialog::backdrop {
     font-weight: 600;
 }
 
+/* A line in a status's ink: danger for words that say a whole thing goes, success for the way to a smaller step. */
+.vfx-ui .vfx-dialog-text > p.is-danger {
+    color: var(--vfx-danger-ink);
+}
+
+.vfx-ui .vfx-dialog-text > p.is-success {
+    color: var(--vfx-success-ink);
+}
+
 .vfx-ui .vfx-dialog-value {
     font-weight: 600;
 }
@@ -1665,6 +1707,12 @@ dialog.vfx-ui.vfx-dialog::backdrop {
 
     .vfx-ui .vfx-grid {
         grid-template-columns: minmax(0, 1fr);
+    }
+
+    /* Several fields in one control row share a line two or three at a time, rather than each shrinking past reading
+       (a search box beside four filter dropdowns); a field alone on its line still takes all of it. */
+    .vfx-ui .vfx-control-row > :is(.vfx-input, .vfx-select) {
+        flex-basis: 120px;
     }
 
     .vfx-ui .vfx-card-header {

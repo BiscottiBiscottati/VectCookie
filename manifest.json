@@ -7,10 +7,10 @@
     "js": "src/index.js",
     "css": "src/vectfox.css",
     "author": "Kritbalde",
-    "version": "3.6.138",
-    "similharity_minimum_version": "3.4.8",
+    "version": "3.6.238",
+    "similharity_minimum_version": "3.4.14",
     "homePage": "https://github.com/KritBlade/VectFox",
-    "description": "Advanced RAG system with temporal decay, importance weighting, and intelligent chunking",
+    "description": "Chat memory from EventBase events, with StoryArc, Agent Mode and LoreBase lorebook picks",
     "auto_update": true,
     "hooks": {
         "update": "onUpdate"

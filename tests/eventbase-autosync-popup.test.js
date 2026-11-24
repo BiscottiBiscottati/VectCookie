@@ -19,7 +19,6 @@ vi.mock('../src/shared/collection-ids.js', () => ({
     getChatUUID: () => 'popup-uuid', parseRegistryKey: (k) => ({ collectionId: k }),
     COLLECTION_PREFIXES: { VECTFOX_ARCHIVE_EVENT: 'vf_archiveevent_', VECTFOX_EVENTBASE: 'vf_eventbase_' },
     buildRegistryKey: (id) => `qdrant:${id}`, buildEventBaseCollectionId: () => 'vf_eventbase_popup', getRegistryBackend: () => 'qdrant',
-    buildChatSearchPatterns: () => [], matchesPatterns: () => false,
 }));
 vi.mock('../src/features/collections/collection-loader.js', () => ({ getCollectionRegistry: () => [], registerCollection: vi.fn(), getCollectionListing: vi.fn() }));
 vi.mock('../src/features/vector-backend/vector-api.js', () => ({
@@ -36,6 +35,17 @@ vi.mock('../src/features/eventbase/eventbase-extractor.js', () => ({
     }]),
 }));
 vi.mock('../src/features/eventbase/generation-rate-limiter.js', () => ({ generationRateLimiter: { execute: (run) => run() }, generationRateLimitSettings: () => ({}) }));
+// The chat's collections: the run's collection is put in use in the chat (eventbase-collection-in-use.test.js holds the rule).
+vi.mock('../src/features/eventbase/eventbase-chat-collections.js', async () => {
+    const { setCollectionMeta } = await import('../src/features/collections/collection-metadata.js');
+    return {
+        collectionInUse: () => ({ collection: null, reason: 'no-collection', collections: [], lockedElsewhere: [] }),
+        noCollectionInUseText: () => null, resolveEventBaseRunTarget: () => null,
+        sharedCollectionsLockedHere: () => ({ otherChats: [], archives: [] }),
+        // In use in the chat: scoped to chats, as the real one leaves it.
+        useChatCollection: vi.fn(registryKey => setCollectionMeta(registryKey, { scope: 'chat' })),
+    };
+});
 vi.mock('../src/features/eventbase/eventbase-store.js', async (importOriginal) => ({
     ...(await importOriginal()),
     insertEvents: vi.fn(async (events) => { state.points.push(...events); }),
@@ -46,9 +56,11 @@ vi.mock('../src/features/vector-backend/backend-registry.js', () => ({
 vi.mock('../src/features/eventbase/eventbase-retrieval.js', () => ({ retrieveEvents: vi.fn() }));
 vi.mock('../src/features/eventbase/agentic-retrieval.js', () => ({ retrieveEventsForTurn: vi.fn() }));
 vi.mock('../src/features/eventbase/eventbase-injection.js', () => ({ formatEventsForInjectionDetailed: vi.fn() }));
-vi.mock('../src/features/collections/collection-metadata.js', () => ({
+// The real records, where each collection keeps its pointer; locks and pauses are left out.
+vi.mock('../src/features/collections/collection-metadata.js', async (importOriginal) => ({
+    ...(await importOriginal()),
     isCollectionEnabled: () => true, isCollectionActiveForContextAnyKey: () => true,
-    setCollectionLock: vi.fn(), setCollectionMeta: vi.fn(), getChatLockedCollections: () => [],
+    setCollectionLock: vi.fn(), getChatLockedCollections: () => [],
 }));
 vi.mock('../src/shared/progress-tracker.js', () => ({ progressTracker: new Proxy({}, { get: () => () => {} }) }));
 vi.mock('../src/sillytavern/log.js', () => ({ log: { lifecycle: vi.fn(), verbose: vi.fn(), trace: vi.fn(), warn: vi.fn(), error: vi.fn(), enabled: () => false } }));
@@ -70,9 +82,10 @@ const buildChat = (count) => Array.from({ length: count }, (_, i) => ({
     name: i % 2 === 0 ? 'User' : 'Bot', is_user: i % 2 === 0, mes: `message ${i}`,
 }));
 
+// Each chat reads into its own collection, so no run sees another's pointer.
 const autoSync = (messages, chatUUID, { suppressAutoSyncPopup = false } = {}) => runEventBaseIngestion({
     messages, chatUUID, settings: SETTINGS, isAutoSync: true, suppressAutoSyncPopup,
-    collectionIdOverride: 'vf_eventbase_popup',
+    collectionIdOverride: `vf_eventbase_popup_${chatUUID}`,
     windowSizeOverride: getAutoSyncWindowSize(SETTINGS), windowOverlapOverride: 0,
 });
 
@@ -89,7 +102,7 @@ describe('auto-sync popup', () => {
     // (window 448-449 was never extracted, it predates the marker) but the marker
     // filter leaves nothing to do.
     it('stays hidden when the start-marker filter leaves no window to extract', async () => {
-        state.extensionSettings.vectfox.eventbase_autosync_start_marker = { 'marker-uuid': 450 };
+        state.extensionSettings.vectfox.collections = { 'qdrant:vf_eventbase_popup_marker-uuid': { eventbaseProgress: { autoSyncStartMarker: 450 } } };
 
         const result = await autoSync(buildChat(452), 'marker-uuid');
 

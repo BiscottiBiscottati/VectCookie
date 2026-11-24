@@ -9,6 +9,7 @@ import {
     ALL_STORY_LINK_TYPES,
     STORY_LINKS_FILE_TYPE,
     STORY_LINK_PROMPT,
+    STORY_LINK_STATE,
     STORY_LINK_TYPE,
     buildStoryLinkGraph,
     buildStoryLinkMessage,
@@ -17,6 +18,7 @@ import {
     describeStoryLinksImport,
     earlierEventsOf,
     estimateStoryLinkPass,
+    linkParallelCallsOf,
     inTimelineOrder,
     measureStoryLinkCoverage,
     mergeLinkCandidates,
@@ -26,6 +28,7 @@ import {
     readStoryLinks,
     readStoryLinksFile,
     shouldLinkNewEvents,
+    storyLinkState,
     walkStoryLinks,
 } from '../src/features/eventbase/story-arc-links-core.js';
 
@@ -72,10 +75,10 @@ describe('measureStoryLinkCoverage', () => {
 
     it('calls links usable from 90% decided, and only when one has a link', () => {
         const decided = Array.from({ length: 9 }, (_, i) => event(i, i, { story_links: [link(0)] }));
-        expect(measureStoryLinkCoverage([...decided, event(9, 9)]).hasUsableLinks).toBe(true);
-        expect(measureStoryLinkCoverage([...decided, event(9, 9), event(10, 10)]).hasUsableLinks).toBe(false);
-        expect(measureStoryLinkCoverage([event(1, 1, { story_links: [] })]).hasUsableLinks).toBe(false);
-        expect(measureStoryLinkCoverage([]).hasUsableLinks).toBe(false);
+        expect(measureStoryLinkCoverage([...decided, event(9, 9)])).toMatchObject({ isMostlyDecided: true, hasUsableLinks: true });
+        expect(measureStoryLinkCoverage([...decided, event(9, 9), event(10, 10)])).toMatchObject({ isMostlyDecided: false, hasUsableLinks: false });
+        expect(measureStoryLinkCoverage([event(1, 1, { story_links: [] })])).toMatchObject({ isMostlyDecided: true, hasUsableLinks: false });
+        expect(measureStoryLinkCoverage([])).toMatchObject({ isMostlyDecided: false, hasUsableLinks: false });
     });
 
     // Links that lead nowhere must read as none, or a chat looks linked while every walk stops at once.
@@ -89,14 +92,33 @@ describe('measureStoryLinkCoverage', () => {
 });
 
 describe('shouldLinkNewEvents', () => {
-    it('links in a new chat, and in a chat whose older events are decided', () => {
-        expect(shouldLinkNewEvents([])).toBe(true);
+    it('links in a collection whose older events are decided', () => {
         expect(shouldLinkNewEvents([event(1, 1, { story_links: [] })])).toBe(true);
+        expect(shouldLinkNewEvents([event(1, 1, { story_links: [link(2)] }), event(2, 2, { story_links: [] })])).toBe(true);
     });
 
     // Otherwise every reply would pay for links nothing can walk yet.
-    it('waits when the chat has never had a link pass', () => {
+    it('waits when the collection has never had a link pass', () => {
         expect(shouldLinkNewEvents([event(1, 1), event(2, 2)])).toBe(false);
+    });
+
+    // A chat's first read, New collection and Start over write into a collection with no older event: a whole chat's
+    // links are paid for only from Regenerate links, which shows the cost first.
+    it('waits with no older event', () => {
+        expect(shouldLinkNewEvents([])).toBe(false);
+    });
+});
+
+describe('storyLinkState', () => {
+    it('is linked with every event decided, partly linked with some, unlinked with none', () => {
+        expect(storyLinkState({ totalCount: 11, decidedCount: 11 })).toBe(STORY_LINK_STATE.LINKED);
+        expect(storyLinkState({ totalCount: 15, decidedCount: 11 })).toBe(STORY_LINK_STATE.PARTLY_LINKED);
+        expect(storyLinkState({ totalCount: 15, decidedCount: 0 })).toBe(STORY_LINK_STATE.UNLINKED);
+    });
+
+    it('reads a coverage as measureStoryLinkCoverage gives it', () => {
+        const coverage = measureStoryLinkCoverage([event(1, 1, { story_links: [] }), event(2, 2)]);
+        expect(storyLinkState(coverage)).toBe(STORY_LINK_STATE.PARTLY_LINKED);
     });
 });
 
@@ -241,14 +263,34 @@ describe('buildStoryLinkGraph and walkStoryLinks', () => {
 });
 
 describe('estimateStoryLinkPass', () => {
-    it('gives tokens, minutes and cost', () => {
-        const estimate = estimateStoryLinkPass(1437, { input: 0.0000001, output: 0.0000005 });
+    it('gives tokens, minutes and cost, the minutes as measured with 8 events at once', () => {
+        const estimate = estimateStoryLinkPass(1437, { input: 0.0000001, output: 0.0000005 }, 8);
         expect(estimate.minutes).toBe(19);
         expect(estimate.costUsd).toBeCloseTo(0.49, 2);
     });
 
+    it('takes longer with fewer events at once, at the same cost', () => {
+        const price = { input: 0.0000001, output: 0.0000005 };
+        expect(estimateStoryLinkPass(1437, price, 3).minutes).toBe(50);
+        expect(estimateStoryLinkPass(1437, price, 3).costUsd).toBe(estimateStoryLinkPass(1437, price, 8).costUsd);
+    });
+
     it('gives no cost when the price is unknown', () => {
-        expect(estimateStoryLinkPass(10, null).costUsd).toBeNull();
+        expect(estimateStoryLinkPass(10, null, 3).costUsd).toBeNull();
+    });
+});
+
+describe('linkParallelCallsOf', () => {
+    it('reads the Events at once box as a whole number from 1 to 8', () => {
+        expect(linkParallelCallsOf('5')).toBe(5);
+        expect(linkParallelCallsOf(0)).toBe(1);
+        expect(linkParallelCallsOf('12')).toBe(8);
+        expect(linkParallelCallsOf('2.7')).toBe(2);
+    });
+
+    it('starts at 3, as Vectorize Content does, for a box that holds no number', () => {
+        expect(linkParallelCallsOf('')).toBe(3);
+        expect(linkParallelCallsOf(undefined)).toBe(3);
     });
 });
 
@@ -263,6 +305,7 @@ describe('describeStoryLinkCoverage', () => {
     it('says how many events are linked, and how many are not decided yet', () => {
         expect(describeStoryLinkCoverage({ totalCount: 1803, decidedCount: 1803, linkedCount: 1672 })).toBe('1672 of 1803 events linked');
         expect(describeStoryLinkCoverage({ totalCount: 10, decidedCount: 7, linkedCount: 5 })).toBe('5 of 10 events linked, 3 not decided yet');
+        expect(describeStoryLinkCoverage({ totalCount: 1, decidedCount: 1, linkedCount: 0 })).toBe('0 of 1 event linked');
     });
 
     it('says when there are no events, and when they could not be read', () => {
@@ -278,12 +321,15 @@ describe('the links file', () => {
         event(3, 30),
     ];
     const collection = { id: 'vf_eventbase_chat', name: 'A chat' };
-    const file = () => buildStoryLinksFile(events, collection, '2026-11-05T00:00:00.000Z');
+    const header = { version: '1.0.0', exportDate: '2026-11-05T00:00:00.000Z', generator: 'VectFox' };
+    const file = () => buildStoryLinksFile(events, collection, header);
 
-    it('holds each decided event in timeline order, and leaves out what is undecided', () => {
+    it('opens with the header every VectFox file has, then holds each decided event in timeline order, and leaves out what is undecided', () => {
         expect(file()).toEqual({
-            type: STORY_LINKS_FILE_TYPE,
+            version: '1.0.0',
             exportDate: '2026-11-05T00:00:00.000Z',
+            generator: 'VectFox',
+            type: STORY_LINKS_FILE_TYPE,
             collection,
             events: [
                 { event_id: 'id1', story_links: [] },
@@ -294,7 +340,7 @@ describe('the links file', () => {
 
     it('refuses to export links that name no event_id', () => {
         const unusable = [event(1, 10, { story_links: [] }), event(2, 20, { story_links: [{ hash: 1, type: STORY_LINK_TYPE.CONTINUES, thread: 't' }] })];
-        expect(() => buildStoryLinksFile(unusable, collection, 'a date')).toThrow('1 events hold links without an event_id');
+        expect(() => buildStoryLinksFile(unusable, collection, header)).toThrow('1 events hold links without an event_id');
     });
 
     it('reads back what it wrote', () => {

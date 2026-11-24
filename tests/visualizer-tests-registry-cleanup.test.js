@@ -20,13 +20,15 @@ vi.mock('../src/sillytavern/requests.js', () => ({ getRequestHeaders: () => ({})
 vi.mock('../src/shared/similharity-plugin.js', () => ({ checkPluginAvailable: async () => true }));
 vi.mock('../src/features/embedding/index.js', () => ({
     embeddingProfileRequestFields: async () => ({}),
+    embeddingProviderLabel: settings => settings.embedding_provider,
     getModelFromSettings: () => '',
     resolveProviderApiUrl: () => undefined,
+    slowEmbeddingWarnMs: () => 10000,
 }));
-vi.mock('../src/features/keyword-search/index.js', () => ({ extractTextKeywords: vi.fn(), extractLorebookKeywords: vi.fn() }));
 vi.mock('../src/features/vector-backend/index.js', async () => {
     const { buildRegistryKey } = await vi.importActual('../src/shared/collection-ids.js');
     return {
+        getBackend: vi.fn(async () => ({ embedQuery: async () => [0.1, 0.2, 0.3] })),
         insertVectorItems: vi.fn(async (collectionId, items, settings) => {
             host.registry.add(buildRegistryKey(collectionId, settings));
             host.inserted.add(collectionId);
@@ -44,9 +46,6 @@ vi.mock('../src/features/vector-backend/index.js', async () => {
     };
 });
 vi.mock('../src/features/collections/index.js', () => ({
-    getChunkMetadata: vi.fn(() => null),
-    saveChunkMetadata: vi.fn(),
-    deleteChunkMetadata: vi.fn(),
     unregisterCollection: vi.fn(key => host.registry.delete(key)),
     deleteCollection: vi.fn(),
 }));

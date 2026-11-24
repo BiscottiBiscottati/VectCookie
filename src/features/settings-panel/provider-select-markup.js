@@ -3,13 +3,13 @@
  * INHERITED PROVIDER SELECT, STATIC MARKUP
  * ============================================================================
  * The Provider select of an LLM consumer that can run on the EventBase model's
- * connection, Auto-Reformat (ChunkBase page) and Agent Mode (AgentMode page), and the
- * hint under it, which the wiring hides while the consumer runs on a profile.
+ * connection, Agent Mode (AgentMode page), and the hint under it, which the wiring
+ * hides while the consumer runs on a profile.
  * Pure: builds strings.
  * ============================================================================
  */
 
-import { CONNECTION_PROFILE_PROVIDER } from '../../shared/constants.js';
+import { chatProviderOptions } from '../../shared/connection-profile-rows-markup.js';
 import { hint, select, selectOption } from '../../shared/gui-dna/gui-dna-core.js';
 
 /**
@@ -22,12 +22,7 @@ import { hint, select, selectOption } from '../../shared/gui-dna/gui-dna-core.js
 export function inheritedProviderSelect(id) {
     return select({
         id,
-        options: [
-            selectOption({ value: '', text: 'Same as EventBase model' }),
-            selectOption({ value: CONNECTION_PROFILE_PROVIDER, text: 'SillyTavern profile' }),
-            selectOption({ value: 'openrouter', text: 'OpenRouter' }),
-            selectOption({ value: 'vllm', text: 'vLLM' }),
-        ],
+        options: [selectOption({ value: '', text: 'Same as EventBase model' }), ...chatProviderOptions()],
     });
 }
 

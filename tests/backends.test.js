@@ -82,6 +82,8 @@ vi.mock('../src/features/embedding/providers.js', () => ({
         return modelFields[source] || null;
     }),
     getModelFromSettings: vi.fn(() => 'test-model'),
+    // No piece size: a search text is embedded whole, with no warning.
+    getProviderConfig: vi.fn(() => null),
     // A manual provider's requests name no profile fields.
     embeddingProfileRequestFields: vi.fn(async () => ({})),
 }));
@@ -319,14 +321,14 @@ describe('StandardBackend', () => {
             expect(fetchMock).not.toHaveBeenCalled();
         });
 
-        it('keeps the keywords, importance and summary fields an item carries only in its metadata', async () => {
+        it('keeps the keywords, importance and event fields an item carries only in its metadata', async () => {
             fetchMock.mockResolvedValueOnce(mockFetchResponse({}));
-            const storedAgain = { hash: 77, index: 0, text: 'The gate stood open.', metadata: { keywords: ['gate'], importance: 7, parentHash: 42 } };
+            const storedAgain = { hash: 77, index: 0, text: 'The gate stood open.', metadata: { keywords: ['gate'], importance: 7, event_type: 'discovery' } };
 
             await backend.insertVectorItems('test-collection', [storedAgain], defaultSettings);
 
             const [sent] = JSON.parse(fetchMock.mock.calls[0][1].body).items;
-            expect(sent.metadata).toMatchObject({ keywords: ['gate'], importance: 7, parentHash: 42 });
+            expect(sent.metadata).toMatchObject({ keywords: ['gate'], importance: 7, event_type: 'discovery' });
         });
 
         it('should throw on insert failure', async () => {
@@ -754,6 +756,23 @@ describe('QdrantBackend', () => {
             expect(fetchMock).not.toHaveBeenCalled();
         });
 
+        it("routes a request whose settings name their own shared collection there, the collection as the tenant (LoreBase's, Q6)", async () => {
+            const ownShared = { ...defaultSettings, qdrant_multitenancy: true, qdrant_shared_collection: 'vf_lorebase_rabbit' };
+            const book = { content_type: 'vf_lorebase_qdrant_rabbit_harbor_atlas_1x' };
+            expect(qdrantTarget('vf_lorebase_qdrant_rabbit_harbor_atlas_1x', ownShared)).toEqual({ collectionId: 'vf_lorebase_rabbit', filters: book });
+            expect(qdrantTarget('vf_lorebase_qdrant_rabbit_harbor_atlas_1x', { ...ownShared, qdrant_shared_collection: null }))
+                .toEqual({ collectionId: 'vectfox_main', filters: book });
+
+            fetchMock.mockImplementation(async () => mockFetchResponse({ success: true, items: [] }));
+            await backend.purgeVectorIndex('vf_lorebase_qdrant_rabbit_harbor_atlas_1x', ownShared);
+            await backend.deleteVectorItems('vf_lorebase_qdrant_rabbit_harbor_atlas_1x', [5], ownShared);
+            await backend.insertVectorItems('vf_lorebase_qdrant_rabbit_harbor_atlas_1x', sampleItems, ownShared);
+            expect(bodyOf(0)).toMatchObject({ collectionId: 'vf_lorebase_rabbit', filters: book });
+            expect(bodyOf(1)).toMatchObject({ collectionId: 'vf_lorebase_rabbit', filters: book });
+            expect(bodyOf(2).collectionId).toBe('vf_lorebase_rabbit');
+            expect(bodyOf(2).items[0].metadata.content_type).toBe(book.content_type);
+        });
+
         it('purges a collection of its own whole, with no tenant, when the shared collection is off', async () => {
             fetchMock.mockResolvedValueOnce(mockFetchResponse({ success: true }));
 
@@ -803,20 +822,31 @@ describe('QdrantBackend', () => {
             expect(registrar).not.toHaveBeenCalled();
         });
 
-        it('keeps the keywords, importance and summary fields an item carries only in its metadata, and appends the keywords once', async () => {
+        it('keeps the keywords, importance and event fields an item carries only in its metadata, and appends the keywords once', async () => {
             fetchMock.mockResolvedValueOnce(mockFetchResponse({}));
             const storedAgain = {
                 hash: 77,
                 index: 0,
                 text: 'The gate stood open. [KEYWORDS: gate]',
-                metadata: { keywords: [{ text: 'gate', weight: 1.5 }], importance: 7, isSummaryChunk: true, parentHash: 42 },
+                metadata: { keywords: [{ text: 'gate', weight: 1.5 }], importance: 7, event_type: 'discovery', window_event_order: 2 },
             };
 
             await backend.insertVectorItems('vf_chat_abc123', [storedAgain], defaultSettings);
 
             const [sent] = JSON.parse(fetchMock.mock.calls[0][1].body).items;
             expect(sent.text).toBe('The gate stood open. [KEYWORDS: gate]');
-            expect(sent.metadata).toMatchObject({ keywords: [{ text: 'gate', weight: 1.5 }], importance: 7, isSummaryChunk: true, parentHash: 42 });
+            expect(sent.metadata).toMatchObject({ keywords: [{ text: 'gate', weight: 1.5 }], importance: 7, event_type: 'discovery', window_event_order: 2 });
+        });
+
+        it('sends the point ID a caller chose, and none when it chose none, so Similharity stores the point under its hash', async () => {
+            fetchMock.mockResolvedValueOnce(mockFetchResponse({}));
+            const chosen = { hash: 91, text: 'Buoy\nA single red buoy marks the reef.', id: '0c5ad2e1-3f4b-8a1c-9d2e-112233445566' };
+
+            await backend.insertVectorItems('vf_chat_abc123', [chosen, sampleItems[0]], defaultSettings);
+
+            const items = JSON.parse(fetchMock.mock.calls[0][1].body).items;
+            expect(items[0].id).toBe(chosen.id);
+            expect('id' in items[1]).toBe(false);
         });
 
         it('should add content_type in multitenancy mode', async () => {
@@ -866,6 +896,62 @@ describe('QdrantBackend', () => {
 
             expect(await fetchCollectionMetadata('test-collection')).toEqual({ cjk_tokenizer_mode: 'intl' });
             expect(fetchMock).toHaveBeenCalledTimes(3);
+        });
+    });
+
+    describe('embedQueries', () => {
+        it('embeds every text in one /batch-embeddings request and returns their vectors in order', async () => {
+            fetchMock.mockResolvedValueOnce(mockFetchResponse({ embeddings: [[0.1, 0.2], [0.3, 0.4]] }));
+            const vectors = await backend.embedQueries(['Who keeps the lamp?', 'The lamp is lit.'], defaultSettings);
+            expect(vectors).toEqual([[0.1, 0.2], [0.3, 0.4]]);
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            const [route, init] = fetchMock.mock.calls[0];
+            expect(route).toBe('/api/plugins/similharity/batch-embeddings');
+            expect(JSON.parse(init.body)).toMatchObject({ texts: ['Who keeps the lamp?', 'The lamp is lit.'], source: 'transformers' });
+        });
+
+        it('fails when the plugin returns a vector short', async () => {
+            fetchMock.mockResolvedValueOnce(mockFetchResponse({ embeddings: [[0.1, 0.2]] }));
+            await expect(backend.embedQueries(['a', 'b'], defaultSettings)).rejects.toThrow('returned 1 vectors for 2 texts');
+        });
+    });
+
+    describe('hybridQueryCollections', () => {
+        const books = ['vf_lorebase_qdrant_rabbit_harbor_atlas_1x', 'vf_lorebase_qdrant_rabbit_wren_journal_2y'];
+        const inAccountCollection = { ...defaultSettings, qdrant_multitenancy: true, qdrant_shared_collection: 'vf_lorebase_rabbit' };
+
+        it('searches every collection listed in one fused request, four times the points per leg, and keeps the RRF scores', async () => {
+            const { invalidateCollectionMetadata } = await import('../src/features/vector-backend/tokenizer-lock.js');
+            invalidateCollectionMetadata('vf_lorebase_rabbit');
+            fetchMock
+                .mockResolvedValueOnce(mockFetchResponse({ payload: null, supported: true }))      // sentinel: no lock
+                .mockResolvedValueOnce(mockFetchResponse({
+                    results: [{ hash: 7, text: 'Lighthouse', score: 0.5, metadata: { lorebookName: 'Harbor Atlas', entryUid: '3' } }],
+                }));
+
+            const points = await backend.hybridQueryCollections(books, 'Who keeps the lamp?', 400, inAccountCollection, [0.1, 0.2]);
+
+            expect(points).toEqual([{ hash: 7, score: 0.5, metadata: { lorebookName: 'Harbor Atlas', entryUid: '3' } }]);
+            expect(fetchMock).toHaveBeenCalledTimes(2);
+            const [route, init] = fetchMock.mock.calls[1];
+            expect(route).toBe('/api/plugins/similharity/chunks/hybrid-query');
+            const body = JSON.parse(init.body);
+            expect(body).toMatchObject({
+                backend: 'qdrant', collectionId: 'vf_lorebase_rabbit', queryVector: [0.1, 0.2], topK: 400,
+                hybridOptions: { fusionMethod: 'rrf', prefetchLimit: 1600 }, filters: { content_type_any: books },
+            });
+            expect(body.sparseQueryVector).toEqual(expect.objectContaining({ indices: expect.any(Array), values: expect.any(Array) }));
+        });
+
+        it('throws when the search fails, with no other request after it', async () => {
+            const { invalidateCollectionMetadata } = await import('../src/features/vector-backend/tokenizer-lock.js');
+            invalidateCollectionMetadata('vf_lorebase_rabbit');
+            fetchMock
+                .mockResolvedValueOnce(mockFetchResponse({ payload: null, supported: true }))
+                .mockResolvedValueOnce(mockFetchError(500, 'content_type_any needs a list of at least one collection ID'));
+            await expect(backend.hybridQueryCollections(books, 'Who keeps the lamp?', 400, inAccountCollection, [0.1, 0.2]))
+                .rejects.toThrow('Hybrid query of 2 collections in vf_lorebase_rabbit failed');
+            expect(fetchMock).toHaveBeenCalledTimes(2);
         });
     });
 

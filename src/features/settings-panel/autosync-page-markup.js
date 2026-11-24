@@ -5,21 +5,26 @@
  * The settings panel's AutoSync page on GUI-DNA: auto-sync for the open chat,
  * Summarizer Injection, and the ghosting that leans on it. Every control keeps the
  * id settings-panel.js wires it by, and a row or card the wiring shows and hides
- * keeps its id too. The status line under the auto-sync switch is built here as
- * well. Pure: builds strings.
+ * keeps its id too. Collection in use here, over the open chat's own collections
+ * (§1.2 of vectfox-multi-collection-per-chat.md), and the status line under the
+ * auto-sync switch are built here as well. Pure: builds strings.
  * ============================================================================
  */
 
 import { detail, field, fieldLabel, hint, input, notice, resultList, stack } from '../../shared/gui-dna/gui-dna-core.js';
 import { cardHeader, sliderNumber, switchRow } from '../../shared/gui-dna/panel-page-genes.js';
-import { GHOST_STEP_MAX } from '../../shared/constants.js';
+import { inUseSwitcherMarkup } from './in-use-switcher-markup.js';
 
 const HIDDEN = ' style="display:none;"';
+
+/** Collection in use here's dropdown, by its id. */
+export const AUTOSYNC_IN_USE_ID = 'VectFox_autosync_in_use';
 
 function autoSyncCard() {
     return `<section class="vfx-card">
         ${cardHeader({ icon: 'fa-arrows-rotate', title: 'Auto-sync', description: 'Keeps this chat\'s events current as the chat grows.' })}
         <div class="vfx-card-body vfx-grid">
+            <div id="VectFox_autosync_collection" class="vfx-span"></div>
             ${switchRow({ id: 'VectFox_autosync_enabled', title: 'Auto-sync this chat', description: 'Extracts events from new messages. The chat must be vectorized once first.', isSpan: true })}
             <div id="VectFox_autosync_status" class="vfx-span" aria-live="polite"></div>
             ${field([
@@ -70,10 +75,10 @@ function ghostingCard() {
                 detail({ text: 'Every message World Info scans is kept as well, so keyword triggers still fire. The blanked turns live on only as events, so check recall as you lower it.' }),
             ])}
             ${field([
-                fieldLabel({ text: 'Blank in batches of', forId: 'VectFox_eventbase_ghost_step', hasHelp: true }),
-                sliderNumber({ id: 'VectFox_eventbase_ghost_step', min: 1, max: GHOST_STEP_MAX, step: 1, title: 'Messages per batch' }),
-                hint({ text: 'Bigger batches hold the wipe line still, so the provider can reuse its cached prefix.' }),
-                detail({ text: 'At 1, the default, the wipe line moves every turn. Higher batches hold it still, and the raw window grows up to the messages kept verbatim plus the batch size, minus one. Raise it only if the model can hold that much context.' }),
+                fieldLabel({ text: 'Blank in batches of', forId: 'VectFox_eventbase_ghost_batch_size', hasHelp: true }),
+                sliderNumber({ id: 'VectFox_eventbase_ghost_batch_size', min: 1, max: 100, step: 1, title: 'Messages' }),
+                hint({ text: 'Above 1, the prompt\'s start holds for a few turns, so a prompt cache can reuse it.' }),
+                detail({ text: 'At 1, blanking moves on every turn. At 10, it waits until 10 more messages can go and blanks them together, so up to 9 more messages stay verbatim until then. Raise it on a provider that caches prompts, such as DeepSeek or OpenAI. Elsewhere the extra messages only cost tokens.' }),
             ])}
             <div id="VectFox_eventbase_ghost_readout">${notice({ status: 'info', text: 'Last turn: no reply yet.' })}</div>
         </div>
@@ -103,9 +108,10 @@ function countsLine({ chatMessageCount, vectorizedCount, isLatestTurnSettling })
  * What auto-sync is doing for the open chat, as a line with its tone: success, warning,
  * or a plain line while it is off.
  */
-function stateLine({ state, isVectFoxOn, isOnForChat, unfinishedWindowCount }) {
+function stateLine({ state, isVectFoxOn, isOnForChat, unfinishedWindowCount, noneInUseText }) {
     if (state === 'no-chat') return { status: 'warning', text: 'No chat open.' };
     if (state === 'no-collection') return { status: 'warning', text: 'Not vectorized yet. Turning auto-sync on starts it.' };
+    if (state === 'none-locked') return { status: 'warning', text: `${noneInUseText} Choose one above.` };
     if (!isVectFoxOn) return { icon: 'fa-circle', text: 'Paused while VectFox is off.' };
     if (!isOnForChat) return { icon: 'fa-circle', text: 'Off for this chat.' };
     if (state === 'fully-vectorized') return { status: 'success', text: 'Up to date.' };
@@ -114,6 +120,31 @@ function stateLine({ state, isVectFoxOn, isOnForChat, unfinishedWindowCount }) {
         return { status: 'warning', name: `${failed} Resume in Vectorize Content sends them again.` };
     }
     return { status: 'warning', text: 'Behind. The next auto-sync catches up.' };
+}
+
+/**
+ * Collection in use here (§1.2 of vectfox-multi-collection-per-chat.md): the open chat's own collections in the in-use
+ * switcher, the one in use chosen as the one route gives it (collectionInUse, D18); "None in use here" while none is,
+ * as with several locked to the chat, so that each of them can be chosen; then New collection, which opens Vectorize
+ * Content on it; nothing for a chat with no collection, which keeps "Not vectorized yet.".
+ * @param {Array<{registryKey: string, name: string}>} collections - chatOwnCollections
+ * @param {string|null} [inUseKey] - The registry key of the collection in use, from getChatAutoSyncStatus; none while
+ *   none is in use
+ * @returns {string}
+ */
+export function autoSyncCollectionMarkup(collections, inUseKey = null) {
+    if (!collections.length) return '';
+    return field([
+        fieldLabel({ text: 'Collection in use here', forId: AUTOSYNC_IN_USE_ID }),
+        inUseSwitcherMarkup({
+            id: AUTOSYNC_IN_USE_ID,
+            title: 'Collection in use here',
+            members: collections.map(collection => ({ id: collection.registryKey, name: collection.name })),
+            inUseId: inUseKey,
+            newText: 'New collection',
+        }),
+        hint({ text: 'The one EventBase reads and writes in this chat. The others stay as they are.' }),
+    ]);
 }
 
 /**
@@ -126,19 +157,18 @@ function stateLine({ state, isVectFoxOn, isOnForChat, unfinishedWindowCount }) {
  * @param {number|null} [status.chatMessageCount]
  * @param {number|null} [status.vectorizedCount] - Messages vectorization covers
  * @param {boolean} [status.isLatestTurnSettling] - Up to date but for the newest turn, held back until it settles
- * @param {number} [status.markerValue] - Where the auto-sync marker sits, read while vectorization is ahead of the chat
  * @param {number} [status.unfinishedWindowCount] - Windows that failed and hold no events
+ * @param {string} [status.noneInUseText] - With collections and none in use: why EventBase reads and writes nothing here
  * @returns {string}
  */
-export function autoSyncStatusMarkup({ state, isVectFoxOn, isOnForChat = false, chatMessageCount = null, vectorizedCount = null, isLatestTurnSettling = false, markerValue = 0, unfinishedWindowCount = 0 }) {
+export function autoSyncStatusMarkup({ state, isVectFoxOn, isOnForChat = false, chatMessageCount = null, vectorizedCount = null, isLatestTurnSettling = false, unfinishedWindowCount = 0, noneInUseText = '' }) {
     if (isVectFoxOn && isOnForChat && state === 'vectorization-ahead') {
-        const gap = markerValue - chatMessageCount;
         return resultList({ lines: [
-            { status: 'warning', text: 'Vectorization reaches past this chat\'s end, so there is nothing to sync.' },
-            { name: `Chat: ${chatMessageCount} messages · vectorized: ${markerValue} messages (${gap} ahead)` },
-            { name: `Messages may have been deleted, or the events came from a longer copy of this chat. Auto-sync resumes once the chat reaches ${markerValue} messages.` },
+            { status: 'warning', text: 'This chat is shorter than what EventBase read.' },
+            { name: `Chat: ${chatMessageCount} messages · read: ${vectorizedCount} messages` },
+            { name: `Messages were deleted, a summary replaced some, or the events came from a longer copy of this chat. Auto-sync goes on with the chat's new messages, and ghosting blanks nothing until the chat passes ${vectorizedCount} messages. Sync chat on the Action page reads what EventBase has not read.` },
         ] });
     }
-    const line = stateLine({ state, isVectFoxOn, isOnForChat, unfinishedWindowCount });
+    const line = stateLine({ state, isVectFoxOn, isOnForChat, unfinishedWindowCount, noneInUseText });
     return resultList({ lines: [line, countsLine({ chatMessageCount, vectorizedCount, isLatestTurnSettling })] });
 }

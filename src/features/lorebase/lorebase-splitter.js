@@ -1,15 +1,15 @@
 /**
- * Cuts a lorebook entry into the passages LoreBase indexes (plan §5.3 of InternalProject/Vectfox/plans/
- * lorebook-semantic-overhaul-passage-index.md): the author's own markers first, then 300-token windows at line and
- * sentence ends, only inside a section that is still too long. A passage never crosses a section. A <tag> wrapper
- * around the whole entry is its frame, kept apart so a trim can keep the tags balanced.
+ * Cuts a lorebook entry into the passages LoreBase's review numbers as its parts (plan §5.3 of InternalProject/Vectfox/
+ * plans/executed/lorebook-semantic-overhaul-passage-index.md): the author's own markers first, then 300-token windows at line
+ * and sentence ends, only inside a section that is still too long. A passage never crosses a section. A <tag> wrapper
+ * around the whole entry is its frame, kept apart so what is sent can keep the tags balanced.
  *
  * A port of the benchmark's splitter (InternalProject/Vectfox/tools/lorebase-benchmark/lore_passages.py), which the
- * live tests measured; it cuts the same passages. Pure: no SillyTavern, no network.
+ * live tests measured; it cuts the same passages. Its line-and-sentence cutter and packer are shared with the
+ * embedding feature's search pieces (shared/text-windows.js). Pure: no SillyTavern, no network.
  */
+import { CJK_CHARACTER, LATIN_WORD, lineAndSentenceParts, packWindows } from '../../shared/text-windows.js';
 
-const CJK_CHARACTER = /[぀-ヿ㐀-䶿一-鿿가-힯豈-﫿]/gu;
-const LATIN_WORD = /[A-Za-z0-9]+/g;
 
 // Section heading kinds, strongest first. Date A Live's '---' / '[NAME]' / '---' triple is matched apart. An entry's
 // strongest kind present makes its sections; weaker kinds only open units inside them, so an all-capitals 'PHASE 3'
@@ -30,9 +30,10 @@ const TRIPLE_RULE = /^-{3,}$/;
 const TRIPLE_NAME = /^\[[^\]\n]{1,60}\]$/u;
 const WRAPPER_OPEN = /^<([^\s<>/]{1,40})>$/u;
 const WRAPPER_CLOSE = /^<\/([^\s<>/]{1,40})>$/u;
-const SENTENCE_END = /(?<=[.!?。！？…])\s+|(?<=[。！？])/u;
 const CATEGORY_PREFIX = /^\s*(\[[^\]]*\]|【[^】]*】|[^:：\s[]{1,12}[:：])\s*/u;
 
+// The section name of an entry's text before its first heading.
+export const INTRO_SECTION = '(intro)';
 // A section up to this multiple of the window stays one passage.
 const WHOLE_SECTION_SLACK = 1.5;
 // A line longer than this is cut at sentence ends before windows are packed.
@@ -40,7 +41,7 @@ const LONG_LINE_TOKENS = 120;
 export const DEFAULT_WINDOW_TOKENS = 300;
 
 /** Round half to even, as Python's round does, so sizes match the benchmark's. */
-function roundHalfEven(value) {
+export function roundHalfEven(value) {
     const floor = Math.floor(value);
     const fraction = value - floor;
     if (fraction > 0.5) return floor + 1;
@@ -121,7 +122,7 @@ function frameAndBody(lines) {
 /** [name, headingLineCount, lines] per section, at the entry's strongest heading kind; text before the first is the intro. */
 function sections(lines, kind) {
     const found = [];
-    let name = '(intro)';
+    let name = INTRO_SECTION;
     let headingLineCount = 0;
     let current = [];
     let index = 0;
@@ -169,38 +170,6 @@ function units(sectionLines, headingLineCount, extraStarts) {
     return grouped;
 }
 
-/** Lines, and the sentences of a line longer than LONG_LINE_TOKENS, as the smallest pieces a window may hold. */
-function atoms(text) {
-    const pieces = [];
-    for (const line of text.split('\n')) {
-        if (estimatedTokens(line) <= LONG_LINE_TOKENS) {
-            pieces.push(line);
-            continue;
-        }
-        pieces.push(...line.split(SENTENCE_END).filter(part => part));
-    }
-    return pieces;
-}
-
-/** Greedy packing of pieces into windows of about windowTokens, never splitting a piece. */
-function pack(pieces, windowTokens, joiner) {
-    const windows = [];
-    let current = [];
-    let currentTokens = 0;
-    for (const piece of pieces) {
-        const pieceTokens = estimatedTokens(piece);
-        if (current.length && currentTokens + pieceTokens > windowTokens) {
-            windows.push(current.join(joiner));
-            current = [];
-            currentTokens = 0;
-        }
-        current.push(piece);
-        currentTokens += pieceTokens;
-    }
-    if (current.length) windows.push(current.join(joiner));
-    return windows.filter(window => window.trim());
-}
-
 /**
  * Cuts an entry's content into passages.
  * @param {string} content - The entry's content
@@ -224,7 +193,8 @@ export function splitEntry(content, windowTokens = DEFAULT_WINDOW_TOKENS) {
             if (estimatedTokens(unitText) <= windowTokens) {
                 passages.push({ section: name, text: unitText });
             } else {
-                for (const window of pack(atoms(unitText), windowTokens, '\n')) passages.push({ section: name, text: window });
+                const parts = lineAndSentenceParts(unitText, LONG_LINE_TOKENS, estimatedTokens);
+                for (const window of packWindows(parts, windowTokens, '\n', estimatedTokens)) passages.push({ section: name, text: window });
             }
         }
     }
@@ -243,28 +213,20 @@ export function splitEntry(content, windowTokens = DEFAULT_WINDOW_TOKENS) {
 }
 
 /**
- * An entry's passages as LoreBase stores them: each with its place in the entry, its size, and the text it is
- * embedded as, prefixed with the entry's title and the section's name (plan §5.3).
+ * An entry's passages, the parts its review numbers: each with its section, its place in the entry and its size
+ * (plan §5.3).
  * @param {{uid: number, comment?: string, content?: string}} entry
  * @param {number} [windowTokens]
- * @returns {{title: string, frame: object|null, passages: Array<{section: string, text: string, passageIndex: number, passageCount: number, tokens: number, embeddingText: string}>}}
+ * @returns {{title: string, frame: object|null, passages: Array<{section: string, text: string, passageIndex: number, passageCount: number, tokens: number}>}}
  */
 export function entryPassages(entry, windowTokens = DEFAULT_WINDOW_TOKENS) {
     const { frame, passages } = splitEntry(entry.content, windowTokens);
-    const title = entryTitle(entry);
     return {
-        title,
+        title: entryTitle(entry),
         frame,
         passages: passages.map((passage, passageIndex) => {
             const text = passage.text.trim();
-            return {
-                section: passage.section,
-                text,
-                passageIndex,
-                passageCount: passages.length,
-                tokens: estimatedTokens(text),
-                embeddingText: passage.section === '(intro)' ? `${title} — ${text}` : `${title} / ${passage.section} — ${text}`,
-            };
+            return { section: passage.section, text, passageIndex, passageCount: passages.length, tokens: estimatedTokens(text) };
         }),
     };
 }

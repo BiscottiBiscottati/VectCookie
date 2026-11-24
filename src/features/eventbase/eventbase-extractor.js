@@ -11,7 +11,7 @@
  * ============================================================================
  */
 
-import { getOpenRouterApiKey, getCustomApiKey } from '../../shared/api-keys.js';
+import { getOpenRouterApiKey } from '../../shared/api-keys.js';
 import { CONNECTION_PROFILE_PROVIDER } from '../../shared/constants.js';
 import {
     CONNECTION_TEST_MAX_TOKENS,
@@ -32,6 +32,8 @@ import {
     truncateCodePoints,
 } from './eventbase-schema.js';
 import { cleanText } from '../text-cleaning/index.js';
+import { chineseLanguageNameFor, isCjkLanguageText, shouldGiveStoryLanguageNotice, STORY_LANGUAGE_NOTICE } from './prompts-i18n.js';
+import { readStoryLanguage } from './story-language.js';
 import { hashSourceMessage } from './eventbase-message-hash.js';
 import { log } from '../../sillytavern/log.js';
 
@@ -87,9 +89,11 @@ function _mapEventBaseError(e, windowIndex) {
         case 'connection': return new EventBaseFatalError(e.message, 'connection_failed');
         // 'http' | 'upstream_error' | 'empty' — per-window skip, not run-fatal. An
         // upstream rejection is only distinguishable from a per-window refusal
-        // (context length, content policy) by text ST does not forward, so we skip
-        // the window and let notifyUpstreamRejection tell the user what happened.
-        default: return new EventBaseExtractionError(e.message, windowIndex);
+        // (context length, content policy) by text ST does not forward, and a
+        // provider can reject a request and take the same one a moment later, so
+        // the run sends the window again; if it still fails, notifyUnfinishedWindows
+        // names the rejection's causes once the run is done.
+        default: return new EventBaseExtractionError(e.message, windowIndex, e.rejectionCauses);
     }
 }
 
@@ -139,20 +143,23 @@ function _detectScript(text) {
 }
 
 /**
- * Infers the human language for the LLM hint, even for mixed-script excerpts.
- * Returns null when the excerpt is clearly Latin-only.
+ * The fields an event writes in its prompt's language, which the language check reads. Keywords are left out: they
+ * hold names, which keep the script the chat writes them in.
  */
-function _inferLanguageHint(text) {
-    if (!text) return null;
+const STORY_LANGUAGE_FIELDS = ['summary', 'cause', 'result', 'concepts', 'open_threads'];
+
+/**
+ * The CJK language an excerpt is written in, for the LLM hint, even for a mixed-script excerpt; null when it is not
+ * written in one (isCjkLanguageText). Chinese takes the name its prompt calls for (chineseLanguageNameFor).
+ */
+function _inferLanguageHint(text, chineseName) {
+    if (!isCjkLanguageText(text)) return null;
     const hangul = (text.match(/[\uAC00-\uD7AF]/g) || []).length;
     const hiragana = (text.match(/[\u3040-\u309F\u30A0-\u30FF]/g) || []).length;
     const cjk = (text.match(/[\u3000-\u9FFF\uF900-\uFAFF]/g) || []).length + hangul + hiragana;
-    const latin = (text.match(/[a-zA-Z]/g) || []).length;
-    const total = cjk + latin;
-    if (total === 0 || cjk / total < 0.15) return null; // too little CJK to guess
     if (hangul > hiragana && hangul > cjk * 0.3) return '\uD55C\uAD6D\uC5B4 (Korean)';
     if (hiragana > 5) return '\u65E5\u672C\u8A9E (Japanese)';
-    return '\u4E2D\u6587 (Chinese)';
+    return chineseName;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +186,8 @@ async function _requestExtraction(prompt, settings, windowIndex, route) {
             temperature: settings.eventbase_temperature ?? DEFAULT_TEMPERATURE,
             timeoutMs: settings.eventbase_timeout_ms || DEFAULT_TIMEOUT_MS,
             contextLabel: 'EventBase',
+            // The run sends a rejected window again and names what still fails at its end.
+            shouldNotifyUpstreamRejection: false,
             ...resolveModelParameterStyle(settings),
         });
     } catch (e) {
@@ -186,6 +195,23 @@ async function _requestExtraction(prompt, settings, windowIndex, route) {
     }
     _throwIfReplyWasCut(reply, maxTokens, windowIndex);
     return reply.content;
+}
+
+/**
+ * The model set in Core → EventBase model, which both manual providers need.
+ * @param {object} settings
+ * @returns {string}
+ * @throws {EventBaseFatalError} When no model is set
+ */
+function _manualProviderModel(settings) {
+    const model = (settings.chat_model || '').trim();
+    if (!model) {
+        throw new EventBaseFatalError(
+            'EventBase: No model configured. Set the Model in Core → EventBase model.',
+            'missing_model',
+        );
+    }
+    return model;
 }
 
 async function _callOpenRouter(prompt, settings, windowIndex) {
@@ -199,14 +225,7 @@ async function _callOpenRouter(prompt, settings, windowIndex) {
         );
     }
 
-    const model = (settings.chat_model || '').trim();
-    if (!model) {
-        throw new EventBaseFatalError(
-            'EventBase: No model configured. Set the Model in Core → EventBase model.',
-            'missing_model',
-        );
-    }
-
+    const model = _manualProviderModel(settings);
     return _requestExtraction(prompt, settings, windowIndex, { model, provider: 'openrouter' });
 }
 
@@ -219,22 +238,9 @@ async function _callVLLM(prompt, settings, windowIndex) {
         );
     }
 
-    const model = (settings.chat_model || '').trim();
-    if (!model) {
-        throw new EventBaseFatalError(
-            'EventBase: No model configured. Set the Model in Core → EventBase model.',
-            'missing_model',
-        );
-    }
-
-    const apiKey = getCustomApiKey();
-    if (!apiKey) {
-        throw new EventBaseFatalError(
-            'EventBase: vLLM / Custom OpenAI-compatible API key not configured. Enter it in Core → EventBase model.',
-            'missing_api_key',
-        );
-    }
-
+    const model = _manualProviderModel(settings);
+    // No key check: the key is optional, as a server such as KoboldCpp needs none (resolveLlmConnection,
+    // src/features/llm-provider/llm-connection.js).
     return _requestExtraction(prompt, settings, windowIndex, { model, provider: 'vllm', vllmUrl: baseUrl });
 }
 
@@ -328,9 +334,11 @@ function _resolveWindowRealWorldDate(messages) {
  * @param {number} params.windowEnd   - 0-based end index (inclusive)
  * @param {object} params.settings    - VectFox settings
  * @param {number} [params.windowIndex] - Window index for error reporting
+ * @param {{promptMode: string, isCjkStory: boolean, chineseScript: 'traditional'|'simplified'|null}} [params.storyLanguage] - From readStoryLanguage on the run's
+ *        messages; a window on its own reads its own
  * @returns {Promise<object[]>} Array of full EventRecord objects (ingestion fields attached)
  */
-export async function extractEvents({ messages, windowStart, windowEnd, settings, windowIndex = 0 }) {
+export async function extractEvents({ messages, windowStart, windowEnd, settings, windowIndex = 0, storyLanguage = readStoryLanguage(messages, settings) }) {
     // Logging routes through src/sillytavern/log.js. Per-window flow → Verbose; per-item
     // parse detail → Trace; raw LLM/parser dumps → 'raw_llm' domain deep-dive.
 
@@ -368,19 +376,28 @@ export async function extractEvents({ messages, windowStart, windowEnd, settings
         return [];
     }
 
-    const maxCount = settings.eventbase_max_events_per_window || 5;
+    const maxCount = settings.eventbase_max_events_per_window || 3;
 
-    // Detect dominant script BEFORE building prompt so we can inject an explicit language hint
+    // The window's script is checked after the reply. The prompt follows the story's language, and in a CJK story a
+    // window written in CJK also names its language, which the others prompt would not write. A window of a story not
+    // written in CJK that holds CJK text is told so before the prompt and again after the excerpt
+    // (STORY_LANGUAGE_NOTICE).
     const excerptScript = _detectScript(excerptText);
-    const languageHint = _inferLanguageHint(excerptText);
+    const languageHint = storyLanguage.isCjkStory ? _inferLanguageHint(excerptText, chineseLanguageNameFor(storyLanguage)) : null;
+    const shouldGiveNotice = shouldGiveStoryLanguageNotice(storyLanguage, excerptText);
     let basePrompt = buildExtractionPrompt(
         excerptText,
         maxCount,
         settings.eventbase_custom_prompt || '',
-        settings.cjk_tokenizer_mode || 'intl',
+        storyLanguage.promptMode,
+        shouldGiveNotice ? STORY_LANGUAGE_NOTICE.afterExcerpt : '',
     );
     if (languageHint) {
         basePrompt = `DETECTED EXCERPT LANGUAGE: ${languageHint}. You MUST write ALL string fields in that language — no exceptions.\n\n${basePrompt}`;
+    }
+    if (shouldGiveNotice) {
+        basePrompt = `${STORY_LANGUAGE_NOTICE.beforePrompt}\n\n${basePrompt}`;
+        log.verbose(`[EventBase] Window ${windowIndex} ${msgRange}: holds Chinese, Japanese or Korean text in a story written in another language, so its prompt says so`);
     }
     const prompt = basePrompt;
     const provider = (settings.chat_provider || 'openrouter').toLowerCase();
@@ -464,13 +481,15 @@ export async function extractEvents({ messages, windowStart, windowEnd, settings
         // can tell "model omitted it" from "validator dropped it").
         log.trace(`[EventBase][scene_time] win=${windowIndex} item ${i}: raw.DateTime=${JSON.stringify(rawArray[i]?.DateTime)} raw.scene_time=${JSON.stringify(rawArray[i]?.scene_time)} | validated DateTime=${JSON.stringify(event.DateTime)} scene_time=${JSON.stringify(event.scene_time)} locations=${JSON.stringify(event.locations)}`);
 
-        // Post-parse language sanity check (warn only — retained for visibility,
-        // does not drop the event; retrieval quality may suffer if the summary
-        // language doesn't match the collection's tokenizer mode)
-        const summaryScript = _detectScript(event.summary);
-        if (excerptScript !== 'empty' && excerptScript !== 'mixed' && summaryScript !== 'empty' && summaryScript !== 'mixed') {
-            if (excerptScript !== summaryScript) {
-                log.warn(`[EventBase] Window ${windowIndex} ${msgRange}, item ${i}: language mismatch (excerpt=${excerptScript}, summary=${summaryScript}) — kept`);
+        // Post-parse language check, warn only: the event is kept, but a field written in another script than the
+        // excerpt reads poorly beside the rest and searches worse.
+        if (excerptScript !== 'empty' && excerptScript !== 'mixed') {
+            const fieldsInAnotherScript = STORY_LANGUAGE_FIELDS.filter((field) => {
+                const fieldScript = _detectScript(Array.isArray(event[field]) ? event[field].join(' ') : event[field]);
+                return fieldScript !== 'empty' && fieldScript !== 'mixed' && fieldScript !== excerptScript;
+            });
+            if (fieldsInAnotherScript.length) {
+                log.warn(`[EventBase] Window ${windowIndex} ${msgRange}, item ${i}: ${fieldsInAnotherScript.join(', ')} not in the excerpt's script (${excerptScript}) — kept`);
             }
         }
 

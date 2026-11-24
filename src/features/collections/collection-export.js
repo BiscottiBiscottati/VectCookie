@@ -20,12 +20,10 @@ import { getContext } from '../../sillytavern/chat.js';
 import { getRequestHeaders } from '../../sillytavern/requests.js';
 import { saveSettingsDebounced } from '../../sillytavern/settings.js';
 import { getStringHash } from '../../sillytavern/identifiers.js';
-import { insertVectorItems, purgeVectorIndex, encodeSparseVector, qdrantTarget, textWithKeywordSuffix } from '../vector-backend/index.js';
+import { copiedPointId, insertVectorItems, purgeVectorIndex, encodeSparseVector, qdrantTarget, textWithKeywordSuffix } from '../vector-backend/index.js';
 import {
     getCollectionMeta,
     setCollectionMeta,
-    getChunkMetadata,
-    saveChunkMetadata,
     clearCollectionLock,
     getEffectiveScope,
 } from './collection-metadata.js';
@@ -33,11 +31,13 @@ import {
     clearStateOfDeletedOrImportedCollection,
     registerCollection,
 } from './collection-loader.js';
+import { retiredContentKindOf } from './retired-content-collections-core.js';
 import { buildRegistryKey, normalizeBackendForId, remapCollectionIdToBackend, remapCollectionIdToHandle, sanitizeHandleId } from '../../shared/collection-ids.js';
 import { getModelFromSettings, refuseSillyTavernEmbeddingRoute } from '../embedding/index.js';
 import { progressTracker } from '../../shared/progress-tracker.js';
 import { log } from '../../sillytavern/log.js';
 import { formatBytes } from '../../shared/byte-size.js';
+import { exportFileHeader } from '../../shared/export-file-header.js';
 import { readErrorBody } from '../../shared/server-error-text.js';
 
 // ============================================================================
@@ -51,11 +51,20 @@ import { readErrorBody } from '../../shared/server-error-text.js';
 // CONSTANTS
 // ============================================================================
 
-/** Current export format version */
-const EXPORT_VERSION = '1.0.0';
-
 /** File extension for VectFox exports */
 export const EXPORT_FILE_EXTENSION = '.vectfox.json';
+
+/**
+ * What an export file holds: 'collection' for a collection export, of one collection or several (`type: 'multi'`),
+ * or the `type` a row's own file names, as a StoryArc links file and LoreBase's keys and vectors files do. The
+ * Database Browser's Import a collection takes a collection file, and a LoreBase file into the lorebook it names, and
+ * names the row that takes a StoryArc links file.
+ * @param {unknown} data - Parsed JSON
+ * @returns {string}
+ */
+export function exportFileKind(data) {
+    return typeof data?.type === 'string' && data.type !== 'multi' ? data.type : 'collection';
+}
 
 // Backend-name helpers (normalizeBackendForId, remapCollectionIdToBackend) come from
 // src/shared/collection-ids.js, the single source of truth — see Doc/collection_helper.md
@@ -164,17 +173,13 @@ export async function exportCollection(collectionId, settings, collectionInfo = 
     try {
         // Step 1: Get collection metadata
         progressTracker.updateProgress(1, 'Loading metadata...');
-        // Metadata (display name, triggers, conditions, …) lives under the
+        // Metadata (display name, StoryArc's lists, …) lives under the
         // registry-key form; callers pass the bare ID.
         const collectionMeta = getCollectionMeta(buildRegistryKey(collectionId, exportSettings));
 
         // Step 2: Get all chunks WITH vectors
         progressTracker.updateProgress(2, 'Loading chunks and vectors...');
-        const chunks = (await fetchPortableChunks(collectionId, exportSettings)).map(chunk => {
-            // Get per-chunk metadata from VectFox settings
-            const chunkMeta = getChunkMetadata(chunk.hash);
-            return chunkMeta ? { ...chunk, chunkMeta } : chunk;
-        });
+        const chunks = await fetchPortableChunks(collectionId, exportSettings);
 
         progressTracker.updateChunks(chunks.length);
 
@@ -187,10 +192,7 @@ export async function exportCollection(collectionId, settings, collectionInfo = 
         const chunksWithVectors = chunks.filter(c => c.vector).length;
 
         const exportData = {
-            // Header
-            version: EXPORT_VERSION,
-            exportDate: new Date().toISOString(),
-            generator: 'VectFox',
+            ...exportFileHeader(),
 
             // Embedding info - CRITICAL for import compatibility
             // NOTE: source + model must match for vectors to be compatible
@@ -219,30 +221,11 @@ export async function exportCollection(collectionId, settings, collectionInfo = 
 
             // Settings that affect behavior
             settings: {
-                // Activation
-                alwaysActive: collectionMeta.alwaysActive || false,
-                triggers: collectionMeta.triggers || [],
-                triggerMatchMode: collectionMeta.triggerMatchMode || 'any',
-                triggerCaseSensitive: collectionMeta.triggerCaseSensitive || false,
-                triggerScanDepth: collectionMeta.triggerScanDepth || 5,
-                conditions: collectionMeta.conditions || { enabled: false, logic: 'AND', rules: [] },
-
-                // Temporal decay
-                temporalDecay: collectionMeta.temporalDecay || {
-                    enabled: false,
-                    mode: 'exponential',
-                    halfLife: 50,
-                    linearRate: 0.01,
-                    minRelevance: 0.3,
-                },
-
-                // Prompt context
-                context: collectionMeta.context || '',
-                xmlTag: collectionMeta.xmlTag || '',
-
                 // StoryArc's merged entity names, and the names its Entity tab hides
                 storyEntityMerges: collectionMeta.storyEntityMerges || {},
                 storyEntityHiddenNames: collectionMeta.storyEntityHiddenNames || [],
+                // EventBase's pointer, how far it has read the chat into this collection, so its import carries on from there
+                ...(collectionMeta.eventbaseProgress ? { eventbaseProgress: collectionMeta.eventbaseProgress } : {}),
             },
 
             // Chunks (text + metadata + vectors)
@@ -342,6 +325,8 @@ export function validateImportData(data, currentSettings = {}) {
     for (const col of collections) {
         if (!col.collection?.id) {
             errors.push('Collection missing ID');
+        } else if (retiredContentKindOf(col.collection.id, col.collection.contentType)) {
+            errors.push(`${col.collection.id}: Vectorize Content no longer reads character cards, documents, web pages, wikis or YouTube, so VectFox does not import their collections.`);
         }
         if (!col.chunks || !Array.isArray(col.chunks)) {
             errors.push(`Collection ${col.collection?.id || 'unknown'} has no chunks array`);
@@ -414,7 +399,10 @@ export async function insertChunksWithVectors(collectionId, chunks, settings, on
     const BATCH_SIZE = 100;
     const target = backendName === 'qdrant' ? qdrantTarget(collectionId, settings) : { collectionId, filters: {} };
     const items = chunks.map(c => {
+        // A copy keeps its source's hash: in the shared collection it is stored under an ID of this collection.
+        const id = copiedPointId(collectionId, c.hash, settings);
         const item = {
+            ...(id ? { id } : {}),
             hash: c.hash,
             text: c.text,
             index: c.index,
@@ -506,8 +494,8 @@ export async function insertChunksWithVectors(collectionId, chunks, settings, on
 /**
  * Imports a collection from export data
  * Uses pre-computed vectors if available and settings match, otherwise re-embeds
- * Also clears the per-chat state kept for the collection, so its chat's next read reports what the
- * collection holds now.
+ * The collection's EventBase pointer goes first; a whole import writes the file's, so the collection carries on
+ * from it, and a file with none leaves none, so its next read reports what the collection holds now.
  *
  * @param {object} exportData - Single collection export data (or one item from multi-export)
  * @param {object} settings - VectFox settings
@@ -549,26 +537,11 @@ export async function importCollection(exportData, settings, options = {}) {
         throw new Error('No valid chunks to import (all chunks missing text)');
     }
 
-    // ─── H-3 mitigations ──────────────────────────────────────────────────
+    // ─── H-3 mitigation ───────────────────────────────────────────────────
     // Reject imports that carry payloads which would cause passive harm
-    // post-import (regex ReDoS at every chat scan; NaN/Infinity vectors that
-    // produce NaN similarity scores and silently break retrieval).
+    // post-import: NaN/Infinity vectors produce NaN similarity scores and
+    // silently break retrieval.
     //
-    // Length cap on triggers: catastrophic-backtracking patterns can be
-    // shorter than typical legitimate triggers — capping at 300 chars draws
-    // a generous line without restricting normal use. Shape heuristics
-    // intentionally NOT applied (e.g. `(.+)+` is a valid regex when the
-    // user actually means it).
-    const MAX_TRIGGER_LEN = 300;
-    const importedTriggers = exportData?.settings?.triggers;
-    if (Array.isArray(importedTriggers)) {
-        for (const t of importedTriggers) {
-            if (typeof t === 'string' && t.length > MAX_TRIGGER_LEN) {
-                throw new Error(`Trigger exceeds ${MAX_TRIGGER_LEN} char limit (got ${t.length}): "${t.slice(0, 80)}…"`);
-            }
-        }
-    }
-
     // Vector validation: any non-finite component (NaN, ±Infinity) would
     // pollute similarity calculations downstream. Reject the whole import
     // if any vector contains one — better than silently storing broken
@@ -619,9 +592,20 @@ export async function importCollection(exportData, settings, options = {}) {
 
     const errors = [];
 
+    // Metadata is keyed by the registry-key form ("backend:id") — same key
+    // used by setCollectionLock, cleanupOrphanedMeta, and the loader's
+    // ensureCollectionMeta. Writing at the bare ID would land in a different
+    // bucket that the orphan-cleanup pass would immediately remove.
+    const registryKey = buildRegistryKey(collectionId, settings);
+
     try {
         // Step 1: Handle existing collection
         progressTracker.updateProgress(1, 'Preparing collection...');
+
+        // The record a replaced collection left keeps its fields through setCollectionMeta's merge, but its
+        // EventBase pointer describes events this import replaces: it goes now, and only a whole import writes the
+        // file's.
+        if (getCollectionMeta(registryKey).eventbaseProgress) setCollectionMeta(registryKey, { eventbaseProgress: undefined });
 
         if (options.overwrite) {
             try {
@@ -666,7 +650,13 @@ export async function importCollection(exportData, settings, options = {}) {
             // Need to embed (slow)
             progressTracker.updateProgress(3, `Embedding ${preparedChunks.length} chunks...`);
             try {
-                await insertVectorItems(collectionId, preparedChunks, settings, null, abortController.signal);
+                // Each keeps the hash it was exported with: in the shared collection it is stored under an ID of this
+                // collection, as insertChunksWithVectors stores a copy.
+                const chunksWithIds = preparedChunks.map(chunk => {
+                    const id = copiedPointId(collectionId, chunk.hash, settings);
+                    return id ? { ...chunk, id } : chunk;
+                });
+                await insertVectorItems(collectionId, chunksWithIds, settings, null, abortController.signal);
                 log.lifecycle(`VectFox Import: Embedded and inserted ${preparedChunks.length} chunks`);
             } catch (error) {
                 if (error?.name === 'AbortError') throw error;
@@ -676,12 +666,6 @@ export async function importCollection(exportData, settings, options = {}) {
 
         // Step 4: Save metadata
         progressTracker.updateProgress(4, 'Saving metadata...');
-
-        // Metadata is keyed by the registry-key form ("backend:id") — same key
-        // used by setCollectionLock, cleanupOrphanedMeta, and the loader's
-        // ensureCollectionMeta. Writing at the bare ID would land in a different
-        // bucket that the orphan-cleanup pass would immediately remove.
-        const registryKey = buildRegistryKey(collectionId, settings);
 
         // Import is treated as a conversion → activation state must start fresh.
         // Clear any chat locks from a prior collection with the same ID first so the
@@ -721,29 +705,17 @@ export async function importCollection(exportData, settings, options = {}) {
         // Merge with exported settings
         if (exportData.settings) {
             Object.assign(importedMeta, {
-                alwaysActive: exportData.settings.alwaysActive,
-                triggers: exportData.settings.triggers,
-                triggerMatchMode: exportData.settings.triggerMatchMode,
-                triggerCaseSensitive: exportData.settings.triggerCaseSensitive,
-                triggerScanDepth: exportData.settings.triggerScanDepth,
-                conditions: exportData.settings.conditions,
-                temporalDecay: exportData.settings.temporalDecay,
-                context: exportData.settings.context || '',
-                xmlTag: exportData.settings.xmlTag || '',
                 storyEntityMerges: exportData.settings.storyEntityMerges || {},
                 storyEntityHiddenNames: exportData.settings.storyEntityHiddenNames || [],
             });
+            // Every chunk is in, so the collection carries on from the file's pointer. A file made before
+            // EventBase's pointer was exported has none: the collection's first run then carries on from the
+            // furthest window stored.
+            const eventbaseProgress = eventBaseProgressOfFile(exportData.settings.eventbaseProgress);
+            if (eventbaseProgress) importedMeta.eventbaseProgress = eventbaseProgress;
         }
 
         setCollectionMeta(registryKey, importedMeta);
-
-        // Per-chunk metadata
-        for (const chunk of validChunks) {
-            if (chunk.chunkMeta) {
-                const newHash = getStringHash(chunk.text);
-                saveChunkMetadata(newHash, chunk.chunkMeta);
-            }
-        }
 
         // Register collection with backend prefix so parseRegistryKey resolves the right backend
         registerCollection(registryKey);
@@ -780,8 +752,8 @@ export async function importCollection(exportData, settings, options = {}) {
         }
         throw error;
     } finally {
-        // Whatever the outcome, the collection no longer holds what its chat's records describe:
-        // overwrite purged it, and a failed or stopped import leaves it empty or partial.
+        // Whatever the outcome, what is held in memory of the collection no longer matches it: its record
+        // holds the file's pointer after a whole import, and none after a failed or stopped one.
         clearStateOfDeletedOrImportedCollection(collectionId);
         progressTracker.clearCancelHandler();
     }
@@ -791,6 +763,28 @@ export async function importCollection(exportData, settings, options = {}) {
 // HELPERS
 // ============================================================================
 
+const isWindowFingerprintList = value => Array.isArray(value) && value.every(fingerprint => typeof fingerprint === 'string');
+const isMessageCount = value => Number.isInteger(value) && value >= 0;
+
+/**
+ * The parts of an EventBase pointer a file carries that have their shape (the parts of `eventbaseProgress` in
+ * eventbase-store.js): message counts for the tip, the auto-sync marker and the window size, and lists of window
+ * fingerprints for the windows read and those that failed. Anything else in the file is left out.
+ *
+ * @param {unknown} value - `settings.eventbaseProgress` of an export file
+ * @returns {object|undefined} The pointer to write, or undefined when the file has none
+ */
+function eventBaseProgressOfFile(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const progress = {};
+    if (isMessageCount(value.vectorizationTip)) progress.vectorizationTip = value.vectorizationTip;
+    if (isWindowFingerprintList(value.extractedWindows)) progress.extractedWindows = [...value.extractedWindows];
+    if (isWindowFingerprintList(value.unfinishedWindows) && value.unfinishedWindows.length) progress.unfinishedWindows = [...value.unfinishedWindows];
+    if (isMessageCount(value.autoSyncStartMarker)) progress.autoSyncStartMarker = value.autoSyncStartMarker;
+    if (Number.isInteger(value.windowSize) && value.windowSize > 0) progress.windowSize = value.windowSize;
+    return Object.keys(progress).length ? progress : undefined;
+}
+
 /**
  * Detects content type from collection ID pattern
  * @param {string} collectionId
@@ -799,15 +793,6 @@ export async function importCollection(exportData, settings, options = {}) {
 function detectContentType(collectionId) {
     if (collectionId.includes('_chat_') || collectionId.includes('_eventbase_')) {
         return 'chat';
-    }
-    if (collectionId.includes('_lorebook_')) {
-        return 'lorebook';
-    }
-    if (collectionId.includes('_document_')) {
-        return 'document';
-    }
-    if (collectionId.includes('_character_')) {
-        return 'character';
     }
     return 'unknown';
 }

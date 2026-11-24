@@ -5,8 +5,16 @@
  * Browses and manages every vector collection, in three pages: Collections (the
  * filters, the list with each collection's actions, and bulk actions on the
  * ticked ones), Search (a search across collections with a keyword filter) and
- * Size Inspector (size-inspector.js). The browser opens in a near-fullscreen dialog of its
- * own (sillytavern/popup.js openPanelPopup), drawn fresh on each open from
+ * Size Inspector (size-inspector.js). The Collections list also holds each
+ * lorebook's LoreBase rows, its keys and its vectors, each exported, imported and
+ * deleted through LoreBase's storage module (features/lorebase), a vectors row's
+ * chunks read only in the Chunk Visualizer, each with Edit entry, LoreBase's
+ * entry editor, on a row of the list, what LoreBase
+ * cannot use here behind Show leftovers; Import a collection takes a collection
+ * file, and a LoreBase keys or vectors file into the lorebook it names, and names
+ * the row whose Import takes a StoryArc links file. The browser opens in a
+ * near-fullscreen dialog of its own
+ * (sillytavern/popup.js openPanelPopup), drawn fresh on each open from
  * database-browser-markup.js, and its handlers are delegated on its root. Rename,
  * Switch model and Collection Settings, which opens Manage locks, are dialogs of
  * their own over it (collection-dialogs.js), and so is the Chunk Visualizer that
@@ -23,13 +31,11 @@ import {
   sanitizeHandleId,
   getCollectionListing,
   cleanupOrphanedMeta,
-  getCollectionActivationSummary,
   setCollectionEnabled,
-  isCollectionLockedToChat,
   getCollectionLockCount,
-  isCollectionLockedToCharacter,
   getCollectionCharacterLockCount,
   exportCollection,
+  exportFileKind,
   importCollection,
   downloadExport,
   readImportFile,
@@ -46,29 +52,59 @@ import { checkPluginAvailable } from "../../shared/similharity-plugin.js";
 import { confirmPopup, openPanelPopup } from "../../sillytavern/popup.js";
 import { pickFiles } from "../../shared/pick-files.js";
 import { bindGeneBehaviours, scrollPageToTop, setCollapsed } from "../../shared/gui-dna/gene-behaviours.js";
-import { COLLECTION_PREFIXES } from "../../shared/collection-ids.js";
+import { COLLECTION_PREFIXES, vectorBackendName } from "../../shared/collection-ids.js";
 import {
   STORY_LINKS_FILE_TYPE,
   buildCollectionLinksFile,
+  compactCollection,
   deleteStoryLinks,
+  describeCompaction,
   describeStoryLinkCoverage,
   describeStoryLinksImport,
+  planCollectionCompaction,
   planStoryLinksDelete,
   planStoryLinksImport,
   readCollectionLinkCoverage,
   writeImportedStoryLinks,
 } from "../eventbase/index.js";
 import {
+  KEYS,
+  LOREBASE_KEYS_FILE_TYPE,
+  LOREBASE_VECTORS_FILE_TYPE,
+  VECTORS,
+  currentEmbeddingModel,
+  deleteStoredRow,
+  describeDelete,
+  describeExport,
+  describeImport,
+  describeImported,
+  describeRemovedLoreBook,
+  editLoreBookEntry,
+  exportStored,
+  loreBaseImportRow,
+  loreBaseStorageRows,
+  modelWords,
+  nothingToImportText,
+  planImport,
+  removeLoreBookAfterConfirm,
+  tenantChunkSource,
+  writeImport,
+} from "../lorebase/index.js";
+import {
   qdrantTarget,
   queryMultipleCollections,
 } from "../vector-backend/index.js";
 import { getRequestHeaders } from "../../sillytavern/requests.js";
-import { getCurrentChatId, getContext } from "../../sillytavern/chat.js";
+import { getContext } from "../../sillytavern/chat.js";
 import { log } from "../../sillytavern/log.js";
 import { openChunkVisualizer } from "./chunk-visualizer.js";
+import { mergeSearchPieceResults } from "./search-results-core.js";
+import { searchPieces } from "../embedding/index.js";
 import { bindSizeInspector } from "./size-inspector.js";
 import { editCollectionSettings, renameCollection, switchCollectionModel } from "./collection-dialogs.js";
+import { activeLockLine } from "./collection-settings-core.js";
 import { formatBytes, utf8ByteLength } from "../../shared/byte-size.js";
+import { counted } from "../../shared/counted.js";
 import {
   BROWSER_PAGES,
   browserPageId,
@@ -79,6 +115,9 @@ import {
   keywordScanFailedMarkup,
   keywordScanRunningMarkup,
   keywordTagsMarkup,
+  loreBaseBookMarkup,
+  loreBaseLeftoversMarkup,
+  loreBaseProblemMarkup,
   noCollectionsMarkup,
   nothingToSearchMarkup,
   searchFailedMarkup,
@@ -90,7 +129,7 @@ import {
 
 const DEFAULT_FILTERS = Object.freeze({
   scope: "all", // 'all', 'character', 'chat': collections locked to at least one of these
-  collectionType: "all", // 'all', 'chat', 'lorebook', 'character', 'document', 'web'
+  collectionType: "all", // 'all', 'chat'
   status: "all", // 'all', 'enabled', 'disabled'
   searchQuery: "",
   onlyActiveForChat: false, // only collections active for the current chat (the Active here pill)
@@ -113,7 +152,27 @@ const browserState = {
   storyLinkCoverage: new Map(),
   // Each read's count in words, once it is in, so a redraw shows it at once
   storyLinkDescriptions: new Map(),
+  // LoreBase's rows, each book's keys and vectors (loreBaseStorageRows), as last read, and why the last read failed
+  loreBaseRows: [],
+  loreBaseProblem: null,
+  // Whether the LoreBase leftovers are shown, and the lorebooks whose ⚠ words are open, by their group's key
+  isShowingLeftovers: false,
+  openLoreBaseFlags: new Set(),
 };
+
+const LOREBASE_TOAST = "VectFox LoreBase";
+const kindWords = (kind) => (kind === KEYS ? "keys" : "vectors");
+
+// Import a collection's word for each file a row's own Import takes instead.
+const ROW_FILE_PLACES = Object.freeze({
+  [STORY_LINKS_FILE_TYPE]: "This is a StoryArc links file. Use Import links on its collection's row in this list.",
+});
+
+// The kind of each LoreBase file Import a collection takes into the lorebook it names.
+const LOREBASE_FILE_KINDS = Object.freeze({
+  [LOREBASE_KEYS_FILE_TYPE]: KEYS,
+  [LOREBASE_VECTORS_FILE_TYPE]: VECTORS,
+});
 
 const collectionKey = (collection) => collection.registryKey || collection.id;
 
@@ -170,6 +229,10 @@ function resetBrowserState() {
   browserState.availableKeywords = null;
   browserState.storyLinkCoverage.clear();
   browserState.storyLinkDescriptions.clear();
+  browserState.loreBaseRows = [];
+  browserState.loreBaseProblem = null;
+  browserState.isShowingLeftovers = false;
+  browserState.openLoreBaseFlags.clear();
 }
 
 /** GUI-DNA draws a shell this wide or narrower in its phone layout (gui-dna.css, `@container vfx-shell`). */
@@ -230,6 +293,15 @@ function bindBrowserEvents(root) {
   $root.on("click", "[data-collection-action]", function () {
     void runCollectionAction(this.dataset.collectionAction, this.dataset.collectionKey);
   });
+  $root.on("click", "[data-lorebase-action]", function () {
+    void runLoreBaseAction(this.dataset.lorebaseAction, this.dataset.lorebaseRow);
+  });
+  $root.on("click", "[data-lorebase-remove]", function () {
+    void removeLoreBookOfRow(this.dataset.lorebaseRemove);
+  });
+  $root.on("click", "[data-lorebase-flag]", function () {
+    toggleLoreBaseFlag(this.dataset.lorebaseFlag);
+  });
 
   // Collections page: the filters, then the ticks
   const filterOn = (selector, eventName, update) => $root.on(eventName, selector, function () {
@@ -248,7 +320,6 @@ function bindBrowserEvents(root) {
     tickAllShown(this.checked);
   });
   $root.on("click", "#vectfox_reset_registry", () => void resyncRegistry());
-  $root.on("click", "#vectfox_browser_clear_reformat_originals", () => void clearReformatOriginals());
 
   // Search page
   $root.on("click", "#vectfox_search_btn", () => void performSearch());
@@ -272,6 +343,7 @@ async function runBrowserAction(action, button) {
   switch (action) {
     case "refresh-scan": return refreshScan(button);
     case "import": return importFromPicker();
+    case "toggle-leftovers": return toggleLeftovers();
     case "bulk-enable": return setTickedEnabled(true);
     case "bulk-disable": return setTickedEnabled(false);
     case "bulk-export": return exportTicked();
@@ -315,36 +387,6 @@ async function resyncRegistry() {
   }
 }
 
-/**
- * Clears the source text Auto-Reformat keeps for review (reformat-store.js), after asking. Only that copy goes: the
- * accepted chunks and their run stay, so nothing vectorized changes.
- */
-async function clearReformatOriginals() {
-  try {
-    const { listReformatCacheEntries, clearAllReformatOriginals } = await import("../chunkbase/index.js");
-    const entries = listReformatCacheEntries();
-    const totalBytes = entries.reduce((sum, entry) => sum + entry.originalTextBytes, 0);
-    if (totalBytes === 0) {
-      toastr.info("No Auto-Reformat originals are kept, so there is nothing to clear.", "VectFox");
-      return;
-    }
-
-    const isConfirmed = await confirmPopup([
-      { text: "Clear the Auto-Reformat originals?" },
-      { text: "Kept now:", name: `${entries.length} sources, about ${formatBytes(totalBytes)}` },
-      { text: "Lost: each source's text as it was before Auto-Reformat. The reformatted chunks stay, so nothing vectorized changes." },
-      { text: "Clear deletes them. Cancel keeps them." },
-    ], { okButton: "Clear", isDestructive: true });
-    if (!isConfirmed) return;
-
-    const cleared = clearAllReformatOriginals();
-    toastr.success(`Cleared the original text of ${cleared} Auto-Reformat source${cleared === 1 ? "" : "s"}.`, "VectFox");
-  } catch (err) {
-    log.error("VectFox: Failed to clear Auto-Reformat originals", err);
-    toastr.error(`Failed to clear Auto-Reformat originals: ${err.message}`, "VectFox");
-  }
-}
-
 /** Picks a collection file and imports it. */
 async function importFromPicker() {
   const [file] = await pickFiles({ accept: ".json,.vectfox.json,.png,image/png" });
@@ -376,8 +418,13 @@ async function importCollectionFile(file) {
       data = await readImportFile(file);
     }
 
-    if (data?.type === STORY_LINKS_FILE_TYPE) {
-      toastr.error("This is a StoryArc links file. Use Import links on its collection's row in this list.", "VectFox Import");
+    const kind = exportFileKind(data);
+    if (LOREBASE_FILE_KINDS[kind]) {
+      await importLoreBaseFileByBook(data, LOREBASE_FILE_KINDS[kind]);
+      return;
+    }
+    if (kind !== "collection") {
+      toastr.error(ROW_FILE_PLACES[kind] ?? `This is not a collection file: it holds "${kind}".`, "VectFox Import");
       return;
     }
 
@@ -483,8 +530,9 @@ const _PERSONA_SCOPED_PREFIXES = [
 
 /**
  * Hides the VectFox collections the current persona does not own. Every VectFox
- * content type (eventbase, archived events, lorebook, character, document) is
- * persona-scoped; a collection without a VectFox prefix is always kept.
+ * prefix is persona-scoped: events, archived events and lorebooks, and the
+ * character and document ones for a collection start-up could not delete. A
+ * collection without a VectFox prefix is always kept.
  *
  * Ownership comes from getCollectionListing: the `creatorHandle` stamped onto
  * collection metadata at registerCollection time (exact equality, collision-proof
@@ -543,6 +591,7 @@ async function refreshCollections(withScan = false) {
     browserState.storyLinkDescriptions.clear();
     const allCollections = await loadAllCollections(browserState.settings, withScan);
     browserState.collections = _filterCollectionsByCurrentPersona(allCollections);
+    await loadLoreBaseRows();
 
     if (allCollections.length !== browserState.collections.length) {
       const hidden = allCollections.length - browserState.collections.length;
@@ -573,13 +622,10 @@ async function refreshCollections(withScan = false) {
   }
 }
 
-// The collection types each Type filter keeps.
+// The collection types each Type filter keeps. LoreBase keeps no collection: only LoreBase's rows (shownLoreBaseBooks).
 const TYPE_FILTER_TYPES = Object.freeze({
   chat: ["chat"],
-  lorebook: ["lorebook"],
-  character: ["character", "persona"],
-  document: ["file", "doc", "paste", "select", "current"],
-  web: ["url", "wiki", "youtube"],
+  lorebase: [],
 });
 
 /**
@@ -607,8 +653,152 @@ function passesFilters(collection, isActiveById) {
 }
 
 /**
- * Renders the collections list from the current filters, keeps only the shown collections ticked, and fills in the
- * StoryArc links rows.
+ * Reads LoreBase's rows, each lorebook's keys and vectors as Similharity lists them. A failed read leaves a notice where
+ * the rows go, and the collections show as ever.
+ * @returns {Promise<void>}
+ */
+async function loadLoreBaseRows() {
+  if (!browserState.pluginAvailable) return;
+  try {
+    browserState.loreBaseRows = await loreBaseStorageRows(browserState.settings);
+    browserState.loreBaseProblem = null;
+  } catch (error) {
+    log.warn("VectFox Database Browser: LoreBase's keys and vectors could not be read:", error);
+    browserState.loreBaseRows = [];
+    browserState.loreBaseProblem = String(error?.message || error);
+  }
+}
+
+/** Reads LoreBase's rows again after one changed, and draws the list. The WorldInfo page counts again as it opens. */
+async function refreshLoreBaseRows() {
+  await loadLoreBaseRows();
+  renderCollections();
+}
+
+/**
+ * Whether the Collections page's filters show LoreBase's rows: under All types and LoreBase, with no filter on pause,
+ * locks or this chat, none of which they have.
+ * @returns {boolean}
+ */
+function isLoreBaseTypeShown() {
+  const { scope, collectionType, status, onlyActiveForChat } = browserState.filters;
+  return ["all", "lorebase"].includes(collectionType) && scope === "all" && status === "all" && !onlyActiveForChat;
+}
+
+// A lorebook's rows share a group: the list's, or the leftovers', of one book, or of one tenant naming none.
+const loreBaseGroupKey = (row) => `${row.isLeftover ? "leftovers" : "list"}|${row.book ?? row.tenant}`;
+
+/**
+ * The lorebooks whose LoreBase rows the filters keep, each its rows in order: the list's, and the leftovers'. Name or
+ * ID keeps a book whose name, or one of whose tenants' IDs, holds the words.
+ * @returns {{listed: object[][], leftovers: object[][]}}
+ */
+function shownLoreBaseBooks() {
+  if (!isLoreBaseTypeShown()) return { listed: [], leftovers: [] };
+  const books = [];
+  for (const row of browserState.loreBaseRows) {
+    const last = books.at(-1);
+    if (last && loreBaseGroupKey(last[0]) === loreBaseGroupKey(row)) last.push(row);
+    else books.push([row]);
+  }
+  const { searchQuery } = browserState.filters;
+  const holds = (value) => String(value ?? "").toLowerCase().includes(searchQuery);
+  const kept = searchQuery ? books.filter((rows) => rows.some((row) => holds(row.book) || holds(row.tenant))) : books;
+  return { listed: kept.filter(([first]) => !first.isLeftover), leftovers: kept.filter(([first]) => first.isLeftover) };
+}
+
+// An embedding model in words, as a row names the one that made its vectors; "" for a row holding none.
+const embeddingWords = (row) => (row?.pointCount ? modelWords(row.embeddingSource, row.embeddingModel) : "");
+
+/**
+ * What the ⚠ beside a lorebook with no selected entry LoreBase decides says, on hover and opened under its name.
+ * @param {boolean} hasVectors
+ * @returns {string}
+ */
+function noSelectionWords(hasVectors) {
+  return hasVectors
+    ? "No selected entry LoreBase decides: it leaves this lorebook out, and its vectors are erased on the next write. Select its entries on VectFox's WorldInfo page to keep them."
+    : "No selected entry LoreBase decides: it leaves this lorebook out. Select its entries on VectFox's WorldInfo page.";
+}
+
+/**
+ * A lorebook's LoreBase rows as plain values, for loreBaseBookMarkup (§3.2 of vectfox-multi-collection-per-chat.md):
+ * the lorebook's row, with its selected entries in the list, where its vectors are stored and their ID, its ⚠ while
+ * none of its entries is selected, and Remove from LoreBase on a lorebook of the list, a leftover's rows being deleted
+ * one at a time (D13); then each of its rows in one line. Export and Delete need something stored, and so does a
+ * vectors row's View chunks; Import needs a row of the list and, for vectors, the collection LoreBase reads now, which
+ * an import writes to.
+ * @param {object[]} rows - One book's rows, from loreBaseStorageRows
+ * @returns {object}
+ */
+function loreBaseBookView(rows) {
+  const [first] = rows;
+  const key = loreBaseGroupKey(first);
+  const tenantRows = rows.filter((row) => row.kind === VECTORS && row.tenant);
+  const shownEmbedding = embeddingWords(tenantRows.find((row) => row.pointCount));
+  return {
+    key,
+    name: `📖 Lorebook: ${first.book ?? "none named"}`,
+    bookName: first.book,
+    canRemove: !first.isLeftover,
+    isInSillyTavern: first.isInSillyTavern,
+    selectedCount: first.isLeftover ? null : first.selectedCount,
+    selectionCount: first.isLeftover ? null : first.selectionCount,
+    storedIn: shownEmbedding ? `Qdrant, embedded by ${shownEmbedding}` : "Qdrant",
+    id: tenantRows[0]?.tenant ?? "",
+    flag: !first.isLeftover && first.selectedCount === 0 ? noSelectionWords(tenantRows.some((row) => row.pointCount)) : "",
+    isFlagOpen: browserState.openLoreBaseFlags.has(key),
+    rows: rows.map((row) => {
+      const count = row.kind === KEYS ? row.entryCount : row.pointCount;
+      return {
+        key: row.key,
+        kind: row.kind,
+        line: row.kind === KEYS ? counted(count, "entry with keys", "entries with keys") : vectorsLine(row, shownEmbedding),
+        isElsewhere: row.kind === VECTORS && !row.isHere,
+        canViewChunks: row.kind === VECTORS && count > 0,
+        canExport: count > 0,
+        canImport: !row.isLeftover && (row.kind === KEYS || row.isHere),
+        canDelete: count > 0,
+      };
+    }),
+  };
+}
+
+/**
+ * A Vectors row's line: its parts, the collection when LoreBase does not read it now, and the embedding model when it
+ * is not the one its lorebook's row names.
+ * @param {object} row
+ * @param {string} shownEmbedding - The model the lorebook's row names
+ * @returns {string}
+ */
+function vectorsLine(row, shownEmbedding) {
+  const embedding = embeddingWords(row);
+  return [
+    counted(row.pointCount, "part"),
+    row.isHere ? "" : `in ${row.collection}, which LoreBase does not read now`,
+    embedding && embedding !== shownEmbedding ? `embedded by ${embedding}` : "",
+  ].filter(Boolean).join(", ");
+}
+
+/** Shows the LoreBase leftovers, or hides them. */
+function toggleLeftovers() {
+  browserState.isShowingLeftovers = !browserState.isShowingLeftovers;
+  renderCollections();
+}
+
+/**
+ * Opens a lorebook's ⚠ words under its name, or closes them.
+ * @param {string} key The lorebook's group key
+ */
+function toggleLoreBaseFlag(key) {
+  if (browserState.openLoreBaseFlags.has(key)) browserState.openLoreBaseFlags.delete(key);
+  else browserState.openLoreBaseFlags.add(key);
+  renderCollections();
+}
+
+/**
+ * Renders the collections list from the current filters, keeps only the shown collections ticked, fills in the
+ * StoryArc links rows, and draws LoreBase's rows after the collections, then Show leftovers when there are some.
  */
 function renderCollections() {
   // One read of the lock state for the filter pass and every row: getCollectionListing computes each entry's
@@ -624,19 +814,29 @@ function renderCollections() {
   for (const key of [...browserState.bulkSelected]) {
     if (!browserState.shownKeys.includes(key)) browserState.bulkSelected.delete(key);
   }
-  updateStats(shown.length, shown.reduce((sum, c) => sum + c.chunkCount, 0));
+  const { listed: loreBaseBooks, leftovers } = shownLoreBaseBooks();
+  const shownLeftovers = browserState.isShowingLeftovers ? leftovers : [];
+  const loreBaseProblem = isLoreBaseTypeShown() ? browserState.loreBaseProblem : null;
+  updateStats(shown.length, shown.reduce((sum, c) => sum + c.chunkCount, 0), loreBaseBooks.length + shownLeftovers.length);
   paintTicks();
 
   const container = $("#vectfox_collections_list");
-  if (shown.length === 0) {
+  if (shown.length === 0 && loreBaseBooks.length === 0 && leftovers.length === 0 && !loreBaseProblem) {
     container.html(noCollectionsMarkup());
     return;
   }
-  container.html(shown.map((collection) => collectionEntryMarkup(collectionRowView(collection, isActiveById))).join(""));
-  fillStoryLinkRows().catch((err) => log.warn("VectFox: Could not fill in the StoryArc links rows:", err));
+  container.html([
+    ...shown.map((collection) => collectionEntryMarkup(collectionRowView(collection, isActiveById))),
+    ...loreBaseBooks.map((rows) => loreBaseBookMarkup(loreBaseBookView(rows))),
+    leftovers.length ? loreBaseLeftoversMarkup({
+      lorebookCount: leftovers.length,
+      isOpen: browserState.isShowingLeftovers,
+      booksMarkup: shownLeftovers.map((rows) => loreBaseBookMarkup(loreBaseBookView(rows))).join(""),
+    }) : "",
+    loreBaseProblem ? loreBaseProblemMarkup(loreBaseProblem) : "",
+  ].join(""));
+  if (shown.length) fillStoryLinkRows().catch((err) => log.warn("VectFox: Could not fill in the StoryArc links rows:", err));
 }
-
-const BACKEND_NAMES = Object.freeze({ standard: "Standard", qdrant: "Qdrant" });
 
 /**
  * A collection's row as plain values, for collectionEntryMarkup.
@@ -656,23 +856,32 @@ function collectionRowView(collection, isActiveById) {
     isEnabled: Boolean(collection.enabled),
     isSelected: browserState.bulkSelected.has(key),
     scope: collection.scope,
-    backend: BACKEND_NAMES[collection.backend] || collection.backend || "",
-    source: collection.source && collection.source !== "unknown" ? collection.source : "",
+    backend: vectorBackendName(collection.backend),
+    embedding: embeddingOfCollection(collection),
     model: hasMultipleModels ? (collection.model || "(default)") : "",
     hasMultipleModels,
     activeHereLine: activeHereLine(collection, isActiveById),
-    // The registry-key (backend:id) metadata the Collection Settings dialog writes
-    activationMode: getCollectionActivationSummary(key).mode,
+    canCompact: canCompactCollection(collection),
     hasStoryLinks: hasStoryLinksRow(collection),
     storyLinksDescription: browserState.storyLinkDescriptions.get(key) ?? "",
   };
 }
 
 /**
- * Which lock makes a collection active in the current chat, in words, or "" when none does. It names the lock that
- * actually matched, not the one its scope implies: shouldCollectionActivate() takes a chat lock OR a character lock
- * whatever the scope, so a chat-scoped collection can be active here through a character lock. Locks elsewhere show in
- * Collection Settings.
+ * The embedding model that made a collection's chunks, as its Stored in line names it: the source, and the model's
+ * name where the scan knows it; "" when the source is unknown.
+ * @param {object} collection
+ * @returns {string}
+ */
+function embeddingOfCollection(collection) {
+  const source = collection.source && collection.source !== "unknown" ? collection.source : "";
+  const modelName = collection.models?.find((model) => model.path === collection.model)?.name || "";
+  return source && modelName ? `${source}/${modelName}` : source;
+}
+
+/**
+ * Which lock makes a collection active in the current chat, in words, or "" when none does: the kind its scope reads,
+ * as isCollectionActiveForContext() reads only that one (activeLockLine). Locks elsewhere show in Collection Settings.
  * @param {object} collection
  * @param {Map<string, boolean>} isActiveById
  * @returns {string}
@@ -681,20 +890,8 @@ function activeHereLine(collection, isActiveById) {
   const isActive = isActiveById.get(collection.registryKey || `${collection.backend}:${collection.id}`) === true
     || isActiveById.get(collection.id) === true;
   if (!isActive) return "";
-
   // Registry-key form, so two collections sharing a bare ID on different backends keep their own locks.
-  const lockKey = collectionKey(collection);
-  const currentChatId = getCurrentChatId();
-  const isViaChat = Boolean(currentChatId && isCollectionLockedToChat(lockKey, currentChatId));
-  const isViaCharacter = Boolean(isCollectionLockedToCharacter(lockKey, getContext()?.characterId));
-  let line;
-  if (isViaChat && isViaCharacter) line = "Locked to this chat and to this character";
-  else if (isViaCharacter) line = "Locked to this character, so it is active in every chat with them";
-  else line = "Locked to this chat";
-
-  const otherChatCount = getCollectionLockCount(lockKey) - (isViaChat ? 1 : 0);
-  if (otherChatCount > 0) line += `, and to ${otherChatCount} other chat${otherChatCount === 1 ? "" : "s"}`;
-  return line;
+  return activeLockLine({ isCharacterScope: collection.scope !== "chat", chatLockCount: getCollectionLockCount(collectionKey(collection)) });
 }
 
 /**
@@ -749,6 +946,19 @@ function hasStoryLinksRow(collection) {
     && settings.vector_backend === "qdrant"
     && collection.backend === "qdrant"
     && String(collection.id).startsWith(COLLECTION_PREFIXES.VECTFOX_EVENTBASE);
+}
+
+/**
+ * Whether Compact collection can clean a collection: one of EventBase events, from a chat or a chat file, in Qdrant,
+ * the backend VectFox uses now, which lists each event with its window.
+ * @param {object} collection Collection data
+ * @returns {boolean}
+ */
+function canCompactCollection(collection) {
+  const id = String(collection.id);
+  return browserState.settings?.vector_backend === "qdrant"
+    && collection.backend === "qdrant"
+    && (id.startsWith(COLLECTION_PREFIXES.VECTFOX_EVENTBASE) || id.startsWith(COLLECTION_PREFIXES.VECTFOX_ARCHIVE_EVENT));
 }
 
 /**
@@ -884,6 +1094,187 @@ async function exportCollectionStoryLinks(collection) {
 }
 
 /**
+ * Runs one of a LoreBase row's buttons.
+ * @param {string} action The button's data-lorebase-action
+ * @param {string} key The row's key
+ */
+async function runLoreBaseAction(action, key) {
+  const row = browserState.loreBaseRows.find((each) => each.key === key);
+  if (!row) return;
+  switch (action) {
+    case "view-chunks": return viewLoreBaseChunks(row);
+    case "export": return exportLoreBaseRow(row);
+    case "import": return importLoreBaseFromPicker(row);
+    case "delete": return deleteLoreBaseRow(row);
+    default: log.warn(`VectFox Database Browser: no LoreBase row button runs "${action}"`);
+  }
+}
+
+/**
+ * Opens a vectors row's chunks in the Chunk Visualizer, read only, over the browser: LoreBase writes them from the
+ * lorebook's entries. On a row of the list, a chunk's Edit entry opens LoreBase's entry editor, whose Save writes the
+ * entry and its vectors; a leftover's lorebook is not in SillyTavern, or its vectors not where LoreBase writes them, so
+ * its entries are not edited here. Once the visualizer closes after a save, the rows are read again, as an entry's
+ * parts may have changed in number. The rows are listed only with Similharity, which the visualizer reads them through.
+ * @param {object} row
+ * @returns {Promise<void>}
+ */
+async function viewLoreBaseChunks(row) {
+  const { collection, settings } = tenantChunkSource(row, browserState.settings);
+  let isEntrySaved = false;
+  const editEntry = row.isLeftover ? null : async (chunk) => {
+    const isSaved = await editLoreBookEntry(row.book, String(chunk.metadata.entryUid));
+    isEntrySaved ||= isSaved;
+    return isSaved;
+  };
+  await openChunkVisualizer(collection, settings, { isLoreBaseParts: true, editEntry });
+  if (isEntrySaved) await refreshLoreBaseRows();
+}
+
+/**
+ * Saves a LoreBase row's keys or vectors to a file, and says how much it holds and what it left out.
+ * @param {object} row
+ */
+async function exportLoreBaseRow(row) {
+  try {
+    const exported = await exportStored(row, browserState.settings);
+    if (!exported.count) {
+      toastr.info(`This lorebook has no ${kindWords(row.kind)} to export.`, LOREBASE_TOAST);
+      return;
+    }
+    downloadExport(exported.file, `${row.book ?? row.tenant}-lorebase-${kindWords(row.kind)}`);
+    toastr.success(describeExport(row.kind, exported), LOREBASE_TOAST);
+  } catch (error) {
+    log.error(`VectFox: Export of LoreBase ${kindWords(row.kind)} failed`, error);
+    toastr.error(`Export failed: ${error.message}`, LOREBASE_TOAST);
+  }
+}
+
+/**
+ * Picks a LoreBase file and writes it onto a row's lorebook.
+ * @param {object} row
+ */
+async function importLoreBaseFromPicker(row) {
+  const [file] = await pickFiles({ accept: ".json" });
+  if (!file) return;
+  let data;
+  try {
+    data = await readImportFile(file);
+  } catch (error) {
+    log.error(`VectFox: Import of LoreBase ${kindWords(row.kind)} failed`, error);
+    toastr.error(`Import failed: ${error.message}`, LOREBASE_TOAST);
+    return;
+  }
+  await importLoreBaseData(data, row);
+}
+
+/**
+ * Writes a LoreBase file Import a collection took into the lorebook the file names (§3.3 of
+ * vectfox-multi-collection-per-chat.md): through its row, or the row it would have, so a book with none comes back.
+ * @param {object} data The file, parsed
+ * @param {string} kind KEYS or VECTORS
+ * @returns {Promise<void>}
+ */
+async function importLoreBaseFileByBook(data, kind) {
+  const bookName = typeof data.book?.name === "string" ? data.book.name : "";
+  if (!bookName) {
+    toastr.error(`This LoreBase ${kindWords(kind)} file names no lorebook. Use Import on the ${kindWords(kind)} row of the lorebook you want it in.`, LOREBASE_TOAST);
+    return;
+  }
+  let row;
+  try {
+    row = loreBaseImportRow(kind, bookName, browserState.loreBaseRows, browserState.settings);
+  } catch (error) {
+    log.warn(`VectFox: LoreBase ${kindWords(kind)} file for "${bookName}" not imported:`, error);
+    toastr.error(error.message, LOREBASE_TOAST);
+    return;
+  }
+  await importLoreBaseData(data, row);
+}
+
+/**
+ * Writes a file's keys or vectors onto what matches in a row's lorebook, after showing what that writes and skips.
+ * @param {object} data The file, parsed
+ * @param {object} row The row it goes to
+ * @returns {Promise<void>}
+ */
+async function importLoreBaseData(data, row) {
+  const words = kindWords(row.kind);
+  try {
+    const plan = await planImport(row, data, browserState.settings);
+    if (plan.writes.length === 0) {
+      toastr.error(nothingToImportText(row.kind, plan, row.book), LOREBASE_TOAST);
+      return;
+    }
+    const current = currentEmbeddingModel(browserState.settings);
+    const isConfirmed = await confirmPopup([
+      { text: `Import LoreBase ${words} into this lorebook?` },
+      { text: "Lorebook:", name: row.book },
+      ...describeImport(row.kind, plan, current).map((sentence) => ({ parts: [{ name: sentence }] })),
+      { text: "Saved from:", name: `${data.book?.name ?? "an unnamed lorebook"}, on ${String(data.exportDate ?? "an unknown date").slice(0, 10)}` },
+      row.kind === KEYS ? { text: "This makes no LLM call." } : null,
+      { text: `Import ${words} writes them. Cancel leaves the lorebook as it is.` },
+    ].filter(Boolean), { okButton: `Import ${words}`, isDestructive: true });
+    if (!isConfirmed) return;
+
+    const outcome = await writeImport(plan, browserState.settings);
+    if (outcome.failed) toastr.warning(describeImported(row.kind, outcome, row.book), LOREBASE_TOAST);
+    else toastr.success(describeImported(row.kind, outcome, row.book), LOREBASE_TOAST);
+    await refreshLoreBaseRows();
+  } catch (error) {
+    log.error(`VectFox: Import of LoreBase ${words} failed`, error);
+    toastr.error(`Import failed: ${error.message}`, LOREBASE_TOAST);
+  }
+}
+
+/**
+ * Deletes a LoreBase row's keys or vectors, after showing what is lost and what follows.
+ * @param {object} row
+ * @returns {Promise<void>}
+ */
+async function deleteLoreBaseRow(row) {
+  const words = kindWords(row.kind);
+  const { lost, after } = describeDelete(row);
+  const isConfirmed = await confirmPopup([
+    { text: `Delete the LoreBase ${words} of this lorebook?` },
+    { text: "Lorebook:", name: row.book ?? row.tenant },
+    { text: "Lost:", name: lost },
+    { text: after },
+    { text: `Delete ${words} deletes them. Cancel keeps them.` },
+  ], { okButton: `Delete ${words}`, isDestructive: true });
+  if (!isConfirmed) return;
+
+  try {
+    const deletedCount = await deleteStoredRow(row, browserState.settings);
+    toastr.success(row.kind === KEYS
+      ? `Deleted the keys of ${counted(deletedCount, "entry", "entries")}`
+      : `Deleted the vectors of ${counted(deletedCount, "part")}`, LOREBASE_TOAST);
+    await refreshLoreBaseRows();
+  } catch (error) {
+    log.error(`VectFox: Delete of LoreBase ${words} failed`, error);
+    toastr.error(`Delete failed: ${error.message}`, LOREBASE_TOAST);
+  }
+}
+
+/**
+ * Removes a lorebook from LoreBase, from its row (removeLoreBookAfterConfirm, the WorldInfo page's book row's too): once
+ * confirmed and done, a toast says what went, and the rows are read again, so the lorebook leaves the list.
+ * @param {string} bookName
+ * @returns {Promise<void>}
+ */
+async function removeLoreBookOfRow(bookName) {
+  try {
+    const removed = await removeLoreBookAfterConfirm(bookName, browserState.settings);
+    if (!removed) return;
+    toastr.success(describeRemovedLoreBook(removed), LOREBASE_TOAST);
+    await refreshLoreBaseRows();
+  } catch (error) {
+    log.error(`VectFox: Remove of lorebook "${bookName}" from LoreBase failed`, error);
+    toastr.error(`Remove failed: ${error.message}`, LOREBASE_TOAST);
+  }
+}
+
+/**
  * Helper to find collection by its unique key (registryKey or id)
  */
 function findCollectionByKey(key) {
@@ -913,6 +1304,7 @@ async function runCollectionAction(action, key) {
     case "view-chunks": return viewCollectionChunks(collection);
     case "export-json": return exportCollectionJson(collection);
     case "export-png": return exportCollectionPng(collection);
+    case "compact": return compactOneCollection(key);
     case "delete": return deleteOneCollection(collection);
     case "export-links": return exportCollectionStoryLinks(collection);
     case "import-links": return importStoryLinksFromPicker(collection);
@@ -930,6 +1322,48 @@ function toggleCollection(collection) {
   setCollectionEnabled(collectionKey(collection), collection.enabled);
   renderCollections();
   log.lifecycle(`VectFox Database Browser: ${collection.enabled ? "Resumed" : "Paused"} ${collectionKey(collection)}`);
+}
+
+/**
+ * Compacts one EventBase collection, after showing what it removes: the events a window holds from readings before its
+ * newest one. The row then shows the collection's new count.
+ * @param {string} key The collection whose Compact collection button was pressed
+ * @returns {Promise<void>}
+ */
+async function compactOneCollection(key) {
+  const collection = findCollectionByKey(key);
+  if (!collection) return;
+  try {
+    const plan = await planCollectionCompaction(collection.id, browserState.settings);
+    if (plan.repeats.length === 0) {
+      toastr.info("This collection has nothing to compact.", "VectFox");
+      return;
+    }
+
+    const isConfirmed = await confirmPopup([
+      { text: "Compact this collection?" },
+      { text: "Collection:", name: collection.name },
+      ...describeCompaction(plan).map((sentence) => ({ parts: [{ name: sentence }] })),
+      { text: "This makes no LLM call, and it cannot be undone. Export the collection first to keep a copy." },
+      { text: "Compact removes them. Cancel keeps them." },
+    ], { okButton: "Compact", isDestructive: true });
+    if (!isConfirmed) return;
+
+    const { removedCount } = await compactCollection(plan, collection.id, browserState.settings);
+    if (removedCount === 0) {
+      toastr.warning("Nothing was removed, as the StoryArc links did not all move. Press Compact collection again to finish.", "VectFox");
+      return;
+    }
+    collection.chunkCount = Math.max(0, collection.chunkCount - removedCount);
+    browserState.storyLinkCoverage.delete(key);
+    browserState.storyLinkDescriptions.delete(key);
+    renderCollections();
+    document.dispatchEvent(new CustomEvent("vectfox:collections-updated"));
+    toastr.success(`Removed ${counted(removedCount, "repeated event")} from ${collection.name}`, "VectFox");
+  } catch (error) {
+    log.error("VectFox: Compact collection failed", error);
+    toastr.error(`Compact collection failed: ${error.message}`, "VectFox");
+  }
 }
 
 /**
@@ -953,8 +1387,8 @@ async function deleteOneCollection(collection) {
     browserState.storyLinkCoverage.delete(key);
     browserState.storyLinkDescriptions.delete(key);
     renderCollections();
-    // The settings panel re-checks its Semantic WI and auto-sync checkboxes on
-    // this event; the deleted collection may have been what kept either one on.
+    // The settings panel re-checks its auto-sync checkbox on this event; the
+    // deleted collection may have been what kept it on.
     document.dispatchEvent(new CustomEvent("vectfox:collections-updated"));
 
     if (result.success) {
@@ -1153,13 +1587,15 @@ async function deleteTicked() {
 }
 
 /**
- * Paints the page header's counts.
+ * Paints the page header's counts; the lorebooks' only while LoreBase rows are shown.
  * @param {number} collectionCount Number of collections shown
  * @param {number} chunkCount Total chunks
+ * @param {number} loreBookCount Number of lorebooks whose LoreBase rows are shown
  */
-function updateStats(collectionCount, chunkCount) {
+function updateStats(collectionCount, chunkCount, loreBookCount) {
   $('[data-browser-count="collections"]').text(`${collectionCount} collection${collectionCount === 1 ? "" : "s"}`);
   $('[data-browser-count="chunks"]').text(`${chunkCount} chunk${chunkCount === 1 ? "" : "s"}`);
+  $('[data-browser-count="lorebooks"]').text(counted(loreBookCount, "lorebook")).toggle(loreBookCount > 0);
 }
 
 /**
@@ -1367,7 +1803,10 @@ async function performSearch() {
   $("#vectfox_search_btn").prop("disabled", true);
   $results.html(searchRunningMarkup());
   try {
-    const results = await queryMultipleCollections(collectionIds, query, topK, threshold, browserState.settings);
+    // A query over the embedding provider's piece size is searched in pieces, merged to one result per hash.
+    const pieceResults = await Promise.all(searchPieces(query, browserState.settings)
+      .map((piece) => queryMultipleCollections(collectionIds, piece, topK, threshold, browserState.settings)));
+    const results = mergeSearchPieceResults(pieceResults, topK);
     renderSearchResults(filterResultsByKeywords(results), results);
   } catch (error) {
     log.error("VectFox: Search failed", error);

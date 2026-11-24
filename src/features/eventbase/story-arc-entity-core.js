@@ -6,6 +6,12 @@
  * An entity merge records which names are one entity and which name is kept, as
  * { kept name: [other names] }. It applies when StoryArc reads: stored events and
  * their vectors never change, so a merge costs nothing and can be split again.
+ * Spellings that differ only in case are one name, as an LLM writes a name in more
+ * than one case. A name is found only where it stands as a word: a Latin-script name,
+ * accented or not, where no Latin letter touches it, a Chinese, Japanese, Thai, Lao,
+ * Khmer or Burmese name where the runtime's word splitter starts and ends a word, and a
+ * Korean name where it starts a word with only particles after it, so a merged 家 is
+ * never found inside 家族, a merged Zoë inside Zoëlla, nor a merged 바다 inside 앞바다.
  *
  * Pure: no host imports.
  * ============================================================================
@@ -33,21 +39,95 @@ const OWN_ENTITY_MIN_EVENTS = 3;
 /** What separates the parts of a full name, such as a given name and a family name. */
 const NAME_PART_SEPARATORS = /[·・．.\s]+/;
 
-const isLatinName = (name) => /^[\x20-\x7e]+$/.test(name);
+/** A name in Latin script, accented letters such as ë and é included, with any digits, punctuation and spaces. */
+const isLatinName = (name) => /^[\p{Script=Latin}\p{M}\p{N}\p{P}\p{S}\p{Zs}]+$/u.test(name);
+/** A Latin name matches only where no Latin letter or accent mark touches it, so Zoë is not found in Zoëlla, but is in Zoë的劍. */
 const asPattern = (name) => {
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return isLatinName(name) ? `(?<![A-Za-z])${escaped}(?![A-Za-z])` : escaped;
+    return isLatinName(name) ? `(?<![\\p{Script=Latin}\\p{M}])${escaped}(?![\\p{Script=Latin}\\p{M}])` : escaped;
 };
 const isSameName = (a, b) => a.toLowerCase() === b.toLowerCase();
 
-/** Whether a text holds a name: a Latin name only as a whole word, in any case. */
+/**
+ * Scripts written with no spaces between words, whose words the runtime's word splitter
+ * knows from its dictionaries: Chinese, Japanese, Thai, Lao, Khmer and Burmese.
+ */
+const UNSPACED_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}\p{Script=Lao}\p{Script=Khmer}\p{Script=Myanmar}]/u;
+const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
+/** The word edges of texts already split, as a turn reads one text for several names. Emptied when full. */
+const wordEdgesByText = new Map();
+const WORD_EDGE_TEXT_LIMIT = 5000;
+
+/** Where the words of a text start and end, by the runtime's word splitter, which knows the words of the unspaced scripts. */
+function wordEdgesOf(text) {
+    const known = wordEdgesByText.get(text);
+    if (known) return known;
+    const edges = new Set([text.length]);
+    for (const { index } of wordSegmenter.segment(text)) edges.add(index);
+    if (wordEdgesByText.size >= WORD_EDGE_TEXT_LIMIT) wordEdgesByText.clear();
+    wordEdgesByText.set(text, edges);
+    return edges;
+}
+
+/** Korean, which writes spaces between words but joins particles to the end of a name. */
+const HANGUL = /\p{Script=Hangul}/u;
+const HANGUL_RUN = /^\p{Script=Hangul}*/u;
+/**
+ * What can follow a Korean name inside its word, alone or one after another as in 바다에서는:
+ * case, topic and other particles, the vocative, the honorifics 님 and 씨, the plural 들, and
+ * the copula's common forms. Anything else joined to the name makes it part of another word.
+ */
+const KOREAN_PARTICLES = [
+    '이', '가', '께서', '은', '는', '을', '를', '의',
+    '에', '에서', '에게', '에게서', '한테', '한테서', '께', '로', '으로', '로서', '으로서', '로써', '으로써',
+    '와', '과', '랑', '이랑', '하고',
+    '도', '만', '까지', '부터', '조차', '마저', '밖에', '뿐', '처럼', '보다', '같이', '만큼', '대로',
+    '나', '이나', '든', '이든', '든지', '이든지',
+    '아', '야', '여', '이여', '님', '씨', '들',
+    '이다', '다', '이야', '예요', '이에요', '입니다', '였다', '이었다',
+];
+const KOREAN_PARTICLES_ONLY = new RegExp(`^(?:${[...KOREAN_PARTICLES].sort((a, b) => b.length - a.length).join('|')})*$`, 'u');
+
+/**
+ * Whether a name found at `start` stands as a word. A name in an unspaced script, such
+ * as Chinese or Thai, must start and end a word, so 家 inside 家族 does not count. A
+ * Korean name must start a word, with only particles after it in that word, so 바다가
+ * counts and 앞바다 and 바다표범 do not; a one-syllable name can still be read inside a
+ * word that looks like it with a particle, as 나 in 나이. A Latin name's pattern already
+ * keeps to whole words, and a name in another script counts wherever it is found: Arabic
+ * and Hebrew join articles and conjunctions to the front of a word, and Greek and Russian
+ * change a name's ending.
+ */
+function standsAsWord(text, start, name) {
+    if (UNSPACED_SCRIPT.test(name)) {
+        const edges = wordEdgesOf(text);
+        return edges.has(start) && edges.has(start + name.length);
+    }
+    if (HANGUL.test(name)) {
+        const isWordStart = !HANGUL.test(text[start - 1] ?? '');
+        const restOfWord = text.slice(start + name.length).match(HANGUL_RUN)[0];
+        return isWordStart && KOREAN_PARTICLES_ONLY.test(restOfWord);
+    }
+    return true;
+}
+
+/** Whether a text holds a name as a word (standsAsWord): a Latin name only as a whole word, in any case. */
 function holdsName(text, name) {
-    return isLatinName(name) ? new RegExp(asPattern(name), 'i').test(text) : text.includes(name);
+    if (isLatinName(name)) return new RegExp(asPattern(name), 'iu').test(text);
+    for (let start = text.indexOf(name); start >= 0; start = text.indexOf(name, start + 1)) {
+        if (standsAsWord(text, start, name)) return true;
+    }
+    return false;
 }
 
 /** The kept name of every other name, keyed in lower case. */
 function keptNameByOtherName(merges) {
     return new Map(Object.entries(merges).flatMap(([kept, others]) => others.map(other => [other.toLowerCase(), kept])));
+}
+
+/** The kept name of every name a merge holds, the kept name itself included, keyed in lower case. */
+function keptNameByName(merges) {
+    return new Map([...Object.keys(merges).map(kept => [kept.toLowerCase(), kept]), ...keptNameByOtherName(merges)]);
 }
 
 /**
@@ -79,8 +159,8 @@ export function entityNamesLeftAlone(merges, storedEvents) {
 }
 
 /**
- * A function that writes every other name as its kept name. The longest name wins
- * where names overlap.
+ * A function that writes every other name as its kept name, where the name stands as a
+ * word (standsAsWord). The longest name wins where names overlap.
  *
  * @param {Record<string, string[]>} merges
  * @param {object[]} [storedEvents] - Their `characters` tags say which longer names are other people (entityNamesLeftAlone)
@@ -92,8 +172,11 @@ export function buildEntityNameWriter(merges, storedEvents = []) {
     const alternatives = [...new Set([...keptByOther.keys(), ...entityNamesLeftAlone(merges, storedEvents)])]
         .sort((a, b) => b.length - a.length)
         .map(asPattern);
-    const pattern = new RegExp(alternatives.join('|'), 'gi');
-    return text => text.replace(pattern, match => keptByOther.get(match.toLowerCase()) ?? match);
+    const pattern = new RegExp(alternatives.join('|'), 'giu');
+    return text => text.replace(pattern, (match, start) => {
+        const keptName = keptByOther.get(match.toLowerCase());
+        return keptName && standsAsWord(text, start, match) ? keptName : match;
+    });
 }
 
 /**
@@ -121,7 +204,7 @@ export function withKeptEntityNames(events, writeName) {
 /**
  * The text to search for a question: stored vectors keep the names they were built
  * from, so it also asks for the other names of anyone the question or its subject
- * names, except the rare ones.
+ * names, in any case, except the rare ones.
  *
  * @param {object} params
  * @param {string} params.queryText
@@ -131,14 +214,15 @@ export function withKeptEntityNames(events, writeName) {
  * @returns {string}
  */
 export function entitySearchText({ queryText, subject, merges, storedEvents }) {
-    const isAsked = name => queryText.includes(name) || (subject && isSameName(subject, name));
+    const isInQuestion = name => holdsName(queryText, name);
+    const isAsked = name => isInQuestion(name) || (subject && isSameName(subject, name));
     const addedNames = Object.entries(merges)
         .map(([kept, others]) => [kept, ...others])
         .filter(names => names.some(isAsked))
         .flatMap((names) => {
             const counts = names.map(name => storedEvents.filter(event => holdsName(String(event.text ?? ''), name)).length);
             const total = counts.reduce((sum, count) => sum + count, 0);
-            return names.filter((name, place) => !queryText.includes(name) && counts[place] / Math.max(total, 1) >= SEARCHED_NAME_SHARE);
+            return names.filter((name, place) => !isInQuestion(name) && counts[place] / Math.max(total, 1) >= SEARCHED_NAME_SHARE);
         });
     return addedNames.length ? `${queryText} ${addedNames.join(' ')}` : queryText;
 }
@@ -158,9 +242,10 @@ export function entityNamesInMessage(message, merges) {
 }
 
 /**
- * One kind's entities, most named first. A merged entity counts every event naming
- * it, and shows under the kinds that tag one of its names. One that no tag names
- * still shows, under people, so it can be split again.
+ * One kind's entities, most named first. A name's spellings that differ only in case
+ * are one row, shown in the spelling most events tag. A merged entity goes by its kept
+ * name, counts every event naming it, and shows under the kinds that tag one of its
+ * names. One that no tag names still shows, under people, so it can be split again.
  *
  * @param {object[]} storedEvents
  * @param {Record<string, string[]>} merges
@@ -168,31 +253,44 @@ export function entityNamesInMessage(message, merges) {
  * @returns {{name: string, otherNames: string[], eventCount: number}[]}
  */
 export function listEntities(storedEvents, merges, kind) {
-    const keptByOther = keptNameByOtherName(merges);
-    const keptNameOf = name => keptByOther.get(name.toLowerCase()) ?? name;
-    const namesOfKind = (wantedKind) => {
-        const eventCountByName = new Map();
+    const keptByName = keptNameByName(merges);
+    const keptNameOf = name => keptByName.get(name.toLowerCase()) ?? name;
+    // Each name in lower case, with how many events tag it, in all and in each spelling.
+    const tallyOfKind = (wantedKind) => {
+        const tallyByLowerCaseName = new Map();
         for (const event of storedEvents) {
             const tags = Array.isArray(event[ENTITY_TAG_BY_KIND[wantedKind]]) ? event[ENTITY_TAG_BY_KIND[wantedKind]] : [];
-            const names = new Set(tags.map(tag => String(tag).trim()).filter(Boolean).map(keptNameOf));
-            for (const name of names) eventCountByName.set(name, (eventCountByName.get(name) ?? 0) + 1);
+            const spellings = new Set(tags.map(tag => String(tag).trim()).filter(Boolean).map(keptNameOf));
+            for (const lowerCaseName of new Set([...spellings].map(spelling => spelling.toLowerCase()))) {
+                const tally = tallyByLowerCaseName.get(lowerCaseName) ?? { eventCount: 0, eventCountBySpelling: new Map() };
+                tally.eventCount += 1;
+                tallyByLowerCaseName.set(lowerCaseName, tally);
+            }
+            for (const spelling of spellings) {
+                const { eventCountBySpelling } = tallyByLowerCaseName.get(spelling.toLowerCase());
+                eventCountBySpelling.set(spelling, (eventCountBySpelling.get(spelling) ?? 0) + 1);
+            }
         }
-        return eventCountByName;
+        return tallyByLowerCaseName;
     };
-    const eventCountByName = namesOfKind(kind);
+    const tallyByLowerCaseName = tallyOfKind(kind);
     if (kind === KIND_OF_UNTAGGED_ENTITY) {
-        const tagged = new Set(Object.keys(ENTITY_TAG_BY_KIND).flatMap(eachKind => [...namesOfKind(eachKind).keys()]));
+        const tagged = new Set(Object.keys(ENTITY_TAG_BY_KIND).flatMap(eachKind => [...tallyOfKind(eachKind).keys()]));
         for (const kept of Object.keys(merges)) {
-            if (!tagged.has(kept)) eventCountByName.set(kept, 0);
+            if (!tagged.has(kept.toLowerCase())) tallyByLowerCaseName.set(kept.toLowerCase(), { eventCount: 0, eventCountBySpelling: new Map([[kept, 0]]) });
         }
     }
     for (const [kept, others] of Object.entries(merges)) {
-        if (!eventCountByName.has(kept)) continue;
+        const tally = tallyByLowerCaseName.get(kept.toLowerCase());
+        if (!tally) continue;
         const names = [kept, ...others];
-        eventCountByName.set(kept, storedEvents.filter(event => names.some(name => holdsName(String(event.text ?? ''), name))).length);
+        tally.eventCount = storedEvents.filter(event => names.some(name => holdsName(String(event.text ?? ''), name))).length;
     }
-    return [...eventCountByName]
-        .map(([name, eventCount]) => ({ name, otherNames: merges[name] ?? [], eventCount }))
+    return [...tallyByLowerCaseName.values()]
+        .map(({ eventCount, eventCountBySpelling }) => {
+            const [name] = [...eventCountBySpelling].reduce((most, spelling) => (spelling[1] > most[1] ? spelling : most));
+            return { name, otherNames: merges[name] ?? [], eventCount };
+        })
         .sort((a, b) => (b.eventCount - a.eventCount) || a.name.localeCompare(b.name));
 }
 
@@ -210,6 +308,29 @@ export function filterEntities(rows, word) {
 }
 
 /**
+ * Whether the Entity tab hides a name. A name is hidden in any case, since its row
+ * shows the spelling most events tag, which can change as events are added.
+ *
+ * @param {string[]} hiddenNames
+ * @param {string} name
+ * @returns {boolean}
+ */
+export function isHiddenEntityName(hiddenNames, name) {
+    return hiddenNames.some(hidden => isSameName(hidden, name));
+}
+
+/**
+ * The hidden names without a name, in every case it is hidden in.
+ *
+ * @param {string[]} hiddenNames
+ * @param {string} name
+ * @returns {string[]} a new array
+ */
+export function showEntityNameAgain(hiddenNames, name) {
+    return hiddenNames.filter(hidden => !isSameName(hidden, name));
+}
+
+/**
  * Rows split by whether the Entity tab hides their name. Hiding keeps a name off that
  * list only: StoryArc still reads every hidden name, in the search, the router and the
  * block.
@@ -219,17 +340,17 @@ export function filterEntities(rows, word) {
  * @returns {{shownRows: object[], hiddenRows: object[]}}
  */
 export function separateHiddenEntities(rows, hiddenNames) {
-    const hidden = new Set(hiddenNames);
+    const isHidden = row => isHiddenEntityName(hiddenNames, row.name);
     return {
-        shownRows: rows.filter(row => !hidden.has(row.name)),
-        hiddenRows: rows.filter(row => hidden.has(row.name)),
+        shownRows: rows.filter(row => !isHidden(row)),
+        hiddenRows: rows.filter(isHidden),
     };
 }
 
 /**
  * Merge one name into another: the target stays the kept name, and the source's name
- * and its own other names become other names of it. A target that is already another
- * entity's other name means that entity.
+ * and its own other names become other names of it. A name already in an entity, as
+ * its kept name or an other name and in any case, means that entity.
  *
  * @param {Record<string, string[]>} merges
  * @param {string} sourceName
@@ -238,8 +359,8 @@ export function separateHiddenEntities(rows, hiddenNames) {
  *          new object, and keptName the name the merged entity goes by
  */
 export function mergeEntityNames(merges, sourceName, targetName) {
-    const keptByOther = keptNameByOtherName(merges);
-    const keptOf = name => keptByOther.get(name.toLowerCase()) ?? name;
+    const keptByName = keptNameByName(merges);
+    const keptOf = name => keptByName.get(name.toLowerCase()) ?? name;
     const source = keptOf(sourceName.trim());
     const target = keptOf(targetName.trim());
     if (!source || !target) return { isMerged: false, merges, reason: 'Choose a name to merge into.' };

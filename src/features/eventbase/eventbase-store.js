@@ -8,51 +8,114 @@
  * ============================================================================
  */
 
-import { insertVectorItems, qdrantTarget } from '../vector-backend/index.js';
+import { insertVectorItems, deleteVectorItems, getSavedHashes, updateChunkMetadata, qdrantTarget } from '../vector-backend/index.js';
 import { saveSettingsDebounced, extension_settings } from '../../sillytavern/settings.js';
 import { getRequestHeaders } from '../../sillytavern/requests.js';
-import { getCurrentChatId, getContext } from '../../sillytavern/chat.js';
-import { getChatUUID, buildEventBaseCollectionId, getRegistryBackend, COLLECTION_PREFIXES, parseRegistryKey, buildChatSearchPatterns, matchesPatterns } from '../../shared/collection-ids.js';
+import { getContext } from '../../sillytavern/chat.js';
+import { getRegistryBackend, COLLECTION_PREFIXES, parseCollectionId, parseRegistryKey } from '../../shared/collection-ids.js';
 import {
     registerCollection,
     getCollectionRegistry,
-    getCollectionListing,
-    getChatLockedCollections,
-    isCollectionActiveForContextAnyKey,
+    getCollectionMeta,
+    setCollectionMeta,
     setCollectionAutoSync,
 } from '../collections/index.js';
 import { buildEmbedText } from './eventbase-schema.js';
+import { findReplacedEvents, linksMovedToReplacements, mayHoldEarlierEvents, replacementIdsOf, windowSpanOf } from './eventbase-window-replacement-core.js';
 import { log } from '../../sillytavern/log.js';
 import { readErrorBody } from '../../shared/server-error-text.js';
 
-// Re-export so callers can import from here if needed
-export { buildEventBaseCollectionId };
+// ---------------------------------------------------------------------------
+// The pointer: how far EventBase has read a chat into one collection
+// ---------------------------------------------------------------------------
+// Each EventBase or archive collection keeps its own pointer in its record
+// (extension_settings.vectfox.collections[<registry key>].eventbaseProgress), so
+// two collections of one chat never share one:
+//   vectorizationTip     — one past the last message any extracted window covers
+//   extractedWindows     — the fingerprints of the windows read, so no message is read twice
+//   unfinishedWindows    — the fingerprints of the windows that failed, sent again
+//   autoSyncStartMarker  — the first message auto-sync reads; its windows start there
+//   windowSize           — the window size Vectorize read it with, which Catch up reads with too: set at
+//                          the chat's first read, by New collection and by Start over
+// Every function below that takes a registryKey reads or writes that collection's
+// pointer, and only through readEventBaseProgress and writeEventBaseProgress.
+// Deleting the collection deletes its record, the pointer with it.
 
-// In-memory Set cache for O(1) window dedup lookups.
-// Backed by the serialized array in extension_settings (which survives reload).
-// Built lazily on first access per chat UUID.
-const _windowCacheSet = new Map(); // chatUUID → Set<fingerprint>
+// Each extractedWindows array's fingerprints as a Set, and the hashes of the messages they
+// hold as another, for O(1) lookups. Keyed by the array itself, so a record whose array is
+// replaced (an import, a clear) is read again from the new array.
+const _extractedWindowSets = new WeakMap(); // extractedWindows array → Set<fingerprint>
+const _readMessageHashSets = new WeakMap(); // extractedWindows array → Set<message hash, as a string>
 
-// In-memory cache for the "vectorization tip" — the index one past the last
-// message that has any extracted event window covering it (== max(source_window_end)+1).
-// Used by the Auto-Sync UI to show "vectorization: N msgs" honestly. The
-// auto-sync START marker (eventbase_autosync_start_marker) only records where
-// auto-sync was first enabled, so it lies as new windows extract after enable.
-// This cache is the truth source for the UI.
-//
-// Lifecycle:
-//   - written by the ingestion loop after each successful markWindowExtracted
-//   - persisted to extension_settings.vectfox.eventbase_vectorization_tip so the
-//     value survives reload WITHOUT a backend probe (benefits standard+plugin and
-//     qdrant+plugin users; standard-no-plugin can't probe anyway). See getter.
-//   - probed via ensureVectorizationTip when neither the in-memory cache nor the
-//     persisted map has a value (i.e. the very first read on a chat), and once per
-//     page load when the known tip is far behind the chat
-//   - cleared by clearVectorizationTip (parity with clearAutoSyncMarker)
-const _vectorizationTipByUuid = new Map(); // chatUUID → number (tip)
+// The tip, in memory: the pointer's tip once read, or a tip probed from the
+// collection's events (ensureVectorizationTip) that is not stored. The Auto-Sync page
+// shows it as "vectorization: N msgs". Written by the ingestion loop after each
+// window it marks extracted; probed only when neither memory nor the record has one,
+// and once per page load when the known tip is far behind the chat.
+const _vectorizationTipByRegistryKey = new Map(); // registry key → number (tip)
 
-// Chats whose far-behind tip was read against the backend on this page load.
+// Collections whose far-behind tip was read against the backend on this page load.
 const _tipsCheckedThisPageLoad = new Set();
+
+/**
+ * A collection's pointer, from its record: an object holding the parts it has, empty when it has none. Read only:
+ * change it through writeEventBaseProgress.
+ *
+ * @param {string} registryKey - The collection's registry key ("backend:id")
+ * @returns {{vectorizationTip?: number, extractedWindows?: string[], unfinishedWindows?: string[], autoSyncStartMarker?: number, windowSize?: number}}
+ */
+export function readEventBaseProgress(registryKey) {
+    if (!registryKey) return {};
+    const progress = getCollectionMeta(registryKey).eventbaseProgress;
+    return progress && typeof progress === 'object' ? progress : {};
+}
+
+/**
+ * Write parts of a collection's pointer into its record, keeping the parts not named; a part given as undefined is
+ * removed. Writes nothing when no part changes, so clearing a collection with no record makes none.
+ *
+ * @param {string} registryKey - The collection's registry key ("backend:id")
+ * @param {object} parts - Parts of the pointer, as readEventBaseProgress returns them
+ */
+export function writeEventBaseProgress(registryKey, parts) {
+    if (!registryKey) return;
+    const current = readEventBaseProgress(registryKey);
+    const isChanged = Object.entries(parts).some(([part, value]) =>
+        value === undefined ? Object.prototype.hasOwnProperty.call(current, part) : current[part] !== value);
+    if (!isChanged) return;
+    const progress = { ...current };
+    for (const [part, value] of Object.entries(parts)) {
+        if (value === undefined) delete progress[part];
+        else progress[part] = value;
+    }
+    setCollectionMeta(registryKey, { eventbaseProgress: Object.keys(progress).length ? progress : undefined });
+}
+
+/** The fingerprints of an extractedWindows array as a Set, built once per array. */
+function extractedWindowSetOf(windows) {
+    let fingerprints = _extractedWindowSets.get(windows);
+    if (!fingerprints) {
+        fingerprints = new Set(windows);
+        _extractedWindowSets.set(windows, fingerprints);
+    }
+    return fingerprints;
+}
+
+/**
+ * The hashes of every message an extractedWindows array's windows hold, as strings, built once per array: a fingerprint
+ * holds one hash per message (windowFingerprint).
+ */
+function readMessageHashSetOf(windows) {
+    let hashes = _readMessageHashSets.get(windows);
+    if (!hashes) {
+        hashes = new Set(windows.flatMap(fingerprint => fingerprint.split(',')));
+        _readMessageHashSets.set(windows, hashes);
+    }
+    return hashes;
+}
+
+/** Whether every message of a window, by its fingerprint, is in a window read already. */
+const isFingerprintRead = (fingerprint, readHashes) => fingerprint.split(',').every(hash => readHashes.has(hash));
 
 /**
  * Whole Auto-sync windows behind the sync boundary at which a chat counts as far behind: the
@@ -74,129 +137,70 @@ export function countWindowsBehind(commitBoundary, tip, windowSize) {
 }
 
 /**
- * Sync getter. On in-memory miss, warms the cache from the persisted
- * extension_settings map, so the tip is correct immediately after a reload with
- * no backend round-trip. Returns undefined only when nothing is known yet.
+ * A collection's tip: from memory, else from its pointer, so it is right at once after a reload with no backend
+ * round-trip. Undefined only when nothing is known yet.
+ *
+ * @param {string} registryKey - The collection's registry key ("backend:id")
+ * @returns {number|undefined}
  */
-export function getVectorizationTip(chatUUID) {
-    if (!chatUUID) return undefined;
-    const cached = _vectorizationTipByUuid.get(chatUUID);
+export function getVectorizationTip(registryKey) {
+    if (!registryKey) return undefined;
+    const cached = _vectorizationTipByRegistryKey.get(registryKey);
     if (typeof cached === 'number') return cached;
-    const persisted = extension_settings?.vectfox?.eventbase_vectorization_tip?.[chatUUID];
-    if (typeof persisted === 'number') {
-        _vectorizationTipByUuid.set(chatUUID, persisted);
-        return persisted;
+    const stored = readEventBaseProgress(registryKey).vectorizationTip;
+    if (typeof stored === 'number') {
+        _vectorizationTipByRegistryKey.set(registryKey, stored);
+        return stored;
     }
     return undefined;
 }
 
-/** Sync setter — monotonic max (in-memory + persisted) so out-of-order calls don't regress the tip. */
-export function setVectorizationTip(chatUUID, tip) {
-    if (!chatUUID || typeof tip !== 'number' || !Number.isFinite(tip)) return;
-    const current = _vectorizationTipByUuid.get(chatUUID) ?? -1;
-    if (tip > current) _vectorizationTipByUuid.set(chatUUID, tip);
-    // Persist (also monotonic) so the value survives reload without a probe.
-    const store = extension_settings?.vectfox;
-    if (store) {
-        if (!store.eventbase_vectorization_tip) store.eventbase_vectorization_tip = {};
-        if (tip > (store.eventbase_vectorization_tip[chatUUID] ?? -1)) {
-            store.eventbase_vectorization_tip[chatUUID] = tip;
-            saveSettingsDebounced();
-        }
-    }
-}
-
-/** Clear the cached + persisted tip (e.g. when the user clears EventBase for this chat). */
-export function clearVectorizationTip(chatUUID) {
-    if (!chatUUID) return;
-    _vectorizationTipByUuid.delete(chatUUID);
-    const store = extension_settings?.vectfox?.eventbase_vectorization_tip;
-    if (store && Object.prototype.hasOwnProperty.call(store, chatUUID)) {
-        delete store[chatUUID];
-        saveSettingsDebounced();
-    }
-}
-
-// Per-chat maps in extension_settings.vectfox that are keyed by chat UUID and only
-// shrink via explicit clear paths (collection delete / fresh-extraction). Without a
-// sweep they accumulate one stale entry per chat deleted OUTSIDE the EventBase flow.
-const _ORPHANABLE_CHAT_MAPS = [
-    'eventbase_autosync_start_marker',
-    'eventbase_last_used_window_size',
-    'eventbase_vectorization_tip',
-    'eventbase_unfinished_windows',
-];
-
 /**
- * Prune orphaned per-chat entries from the EventBase maps above (+ the in-memory
- * tip cache). An entry is orphaned when its chat UUID is NOT in `liveUuids` — the
- * set of UUIDs that still have an EventBase/archive-event collection, which
- * pruneOrphanedEventBaseChatMaps reads from the collection registry. A live chat
- * that loses its marker/tip re-stamps/re-probes on the next ingestion, and a chat
- * with no collection has no fingerprints either, so its next run sends every window.
- * An over-eager prune therefore self-heals rather than losing real data.
+ * Raise a collection's tip, in memory and in its pointer. Never lowers it, so calls arriving out of order keep the
+ * highest.
  *
- * @param {Set<string>} liveUuids
- * @returns {number} entries removed across the persisted maps
+ * @param {string} registryKey - The collection's registry key ("backend:id")
+ * @param {number} tip
  */
-function pruneOrphanedChatMaps(liveUuids) {
-    if (!(liveUuids instanceof Set)) return 0;
-    const store = extension_settings?.vectfox;
-    if (!store) return 0;
-
-    let removed = 0;
-    for (const mapKey of _ORPHANABLE_CHAT_MAPS) {
-        const m = store[mapKey];
-        if (!m || typeof m !== 'object') continue;
-        for (const uuid of Object.keys(m)) {
-            if (!liveUuids.has(uuid)) {
-                delete m[uuid];
-                removed++;
-            }
-        }
+export function setVectorizationTip(registryKey, tip) {
+    if (!registryKey || typeof tip !== 'number' || !Number.isFinite(tip)) return;
+    const current = _vectorizationTipByRegistryKey.get(registryKey) ?? -1;
+    if (tip > current) _vectorizationTipByRegistryKey.set(registryKey, tip);
+    if (tip > (readEventBaseProgress(registryKey).vectorizationTip ?? -1)) {
+        writeEventBaseProgress(registryKey, { vectorizationTip: tip });
     }
-    // Drop in-memory tip entries for the same orphans (their persisted copy is gone).
-    for (const uuid of [..._vectorizationTipByUuid.keys()]) {
-        if (!liveUuids.has(uuid)) _vectorizationTipByUuid.delete(uuid);
-    }
-    if (removed > 0) {
-        saveSettingsDebounced();
-        log.lifecycle(`[EventBase] Pruned ${removed} orphaned per-chat entries (marker / last-window-size / tip / unfinished windows)`);
-    }
-    return removed;
 }
 
 /**
- * Prune orphaned per-chat EventBase settings (auto-sync marker, last-used window
- * size, vectorization tip, unfinished windows): entries whose chat UUID no longer has an EventBase or
- * archive-event collection in the registry, because the chat or its collection was
- * deleted, possibly outside the EventBase delete flow.
+ * Forget a collection's tip, in memory and in its pointer.
  *
- * SAFETY: run this only AFTER a successful discovery, so the registry reflects reality.
- * It also bails when the registry is empty, so a transient discovery failure cannot
- * read as "every chat is orphaned" and wipe live entries.
- *
- * @returns {number} entries removed
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  */
-export function pruneOrphanedEventBaseChatMaps() {
-    const registry = getCollectionRegistry();
-    if (!registry.length) return 0; // empty registry → don't risk a mass wipe
+export function clearVectorizationTip(registryKey) {
+    if (!registryKey) return;
+    _vectorizationTipByRegistryKey.delete(registryKey);
+    writeEventBaseProgress(registryKey, { vectorizationTip: undefined });
+}
 
-    const liveUuids = new Set();
-    for (const registryKey of registry) {
-        const colId = parseRegistryKey(registryKey)?.collectionId || '';
-        let raw = null;
-        if (colId.startsWith(COLLECTION_PREFIXES.VECTFOX_EVENTBASE)) {
-            raw = colId.slice(COLLECTION_PREFIXES.VECTFOX_EVENTBASE.length);
-        } else if (colId.startsWith(COLLECTION_PREFIXES.VECTFOX_ARCHIVE_EVENT)) {
-            raw = colId.slice(COLLECTION_PREFIXES.VECTFOX_ARCHIVE_EVENT.length);
-        }
-        if (raw) {
-            const uuid = raw.split('_').pop(); // uuid is the final underscore-free segment
-            if (uuid) liveUuids.add(uuid);
-        }
-    }
-    return pruneOrphanedChatMaps(liveUuids);
+/** Reads a whole collection: a limit below its size would return an arbitrary part of it. */
+const WHOLE_COLLECTION_LIMIT = 50000;
+
+/**
+ * Every event a collection holds, as its stored metadata, with the point hash it is stored under
+ * as `_hash`. Without the Similharity plugin the Standard backend lists hashes only, so its events
+ * carry no metadata.
+ *
+ * @param {string} collectionId - Bare or registry-key form; passed straight to listChunks.
+ * @param {object} settings
+ * @returns {Promise<object[]>}
+ * @throws when the backend cannot list the collection
+ */
+export async function readStoredEvents(collectionId, settings) {
+    const { getBackend } = await import('../vector-backend/index.js');
+    const backendInstance = await getBackend(settings);
+    const result = await backendInstance.listChunks(collectionId, settings, { limit: WHOLE_COLLECTION_LIMIT });
+    const items = Array.isArray(result?.items) ? result.items : [];
+    return items.map(item => ({ ...item?.metadata, _hash: Number(item?.hash) }));
 }
 
 /**
@@ -207,13 +211,9 @@ export function pruneOrphanedEventBaseChatMaps() {
  * @returns {Promise<{ end: number, createdAt: number|undefined }[]>}
  */
 async function _readEventPositions(collectionId, settings) {
-    const { getBackend } = await import('../vector-backend/index.js');
-    const backendInstance = await getBackend(settings);
-    const result = await backendInstance.listChunks(collectionId, settings, { limit: 10000 });
-    const items = Array.isArray(result?.items) ? result.items : [];
-    return items
-        .filter(item => typeof item?.metadata?.source_window_end === 'number')
-        .map(item => ({ end: item.metadata.source_window_end, createdAt: item.metadata.created_at }));
+    return (await readStoredEvents(collectionId, settings))
+        .filter(event => typeof event.source_window_end === 'number')
+        .map(event => ({ end: event.source_window_end, createdAt: event.created_at }));
 }
 
 /** The tip those positions prove: one past the highest message any event covers, 0 with none. */
@@ -227,9 +227,10 @@ function _laterEventTime(first, second) {
 }
 
 /**
- * Whether the events at the collection's end are older than events below a tip. Reset & Vectorize
- * keeps the existing events and re-extracts from the start, so a run stopped part way looks like
- * this, and its tip is the run's own progress. A stale tip does not: the collection's end is newest.
+ * Whether the events at the collection's end are older than events below a tip. Vectorize reads a
+ * chat again from the start, replacing each window's events as it reaches the window, so a run
+ * stopped part way leaves the windows past its tip with older events, and its tip is the run's own
+ * progress. A stale tip does not: the collection's end is newest.
  *
  * @param {{ end: number, createdAt: number|undefined }[]} positions
  * @param {number} tip
@@ -252,8 +253,8 @@ function _isReExtractionUnfinished(positions, tip) {
 }
 
 /**
- * Checks a far-behind tip against its collection, once per chat per page load. SillyTavern saves the
- * whole settings file from whichever tab saves last, so a tab left open or a restored backup can put
+ * Checks a far-behind tip against its collection, once per collection per page load. SillyTavern saves
+ * the whole settings file from whichever tab saves last, so a tab left open or a restored backup can put
  * back a tip from long before the collection's events, and a known tip is otherwise never re-read.
  *
  * Only ever raises: windows that produced no events leave nothing in the backend, so it can prove a
@@ -261,19 +262,19 @@ function _isReExtractionUnfinished(positions, tip) {
  * state and a non-empty one makes Resume start where it ends instead of at the tip
  * (shouldUseTipFallback).
  *
- * @param {string} chatUUID
- * @param {string} collectionId
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  * @param {object} settings
  * @param {number} knownTip
  * @returns {Promise<number>} the tip to use
  */
-async function _checkFarBehindTip(chatUUID, collectionId, settings, knownTip) {
-    _tipsCheckedThisPageLoad.add(chatUUID);
+async function _checkFarBehindTip(registryKey, settings, knownTip) {
+    const { collectionId } = parseRegistryKey(registryKey);
+    _tipsCheckedThisPageLoad.add(registryKey);
     let positions;
     try {
         positions = await _readEventPositions(collectionId, settings);
     } catch (err) {
-        _tipsCheckedThisPageLoad.delete(chatUUID); // the next status read tries again
+        _tipsCheckedThisPageLoad.delete(registryKey); // the next status read tries again
         log.warn(`[EventBase VectorizationTip] check of far-behind tip ${knownTip} failed for ${collectionId}, keeping it:`, err);
         return knownTip;
     }
@@ -283,41 +284,41 @@ async function _checkFarBehindTip(chatUUID, collectionId, settings, knownTip) {
         log.lifecycle(`[EventBase VectorizationTip] tip ${knownTip} is an unfinished re-extraction in ${collectionId}, keeping it`);
         return knownTip;
     }
-    clearWindowCacheForChat(chatUUID);
-    setVectorizationTip(chatUUID, collectionTip);
+    clearWindowCache(registryKey);
+    setVectorizationTip(registryKey, collectionTip);
     log.warn(`[EventBase VectorizationTip] saved tip ${knownTip} was behind ${collectionId}, which reaches ${collectionTip}: raised it and dropped the window record`);
     return collectionTip;
 }
 
 /**
- * Reads a chat's tip, going to the backend only when the known one cannot answer. On a hit
- * (in-memory OR persisted, via getVectorizationTip), returns the tip with no backend round-trip,
- * unless syncProgress shows it far behind (_checkFarBehindTip). When nothing is known yet it probes
- * the backend via listChunks ONCE, populates the cache, and returns the value. Same shape as
- * stampAutoSyncMarker's existing scan, so cost on a genuinely-cold chat is the same as the existing
- * marker-stamp flow.
+ * Reads a collection's tip, going to the backend only when the known one cannot answer. On a hit
+ * (in memory or in its pointer, via getVectorizationTip), returns the tip with no backend round-trip,
+ * unless syncProgress shows it far behind (_checkFarBehindTip). When nothing is known yet it reads
+ * the collection's events ONCE, keeps the tip in memory, and returns it. Same shape as
+ * stampAutoSyncMarker's scan, so a collection read for the first time costs what stamping its marker
+ * does.
  *
- * @param {string} chatUUID
- * @param {string} collectionId  - Bare or registry-key form; passed straight to listChunks.
+ * @param {string} registryKey - The collection's registry key ("backend:id"); its events are read
+ *   from the current backend
  * @param {object} settings
  * @param {{ commitBoundary: number, windowSize: number }} [syncProgress] - where the chat stands
  *   (see countWindowsBehind). Without it a known tip is returned as it is.
  * @returns {Promise<number|null>}  Tip, or null if the collection has no events yet.
  */
-export async function ensureVectorizationTip(chatUUID, collectionId, settings, syncProgress = null) {
-    if (!chatUUID) return null;
-    const cached = getVectorizationTip(chatUUID); // in-memory, else warms from persisted
+export async function ensureVectorizationTip(registryKey, settings, syncProgress = null) {
+    if (!registryKey) return null;
+    const cached = getVectorizationTip(registryKey); // in memory, else from the pointer
     if (typeof cached === 'number') {
         const isFarBehind = syncProgress
             && countWindowsBehind(syncProgress.commitBoundary, cached, syncProgress.windowSize) >= FAR_BEHIND_WINDOW_COUNT;
-        if (!isFarBehind || !collectionId || _tipsCheckedThisPageLoad.has(chatUUID)) return cached;
-        return _checkFarBehindTip(chatUUID, collectionId, settings, cached);
+        if (!isFarBehind || _tipsCheckedThisPageLoad.has(registryKey)) return cached;
+        return _checkFarBehindTip(registryKey, settings, cached);
     }
-    if (!collectionId) return null;
+    const { collectionId } = parseRegistryKey(registryKey);
     try {
         const tip = _tipOfPositions(await _readEventPositions(collectionId, settings));
         if (tip === 0) return null;
-        _vectorizationTipByUuid.set(chatUUID, tip);
+        _vectorizationTipByRegistryKey.set(registryKey, tip);
         return tip;
     } catch (err) {
         log.warn(`[EventBase VectorizationTip] probe failed for ${collectionId} — falling back to marker:`, err?.message || err);
@@ -335,15 +336,15 @@ export async function ensureVectorizationTip(chatUUID, collectionId, settings, s
  *
  * @param {object[]} events      - Array of full EventRecord objects (with ingestion metadata)
  * @param {object}   settings    - VectFox settings
- * @param {AbortSignal|null} [abortSignal]
+ * @param {AbortSignal|null} abortSignal
+ * @param {string} collectionId - The run's collection (runEventBaseIngestion): never an ID built again here, which
+ *   changes with the persona and, in a group chat, with each speaker
  * @returns {Promise<void>}
+ * @throws {Error} When no collection is given
  */
-export async function insertEvents(events, settings, abortSignal = null, collectionIdOverride = null) {
+export async function insertEvents(events, settings, abortSignal, collectionId) {
     if (!events?.length) return;
-
-    const chatUUID = events[0].chat_uuid;
-    const collectionId = collectionIdOverride || buildEventBaseCollectionId(chatUUID, settings?.vector_backend);
-    if (!collectionId) throw new Error('EventBase: Cannot build collection ID — no active chat');
+    if (!collectionId) throw new Error('EventBase: no collection to write these events into.');
 
     // Build embed texts for all events at once (for efficient batched embedding)
     const embedTexts = events.map(e => buildEmbedText(e));
@@ -386,8 +387,6 @@ export async function insertEvents(events, settings, abortSignal = null, collect
             // own defaults (importance=100).
             importance: event.importance,
             keywords: event.keywords || [],
-            isSummaryChunk: false,
-            parentHash: null,
             metadata: {
                 ...eventWithoutSummary,
                 eventbase: true,        // marker for filter queries
@@ -434,85 +433,183 @@ export async function insertEvents(events, settings, abortSignal = null, collect
 }
 
 // ---------------------------------------------------------------------------
-// Query (for retrieval)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// List (for Event Browser)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Delete
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Deduplication check
+// Window replacement: a window extracted again replaces its earlier events
 // ---------------------------------------------------------------------------
 
 /**
- * Check which event IDs already exist in the collection for the given source
- * message hash set. Returns a Set of existing event_id strings.
- * Used by the ingestion pipeline to skip already-processed windows.
+ * What one ingestion run uses to replace the events its windows hold from earlier extractions;
+ * eventbase-window-replacement-core.js decides which those are. The collection is read once per
+ * run, and only when a window may hold such events, so an ordinary turn reads nothing more.
  *
- * NOTE: This is a best-effort check — it queries by overlap in
- * source_message_hashes. If Qdrant returns relevant existing events we
- * compare their source_message_hashes to find exact-coverage matches.
+ * Neither method throws. A window whose earlier events could not be removed keeps both versions
+ * until it is extracted again, and a link left on a removed event is one no walk can follow.
  *
- * @param {number[]} sourceHashes   - Hashes of messages in the candidate window
- * @param {number[]} messageIds     - 0-based message indices in the window
- * @param {object}   settings
- * @param {string}   [chatUUID]
- * @returns {Promise<boolean>}  true if this exact window is fully covered
+ * @param {{collectionId: string, settings: object, tipAtRunStart: number|null|undefined}} run
+ * @returns {{replaceEarlierEvents: (newEvents: object[], windowsReadEmpty?: object[]) => Promise<void>,
+ *   moveLinksOffReplacedEvents: () => Promise<string[]>}}
  */
-// ---------------------------------------------------------------------------
-// Window fingerprint cache (stored in extension_settings, keyed by chatUUID)
-// ---------------------------------------------------------------------------
+export function createWindowReplacement({ collectionId, settings, tipAtRunStart }) {
+    const runEvents = [];
+    const runWindowsReadEmpty = [];
+    let uncheckedEvents = [];
+    let uncheckedWindowsReadEmpty = [];
+    let storedEventsRead = null;
+    const replacementById = new Map();
+
+    return {
+        /**
+         * After a batch is stored: removes the earlier events of the windows these new events
+         * belong to. A window whose new extraction found no events is not among them, so it keeps
+         * its earlier events, unless the run reads a stretch again and names it in windowsReadEmpty.
+         *
+         * @param {object[]} newEvents - The batch's stored events
+         * @param {object[]} [windowsReadEmpty] - The batch's windows read again with no event found, as
+         *   findReplacedEvents takes them
+         */
+        async replaceEarlierEvents(newEvents, windowsReadEmpty = []) {
+            runEvents.push(...newEvents);
+            runWindowsReadEmpty.push(...windowsReadEmpty);
+            uncheckedEvents.push(...newEvents);
+            uncheckedWindowsReadEmpty.push(...windowsReadEmpty);
+            if (!storedEventsRead && !mayHoldEarlierEvents([...runEvents, ...runWindowsReadEmpty], tipAtRunStart)) return;
+            storedEventsRead ??= readStoredEvents(collectionId, settings).catch((err) => {
+                log.warn(`[EventBase] Could not read ${collectionId} for the events of earlier extractions, so windows extracted again keep both versions:`, err);
+                return null;
+            });
+            const storedEvents = await storedEventsRead;
+            const eventsToCheck = uncheckedEvents;
+            const emptyWindowsToCheck = uncheckedWindowsReadEmpty;
+            uncheckedEvents = [];
+            uncheckedWindowsReadEmpty = [];
+            if (!storedEvents) return;
+
+            const replacedEvents = findReplacedEvents(storedEvents, eventsToCheck, new Set(runEvents.map(event => event.event_id)), emptyWindowsToCheck);
+            if (!replacedEvents.length) return;
+            try {
+                await deleteVectorItems(collectionId, replacedEvents.map(event => event._hash), settings);
+            } catch (err) {
+                log.warn(`[EventBase] Could not remove ${replacedEvents.length} event(s) of earlier extractions from ${collectionId}, so their windows keep both versions:`, err);
+                return;
+            }
+            for (const [replacedId, newId] of replacementIdsOf(replacedEvents, eventsToCheck)) replacementById.set(replacedId, newId);
+            log.lifecycle(`[EventBase] Replaced ${replacedEvents.length} event(s) of earlier extractions in ${new Set(replacedEvents.map(windowSpanOf)).size} window(s)`);
+        },
+
+        /**
+         * At the end of the run: points the StoryArc links that went to replaced events at the
+         * events that replaced them, and drops those to replaced events with no replacement. Reads
+         * the collection again, since links change while a run goes on.
+         *
+         * @returns {Promise<string[]>} event_id of each event that held a link to a replaced event,
+         *   whether or not its links were stored; none when the collection could not be read
+         */
+        async moveLinksOffReplacedEvents() {
+            if (!replacementById.size) return [];
+            let writes;
+            try {
+                writes = linksMovedToReplacements(await readStoredEvents(collectionId, settings), replacementById);
+            } catch (err) {
+                log.warn(`[EventBase] Could not read ${collectionId} to move links off replaced events, so walks skip those links:`, err);
+                return [];
+            }
+            let movedCount = 0;
+            for (const { event, links } of writes) {
+                try {
+                    await updateChunkMetadata(collectionId, event._hash, { story_links: links }, settings);
+                    movedCount++;
+                } catch (err) {
+                    log.warn(`[EventBase] Could not move the links of the event at message ${event.source_window_start} off replaced events:`, err);
+                }
+            }
+            if (writes.length) log.lifecycle(`[EventBase] Moved links off replaced events on ${movedCount} of ${writes.length} event(s)`);
+            return writes.map(({ event }) => event.event_id);
+        },
+    };
+}
 
 // ---------------------------------------------------------------------------
 // AutoSync start-marker (per-chat) — see InternalProject/Vectfox/plans/executed/autosync-independent-window-and-last-n-injection.md §9
 // ---------------------------------------------------------------------------
 //
-// The window fingerprint dedup below is window-size-dependent: changing window
-// size invalidates every cached fingerprint and would trigger a full chat
-// re-extraction when auto-sync next runs. The marker is an additional gate
-// stamped at "everything before this message index is considered covered;
-// auto-sync should only process windows whose start >= marker." Stamped on
+// The window record below skips a window only once every message in it was
+// read, in windows of any size (isWindowAlreadyExtracted), so a window of
+// auto-sync's size that holds messages read before at another size would read
+// them again. The marker is the first message auto-sync reads: its windows
+// start at the marker and every step after it (autoSyncFirstWindowStart), and
+// it reads none that starts before it, so whatever window size stamped the
+// marker, auto-sync reads no message twice and skips none after it. Stamped on
 // auto-sync enable and re-stamped whenever the auto-sync window size setting
-// changes (Phase 2 — see §9.8 of the linked plan).
+// changes (Phase 2 — see §9.8 of the linked plan). An auto-sync run moves it
+// back to the chat's unread end when the chat got shorter than it
+// (capAutoSyncMarker).
 
 /**
- * Look up the auto-sync start marker for a chat.
- * @param {string} chatUUID
+ * A collection's auto-sync start marker.
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  * @returns {number|undefined}  Marker (message index), or undefined if not stamped.
  */
-export function getAutoSyncMarker(chatUUID) {
-    if (!chatUUID) return undefined;
-    return extension_settings?.vectfox?.eventbase_autosync_start_marker?.[chatUUID];
+export function getAutoSyncMarker(registryKey) {
+    return readEventBaseProgress(registryKey).autoSyncStartMarker;
 }
 
 /**
- * Clear the auto-sync start marker for a chat. Called when auto-sync is
+ * Clear a collection's auto-sync start marker. Called when auto-sync is
  * disabled, so re-enabling later re-computes a fresh marker.
- * @param {string} chatUUID
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  */
-export function clearAutoSyncMarker(chatUUID) {
-    const store = extension_settings?.vectfox?.eventbase_autosync_start_marker;
-    if (!store || !chatUUID) return;
-    if (Object.prototype.hasOwnProperty.call(store, chatUUID)) {
-        delete store[chatUUID];
-        saveSettingsDebounced();
-    }
+export function clearAutoSyncMarker(registryKey) {
+    writeEventBaseProgress(registryKey, { autoSyncStartMarker: undefined });
 }
 
 /**
- * Stamp the auto-sync start marker for a chat. Used to gate which windows
- * the auto-sync workflow will process.
+ * Move a collection's auto-sync start marker back when the chat got shorter than it, as it does when messages are
+ * deleted or a summarizer replaces some with a summary. Past the end, the marker would keep auto-sync from reading
+ * anything until the chat grew past it again, the new messages before it included. It moves to the chat's unread end:
+ * the messages after the last one the window record holds, among the last that auto-sync leaves unread while it keeps
+ * up (the turn it holds back and a window not yet full). So the turn held back before the chat got shorter is read
+ * with the new messages, and no message read before is read again.
+ * @param {string} registryKey - The collection's registry key ("backend:id")
+ * @param {object[]} messages - The messages auto-sync reads in the chat
+ * @param {{windowSize: number, step: number, hashFn: (message: object) => number}} autoSyncWindow - Auto-sync's window
+ *   size, how far apart its windows start, and the hash a window's fingerprint holds for each message
+ * @returns {number|undefined} The marker after the move, or undefined if none is stamped
+ */
+export function capAutoSyncMarker(registryKey, messages, { windowSize, step, hashFn }) {
+    const marker = getAutoSyncMarker(registryKey);
+    const messageCount = messages.length;
+    if (typeof marker !== 'number' || marker <= messageCount) return marker;
+    const readHashes = readMessageHashSetOf(readEventBaseProgress(registryKey).extractedWindows ?? []);
+    const earliestUnreadEnd = Math.max(0, messageCount - (windowSize + step - 1));
+    let movedMarker = messageCount;
+    while (movedMarker > earliestUnreadEnd && !readHashes.has(String(hashFn(messages[movedMarker - 1])))) movedMarker--;
+    writeEventBaseProgress(registryKey, { autoSyncStartMarker: movedMarker });
+    log.lifecycle(`[EventBase] AutoSyncMarker ${marker} is past the chat's ${messageCount} messages: moved to ${movedMarker}`);
+    return movedMarker;
+}
+
+/**
+ * Where auto-sync's windows start counting: the start marker's place among windows of the step, so one window starts
+ * exactly at the marker whatever window size stamped it, or the chat's first message while none is stamped.
+ * @param {string} registryKey - The collection's registry key ("backend:id")
+ * @param {number} step - How far apart auto-sync's windows start
+ * @returns {number} The message auto-sync's first window starts at, below step
+ */
+export function autoSyncFirstWindowStart(registryKey, step) {
+    const marker = getAutoSyncMarker(registryKey);
+    if (typeof marker !== 'number' || marker <= 0) return 0;
+    return marker % Math.max(1, step);
+}
+
+/**
+ * Stamp a collection's auto-sync start marker, which gates the windows auto-sync
+ * reads into it. The collection is the chat's collection in use, on the current backend
+ * (collectionInUse): the marker is a message index into the open chat.
  *
  * Smart placement:
- *   - If the EventBase collection has existing events → marker = max(source_window_end) + 1
+ *   - If the collection has events → marker = max(source_window_end) + 1
  *     (backfill the gap between last-covered message and current chat tail
  *     at the user's new window size).
- *   - If the collection is empty → marker = current chat length
+ *   - If the collection is empty → marker = the chat's length
  *     (auto-sync starts "from now on" — no full backfill of a long pre-existing
  *     chat that was never vectorized).
  *
@@ -520,116 +617,82 @@ export function clearAutoSyncMarker(chatUUID) {
  * regardless of existing coverage — used by the auto-sync enable flow's "Just keep
  * up from here" choice, where the user explicitly declines backfilling the gap.
  *
- * @param {string} chatUUID
+ * The chat's length counts its messages as a run does, those with text, the positions its windows and stored events
+ * use. Auto-sync's windows start at the marker (autoSyncFirstWindowStart), so the window holding the next message
+ * starts with it.
+ *
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  * @param {object} settings
  * @param {{ floor?: 'chatLength' }} [options]
  * @returns {Promise<number>}  The marker that was stamped.
  */
-export async function stampAutoSyncMarker(chatUUID, settings, options = {}) {
-    if (!chatUUID) return 0;
-    const store = extension_settings?.vectfox;
-    if (!store) return 0;
-
-    const chatLength = getContext()?.chat?.length ?? 0;
+export async function stampAutoSyncMarker(registryKey, settings, options = {}) {
+    if (!registryKey) return 0;
+    const chatLength = (getContext()?.chat ?? []).filter(message => message.mes && message.mes.trim().length > 0).length;
 
     // Explicit "from now on" — skip the coverage scan entirely.
     if (options.floor === 'chatLength') {
-        if (!store.eventbase_autosync_start_marker) store.eventbase_autosync_start_marker = {};
-        store.eventbase_autosync_start_marker[chatUUID] = chatLength;
-        saveSettingsDebounced();
-        log.lifecycle(`[EventBase] AutoSyncMarker stamped (floor=chatLength): uuid=${chatUUID}, marker=${chatLength}`);
+        writeEventBaseProgress(registryKey, { autoSyncStartMarker: chatLength });
+        log.lifecycle(`[EventBase] AutoSyncMarker stamped (floor=chatLength): collection=${registryKey}, marker=${chatLength}`);
         return chatLength;
     }
 
-    // Resolve the write target, so the marker is computed from the collection the
-    // user is actually vectorizing — not an arbitrary per-persona sibling (the
-    // stale-import bug). The marker is a message index into THIS chat, so it must
-    // never be derived from a foreign-UUID collection locked in for retrieval.
-    const active = resolveEventBaseWriteTarget(settings, chatUUID);
-
+    const { collectionId } = parseRegistryKey(registryKey);
     let maxEnd = -1;
-    if (active) {
-        try {
-            const { getBackend } = await import('../vector-backend/index.js');
-            const backendInstance = await getBackend(settings);
-            // Overfetch generously; per-chat EventBase collections are typically
-            // O(hundreds to low thousands) of events. listChunks is paged anyway.
-            const result = await backendInstance.listChunks(active.collectionId, settings, { limit: 10000 });
-            const items = Array.isArray(result?.items) ? result.items : [];
-            for (const it of items) {
-                const end = it?.metadata?.source_window_end;
-                if (typeof end === 'number' && end > maxEnd) maxEnd = end;
-            }
-        } catch (err) {
-            log.warn(`[EventBase AutoSyncMarker] listChunks failed for ${active.collectionId} — falling back to chat-tail marker:`, err?.message || err);
+    try {
+        const { getBackend } = await import('../vector-backend/index.js');
+        const backendInstance = await getBackend(settings);
+        // Overfetch generously; per-chat EventBase collections are typically
+        // O(hundreds to low thousands) of events. listChunks is paged anyway.
+        const result = await backendInstance.listChunks(collectionId, settings, { limit: 10000 });
+        const items = Array.isArray(result?.items) ? result.items : [];
+        for (const it of items) {
+            const end = it?.metadata?.source_window_end;
+            if (typeof end === 'number' && end > maxEnd) maxEnd = end;
         }
+    } catch (err) {
+        log.warn(`[EventBase AutoSyncMarker] listChunks failed for ${collectionId} — falling back to chat-tail marker:`, err?.message || err);
     }
 
     const marker = maxEnd >= 0 ? maxEnd + 1 : chatLength;
-
-    if (!store.eventbase_autosync_start_marker) store.eventbase_autosync_start_marker = {};
-    store.eventbase_autosync_start_marker[chatUUID] = marker;
-    saveSettingsDebounced();
-
-    log.lifecycle(`[EventBase] AutoSyncMarker stamped: uuid=${chatUUID}, marker=${marker} (maxEnd=${maxEnd}, chatLength=${chatLength}, active=${active?.collectionId ?? 'none'})`);
+    writeEventBaseProgress(registryKey, { autoSyncStartMarker: marker });
+    log.lifecycle(`[EventBase] AutoSyncMarker stamped: collection=${registryKey}, marker=${marker} (maxEnd=${maxEnd}, chatLength=${chatLength})`);
     return marker;
 }
 
 /**
- * Look up the last successfully-used window size for a chat.
- * Used by Vectorize Content → Continue to detect window-size changes that
- * would trigger a full re-extraction (and warn the user before proceeding).
- * @param {string} chatUUID
+ * The window size a collection is read with (§2.7 of InternalProject/Vectfox/plans/executed/vectfox-multi-collection-per-chat.md):
+ * the Vectorize dialog's size at the chat's first read, at New collection or at Start over, which Catch up reads with
+ * too. No run changes it afterwards; auto-sync reads at the AutoSync page's own size.
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  * @returns {number|undefined}
  */
-export function getLastUsedWindowSize(chatUUID) {
-    if (!chatUUID) return undefined;
-    return extension_settings?.vectfox?.eventbase_last_used_window_size?.[chatUUID];
+export function getCollectionWindowSize(registryKey) {
+    return readEventBaseProgress(registryKey).windowSize;
 }
 
 /**
- * Record the window size used for a successful extraction run.
- * @param {string} chatUUID
+ * Set the window size a collection is read with: at the chat's first read, by New collection, by Start over, by a run
+ * on a collection that keeps none, and on a fork, from the collection the branch's events came from.
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  * @param {number} windowSize
  */
-export function setLastUsedWindowSize(chatUUID, windowSize) {
-    const store = extension_settings?.vectfox;
-    if (!store || !chatUUID || !Number.isFinite(windowSize)) return;
-    if (!store.eventbase_last_used_window_size) store.eventbase_last_used_window_size = {};
-    if (store.eventbase_last_used_window_size[chatUUID] !== windowSize) {
-        store.eventbase_last_used_window_size[chatUUID] = windowSize;
-        saveSettingsDebounced();
-    }
+export function setCollectionWindowSize(registryKey, windowSize) {
+    if (!Number.isFinite(windowSize)) return;
+    writeEventBaseProgress(registryKey, { windowSize });
 }
 
 // ---------------------------------------------------------------------------
 // Re-extraction coordination helpers
 // ---------------------------------------------------------------------------
-// These three helpers are the single source of truth for:
-//   1. "Did the window size change since last extraction?"        → checkWindowSizeChanged()
-//   2. "Should the workflow apply its Qdrant-side tip fallback?"  → shouldUseTipFallback()
-//   3. "User asked for fresh extraction — prep the chat state"    → prepareForFreshExtraction()
+// These two helpers are the single source of truth for:
+//   1. "Should the workflow apply its Qdrant-side tip fallback?"  → shouldUseTipFallback()
+//   2. "User asked for fresh extraction — prep the chat state"    → prepareForFreshExtraction()
 //
 // Code that touches these concerns must use these helpers, not inline the logic: a
 // caller that clears the local cache while the Qdrant-side tip fallback still fires
 // gets a silent "0 events, X skipped" run. If a check needs new behavior, extend the
 // helper, don't fork it at a call site.
-
-/**
- * UI helper. Detect whether the current window size differs from the last
- * successfully-used one for this chat. Single source of truth — callers MUST NOT
- * inline `getLastUsedWindowSize(...) !== currentSize`; use this helper instead so
- * any future refinement (e.g. tolerance, schema migration) applies uniformly.
- *
- * @param {string} chatUUID
- * @param {number} currentSize - The window size the next run would use
- * @returns {{ changed: boolean, oldSize: number|undefined, newSize: number }}
- */
-export function checkWindowSizeChanged(chatUUID, currentSize) {
-    const oldSize = getLastUsedWindowSize(chatUUID);
-    const changed = typeof oldSize === 'number' && oldSize !== currentSize;
-    return { changed, oldSize, newSize: currentSize };
-}
 
 /**
  * Workflow helper. Decide whether `runEventBaseIngestion` should perform its
@@ -638,33 +701,33 @@ export function checkWindowSizeChanged(chatUUID, currentSize) {
  *
  * The fallback fires ONLY when ALL of:
  *   - Caller did NOT explicitly opt out (skipTipFallback === false)
- *   - The local cache gave zero skips (fastForwardSkipped === 0)
  *   - A collection exists to probe (hasCollection === true)
- *   - No window of this chat is on the unfinished record (hasUnfinishedWindows === false)
+ *   - The window record holds no window of the collection, read or unfinished (hasWindowRecord === false)
  *
- * The tip is the furthest window stored, so falling back to it would mark every
- * window before it extracted, unfinished ones included. A record also proves the
- * local cache is alive, so zero skips means the first window is the unfinished one.
+ * The tip is the furthest window stored, so falling back to it marks every window
+ * before it extracted. That is right only when the record was lost, as an import
+ * without its pointer leaves it. A record that holds windows proves the local cache
+ * is alive, so a window it lacks is unread: a summary or an edit changed the first
+ * window, or the window failed, and each window is checked against the record instead.
  *
- * The workflow and the UI popups that request fresh extraction share this
- * rule, so a change to the condition is made here only.
+ * Only the workflow asks it; the dialogs that request a fresh extraction opt out
+ * through skipTipFallback (prepareForFreshExtraction).
  *
- * @param {{ skipTipFallback: boolean, fastForwardSkipped: number, hasCollection: boolean, hasUnfinishedWindows?: boolean }} state
+ * @param {{ skipTipFallback: boolean, hasCollection: boolean, hasWindowRecord: boolean }} state
  * @returns {boolean}
  */
-export function shouldUseTipFallback({ skipTipFallback, fastForwardSkipped, hasCollection, hasUnfinishedWindows = false }) {
+export function shouldUseTipFallback({ skipTipFallback, hasCollection, hasWindowRecord }) {
     if (skipTipFallback) return false;
-    if (fastForwardSkipped > 0) return false;
     if (!hasCollection) return false;
-    if (hasUnfinishedWindows) return false;
+    if (hasWindowRecord) return false;
     return true;
 }
 
 /**
- * UI helper. Prepare a chat for an explicitly user-requested fresh re-extraction.
+ * UI helper. Prepare a collection for an explicitly user-requested fresh re-extraction.
  *
  * Does TWO things, both required:
- *   1. Clears the local extraction caches (window fingerprint cache + tip)
+ *   1. Clears its extraction caches (the window records + tip)
  *   2. Returns options block to spread into runEventBaseOnOpenChat / runEventBaseIngestion
  *      so the workflow's Qdrant-side tip fallback ALSO skips this run
  *
@@ -672,22 +735,23 @@ export function shouldUseTipFallback({ skipTipFallback, fastForwardSkipped, hasC
  * silently fast-forwards past everything — the "0 events, X skipped" surprise.
  * Without step 1 the local fingerprints linger as dead-but-harmless entries.
  *
- * Call this whenever a popup promises "re-extract from message 1" — Reset &
- * Vectorize, Window-size-change Proceed, etc. If a third trigger is ever added,
+ * Call this whenever a run promises to read from the Start from message whatever
+ * was read before: a chat's first read, Start over (after emptyEventBaseCollection),
+ * New collection, and a chat file's Vectorize. If another trigger is ever added,
  * route it through this helper too.
  *
- * @param {string} chatUUID
+ * @param {string} registryKey - The registry key ("backend:id") of the collection the run reads into
  * @returns {Promise<{ skipTipFallback: true }>}
  */
-export async function prepareForFreshExtraction(chatUUID) {
-    if (!chatUUID) return { skipTipFallback: true };
-    clearExtractionCachesForChat(chatUUID);
-    log.lifecycle(`[EventBase] prepareForFreshExtraction: caches cleared for ${chatUUID} (skipTipFallback will be propagated)`);
+export async function prepareForFreshExtraction(registryKey) {
+    if (!registryKey) return { skipTipFallback: true };
+    clearExtractionCaches(registryKey);
+    log.lifecycle(`[EventBase] prepareForFreshExtraction: caches cleared for ${registryKey} (skipTipFallback will be propagated)`);
     return { skipTipFallback: true };
 }
 
 // ---------------------------------------------------------------------------
-// Window-fingerprint cache (in-session dedup of identical extraction windows)
+// Window records (which windows a collection has read, and which failed)
 // ---------------------------------------------------------------------------
 
 /**
@@ -700,70 +764,59 @@ export function windowFingerprint(sourceHashes) {
 }
 
 /**
- * Marks a window as extracted, and takes it off the unfinished record. Stored in
- * extension_settings so it survives page reloads without requiring a chat save.
+ * Marks a window as extracted in a collection's pointer, and takes off its unfinished record that window and every
+ * failed window whose messages have all been read now, in windows of any size.
+ * Stored in the settings, so it survives page reloads without requiring a chat save.
  * @param {number[]} sourceHashes
- * @param {string} [chatUUID]
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  */
-export function markWindowExtracted(sourceHashes, chatUUID) {
-    if (!sourceHashes?.length) return;
-    const uuid = chatUUID || getChatUUID();
-    if (!uuid) return;
-
-    const store = extension_settings.vectfox;
-    if (!store) return;
-    if (!store.eventbase_extracted_windows) store.eventbase_extracted_windows = {};
-    if (!store.eventbase_extracted_windows[uuid]) store.eventbase_extracted_windows[uuid] = [];
-
-    const fp = windowFingerprint(sourceHashes);
-    _keepUnfinishedWindows(uuid, recordedFingerprint => recordedFingerprint !== fp);
-
-    // Update the in-memory Set first (O(1) check)
-    if (!_windowCacheSet.has(uuid)) {
-        _windowCacheSet.set(uuid, new Set(store.eventbase_extracted_windows[uuid]));
+export function markWindowExtracted(sourceHashes, registryKey) {
+    if (!sourceHashes?.length || !registryKey) return;
+    const fingerprint = windowFingerprint(sourceHashes);
+    const windows = readEventBaseProgress(registryKey).extractedWindows ?? [];
+    const extracted = extractedWindowSetOf(windows);
+    const readHashes = readMessageHashSetOf(windows);
+    if (!extracted.has(fingerprint)) {
+        // A new array, which the record then holds: both Sets move to it with the window added.
+        const nextWindows = [...windows, fingerprint];
+        extracted.add(fingerprint);
+        for (const hash of fingerprint.split(',')) readHashes.add(hash);
+        _extractedWindowSets.set(nextWindows, extracted);
+        _readMessageHashSets.set(nextWindows, readHashes);
+        writeEventBaseProgress(registryKey, { extractedWindows: nextWindows });
     }
-    const set = _windowCacheSet.get(uuid);
-    if (!set.has(fp)) {
-        set.add(fp);
-        store.eventbase_extracted_windows[uuid].push(fp);
-        saveSettingsDebounced();
-    }
+    _keepUnfinishedWindows(registryKey, recorded => recorded !== fingerprint && !isFingerprintRead(recorded, readHashes));
 }
 
 /**
- * Puts a window on the chat's unfinished record: its extraction failed, so it must be
- * sent again. The fingerprint cache cannot say this by itself, because a failed window
+ * Puts a window on a collection's unfinished record: its extraction failed, so it must be
+ * sent again. The window record cannot say this by itself, because a failed window
  * is merely absent from it, while the windows after it are present, and the quick exit
  * and the tip look only at the furthest window reached.
  *
  * @param {number[]} sourceHashes
- * @param {string} chatUUID
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  */
-export function markWindowUnfinished(sourceHashes, chatUUID) {
-    const store = extension_settings?.vectfox;
-    if (!store || !chatUUID || !sourceHashes?.length) return;
-    if (!store.eventbase_unfinished_windows) store.eventbase_unfinished_windows = {};
-    if (!store.eventbase_unfinished_windows[chatUUID]) store.eventbase_unfinished_windows[chatUUID] = [];
-
-    const record = store.eventbase_unfinished_windows[chatUUID];
+export function markWindowUnfinished(sourceHashes, registryKey) {
+    if (!registryKey || !sourceHashes?.length) return;
+    const unfinished = readEventBaseProgress(registryKey).unfinishedWindows ?? [];
     const fingerprint = windowFingerprint(sourceHashes);
-    if (record.includes(fingerprint)) return;
-    record.push(fingerprint);
-    saveSettingsDebounced();
+    if (unfinished.includes(fingerprint)) return;
+    writeEventBaseProgress(registryKey, { unfinishedWindows: [...unfinished, fingerprint] });
 }
 
 /**
- * The windows of this size on the chat's unfinished record. A fingerprint holds one hash
+ * The windows of this size on a collection's unfinished record. A fingerprint holds one hash
  * per message, so a run at another window size does not see them: its windows are different.
  *
- * @param {string} chatUUID
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  * @param {number} windowSize
  * @returns {Set<string>} window fingerprints
  */
-export function getUnfinishedWindowFingerprints(chatUUID, windowSize) {
-    const record = extension_settings?.vectfox?.eventbase_unfinished_windows?.[chatUUID];
-    if (!Array.isArray(record)) return new Set();
-    return new Set(record.filter(fingerprint => fingerprint.split(',').length === windowSize));
+export function getUnfinishedWindowFingerprints(registryKey, windowSize) {
+    const unfinished = readEventBaseProgress(registryKey).unfinishedWindows;
+    if (!Array.isArray(unfinished)) return new Set();
+    return new Set(unfinished.filter(fingerprint => fingerprint.split(',').length === windowSize));
 }
 
 /**
@@ -771,89 +824,108 @@ export function getUnfinishedWindowFingerprints(chatUUID, windowSize) {
  * message in the window was edited or deleted. An edited window has a new fingerprint and
  * goes through the run like any window not yet extracted.
  *
- * @param {string} chatUUID
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  * @param {number} windowSize
  * @param {Set<string>} chatFingerprints - every window fingerprint the chat has now
  */
-export function forgetUnfinishedWindowsNotInChat(chatUUID, windowSize, chatFingerprints) {
-    _keepUnfinishedWindows(chatUUID, fingerprint =>
+export function forgetUnfinishedWindowsNotInChat(registryKey, windowSize, chatFingerprints) {
+    _keepUnfinishedWindows(registryKey, fingerprint =>
         fingerprint.split(',').length !== windowSize || chatFingerprints.has(fingerprint));
 }
 
 /**
- * @param {string} chatUUID
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  * @param {(fingerprint: string) => boolean} shouldKeep
  */
-function _keepUnfinishedWindows(chatUUID, shouldKeep) {
-    const records = extension_settings?.vectfox?.eventbase_unfinished_windows;
-    const record = records?.[chatUUID];
-    if (!Array.isArray(record)) return;
-
-    const kept = record.filter(shouldKeep);
-    if (kept.length === record.length) return;
-    if (kept.length > 0) records[chatUUID] = kept;
-    else delete records[chatUUID];
-    saveSettingsDebounced();
+function _keepUnfinishedWindows(registryKey, shouldKeep) {
+    const unfinished = readEventBaseProgress(registryKey).unfinishedWindows;
+    if (!Array.isArray(unfinished)) return;
+    const kept = unfinished.filter(shouldKeep);
+    if (kept.length === unfinished.length) return;
+    writeEventBaseProgress(registryKey, { unfinishedWindows: kept.length > 0 ? kept : undefined });
 }
 
 /**
- * Clears the extraction cache and the unfinished record for a specific chat.
- * Call this whenever an EventBase collection is deleted so that
- * the next vectorization run starts fresh.
- * @param {string} [chatUUID]
+ * Clears a collection's window record and its unfinished record, so its next run reads
+ * every window again.
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  */
-export function clearWindowCacheForChat(chatUUID) {
-    const uuid = chatUUID || getChatUUID();
-    if (!uuid) return;
-    const store = extension_settings?.vectfox;
-    if (!store) return;
-    delete store.eventbase_extracted_windows?.[uuid];
-    delete store.eventbase_unfinished_windows?.[uuid];
-    _windowCacheSet.delete(uuid);
-    saveSettingsDebounced();
+export function clearWindowCache(registryKey) {
+    writeEventBaseProgress(registryKey, { extractedWindows: undefined, unfinishedWindows: undefined });
 }
 
 /**
- * Drops BOTH "already-extracted" caches for a chat — the persisted window
- * fingerprint Set (with the unfinished record) and the in-memory vectorization tip.
- * These are two representations of the same fact ("how far this chat is already extracted"),
- * so they must always be cleared together: clearing one but not the other was
- * the stale-tip bug where re-vectorizing a deleted collection fast-forwarded
- * past every window and extracted 0 events.
+ * Drops BOTH "already-extracted" caches of a collection — its window records and its
+ * vectorization tip. These are two representations of the same fact ("how far this
+ * collection is already extracted"), so they must always be cleared together: clearing
+ * one but not the other was the stale-tip bug where re-vectorizing a deleted collection
+ * fast-forwarded past every window and extracted 0 events.
  *
- * Use this anywhere a chat's extraction state is invalidated wholesale:
- *   - the EventBase collection is deleted or imported (clearCachesForDeletedOrImportedCollection)
+ * Use this anywhere a collection's extraction state is invalidated wholesale:
  *   - the backend is found empty but a local cache lingers (eventbase-workflow.js)
  *   - the user hits Vectorize for a fresh start (content-vectorizer.js)
  *
  * Does NOT touch the auto-sync marker — that's a separate concept (where
  * auto-sync should resume), intentionally preserved across these resets.
  *
- * @param {string} [chatUUID] - defaults to the current chat
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  */
-export function clearExtractionCachesForChat(chatUUID) {
-    const uuid = chatUUID || getChatUUID();
-    if (!uuid) return;
-    clearWindowCacheForChat(uuid);
-    clearVectorizationTip(uuid);
+export function clearExtractionCaches(registryKey) {
+    if (!registryKey) return;
+    clearWindowCache(registryKey);
+    clearVectorizationTip(registryKey);
 }
 
 /**
- * Clears the extraction caches of the chat whose EventBase collection was deleted or imported, so
- * the next read probes what the collection holds now; any other collection needs nothing. index.js
- * hands it to collection-loader's setDeletedOrImportedCollectionCleanup(), so deleteCollection()
- * and importCollection() run it.
+ * Start over's emptying (§2.6 of InternalProject/Vectfox/plans/executed/vectfox-multi-collection-per-chat.md): delete every event
+ * a collection holds, and with them the StoryArc links stored on them; only once none is left, forget the windows it
+ * read, the windows that failed and how far it read, and take the window size given. Where auto-sync started stays, as
+ * do the collection's ID, name, locks, auto-sync switch and StoryArc merges, and the collection itself, empty, so
+ * discovery keeps listing it. Deletes as many events as a listing gives at a time, until none is listed.
+ *
+ * @param {string} registryKey - The collection's registry key ("backend:id")
+ * @param {object} settings - VectFox settings
+ * @param {{windowSize: number}} reading - The window size the collection is read with from now on
+ * @returns {Promise<number>} How many events were deleted
+ * @throws {Error} When the backend refuses a delete, or a delete leaves events it was given; the pointer stays as it was
+ */
+export async function emptyEventBaseCollection(registryKey, settings, { windowSize }) {
+    const { collectionId } = parseRegistryKey(registryKey);
+    let deletedCount = 0;
+    let listed = await getSavedHashes(collectionId, settings);
+    while (listed.length) {
+        await deleteVectorItems(collectionId, listed, settings);
+        const deleted = new Set(listed);
+        const next = await getSavedHashes(collectionId, settings);
+        const keptCount = next.filter(hash => deleted.has(hash)).length;
+        if (keptCount) throw new Error(`${keptCount} of the ${listed.length} events it was asked to delete are still stored`);
+        deletedCount += listed.length;
+        listed = next;
+    }
+    clearExtractionCaches(registryKey);
+    setCollectionWindowSize(registryKey, windowSize);
+    log.lifecycle(`[EventBase] Start over emptied ${registryKey}: ${deletedCount} event(s) deleted, window size ${windowSize}`);
+    return deletedCount;
+}
+
+/**
+ * Forgets what is held in memory of a collection that was deleted or imported, on any backend, so
+ * the next read takes its pointer from its record: deleting the collection deleted its record, and an
+ * import wrote the file's pointer into it, or none. index.js hands it to collection-loader's
+ * setDeletedOrImportedCollectionCleanup(), so deleteCollection() and importCollection() run it.
  *
  * @param {string} collectionId - the collection's bare ID
  */
 export function clearCachesForDeletedOrImportedCollection(collectionId) {
-    if (!collectionId.startsWith(COLLECTION_PREFIXES.VECTFOX_EVENTBASE)) return;
-    // The chat UUID is always the last underscore-separated segment of the collection ID.
-    const chatUUID = collectionId.split('_').pop();
-    // Drop both window + tip caches together. Leaving the tip stale makes the
-    // next re-vectorize fast-forward past every window (tip says "already at
-    // message N") and extract 0 events.
-    if (chatUUID) clearExtractionCachesForChat(chatUUID);
+    const isThatCollection = registryKey => parseRegistryKey(registryKey).collectionId === collectionId;
+    // Leaving the tip in memory makes the next re-vectorize fast-forward past every window (the tip
+    // says "already at message N") and extract 0 events.
+    for (const registryKey of [..._vectorizationTipByRegistryKey.keys()]) {
+        if (isThatCollection(registryKey)) _vectorizationTipByRegistryKey.delete(registryKey);
+    }
+    for (const registryKey of [..._tipsCheckedThisPageLoad]) {
+        if (isThatCollection(registryKey)) _tipsCheckedThisPageLoad.delete(registryKey);
+    }
 }
 
 /**
@@ -865,284 +937,82 @@ export function clearCachesForDeletedOrImportedCollection(collectionId) {
  * @param {object[]} messages  - Filtered message array (same as passed to runEventBaseIngestion)
  * @param {number}   windowSize
  * @param {number}   step       - windowSize - windowOverlap
- * @param {string}   [chatUUID]
+ * @param {string}   registryKey - The collection's registry key ("backend:id")
  * @param {Function} hashFn     - (message) => number hash for that message
+ * @param {number}   [firstWindowStart] - The message the first window starts at: auto-sync's from its start marker
+ *   (autoSyncFirstWindowStart), 0 for every other run
  * @returns {boolean}
  */
-export function isLastWindowExtracted(messages, windowSize, step, chatUUID, hashFn) {
-    const uuid = chatUUID;
-    if (!uuid || messages.length < windowSize) return false;
+export function isLastWindowExtracted(messages, windowSize, step, registryKey, hashFn, firstWindowStart = 0) {
+    const messagesInWindows = messages.length - firstWindowStart;
+    if (!registryKey || messagesInWindows < windowSize) return false;
 
-    const totalPossible = Math.floor((messages.length - windowSize) / step) + 1;
+    const totalPossible = Math.floor((messagesInWindows - windowSize) / step) + 1;
     if (totalPossible <= 0) return false;
 
-    const lastStart = (totalPossible - 1) * step;
+    const lastStart = firstWindowStart + (totalPossible - 1) * step;
     const lastMsgs = messages.slice(lastStart, lastStart + windowSize);
     if (lastMsgs.length < windowSize) return false;
 
-    const hashes = lastMsgs.map(hashFn);
-
-    if (!_windowCacheSet.has(uuid)) {
-        const arr = extension_settings?.vectfox?.eventbase_extracted_windows?.[uuid];
-        _windowCacheSet.set(uuid, new Set(Array.isArray(arr) ? arr : []));
-    }
-
-    return _windowCacheSet.get(uuid).has(windowFingerprint(hashes));
+    return isWindowAlreadyExtracted(lastMsgs.map(hashFn), registryKey);
 }
 
 /**
- * Checks whether a window has already been extracted (O(1), no DB query).
- * Uses an in-memory Set keyed by chatUUID; built lazily from the persisted array.
+ * Whether a collection has read a window (no DB query), from its window record: the window's fingerprint is on it, or
+ * every message in the window is in a window read already, of any size (§2.7 of
+ * InternalProject/Vectfox/plans/executed/vectfox-multi-collection-per-chat.md). So a Catch up after auto-sync read at another
+ * size reads only the unread messages, and a deleted message or a changed overlap, which move every later window,
+ * read nothing again.
  *
  * @param {number[]} sourceHashes
- * @param {number[]} messageIds     - unused, kept for API compat
- * @param {object}   settings       - unused, kept for API compat
- * @param {string}   [chatUUID]
- * @returns {Promise<boolean>}
+ * @param {string} registryKey - The collection's registry key ("backend:id")
+ * @returns {boolean}
  */
-export async function isWindowAlreadyExtracted(sourceHashes, messageIds, settings, chatUUID) {
-    if (!sourceHashes?.length) return false;
-    const uuid = chatUUID || getChatUUID();
-    if (!uuid) return false;
-
-    // Build the Set from the persisted array on first access for this chat
-    if (!_windowCacheSet.has(uuid)) {
-        const arr = extension_settings?.vectfox?.eventbase_extracted_windows?.[uuid];
-        _windowCacheSet.set(uuid, new Set(Array.isArray(arr) ? arr : []));
-    }
-
-    const fp = windowFingerprint(sourceHashes);
-    return _windowCacheSet.get(uuid).has(fp);  // O(1)
+export function isWindowAlreadyExtracted(sourceHashes, registryKey) {
+    if (!sourceHashes?.length || !registryKey) return false;
+    const windows = readEventBaseProgress(registryKey).extractedWindows;
+    if (!Array.isArray(windows)) return false;
+    if (extractedWindowSetOf(windows).has(windowFingerprint(sourceHashes))) return true;
+    const readHashes = readMessageHashSetOf(windows);
+    return sourceHashes.every(hash => readHashes.has(String(hash)));
 }
 
 /**
- * Find every EventBase collection registered for the given chat UUID.
+ * Every EventBase collection registered for the given chat UUID, on every backend and of every account: each whose ID
+ * holds it, as parseCollectionId reads it, so the chat's later collections are found beside its first. Never an
+ * archive. Which of them the chat uses is collectionInUse's answer (eventbase-chat-collections.js), the one route every
+ * reader and writer of a chat's events asks; this list is what that route, and the lock function unlocking the chat's
+ * others, read.
  *
- * The registry — not `buildEventBaseCollectionId` — is the source of truth for
- * which collection holds a chat's data. The collection ID embeds a sanitized
- * form of `name1`/`name2`, and that sanitization can change over time
- * (e.g. the CJK-name fix). Recomputing the ID at read-time therefore can't
- * be trusted; the registry remembers the actual stored ID.
- *
- * Returned entries are ordered most-preferred first:
- *   1. Backend-scoped IDs matching the current backend setting
- *   2. Other backend-scoped IDs
- *   3. Legacy (no backend) IDs
- *
- * Naming convention (see Doc/collection_helper.md):
- *   - `find…`  → ALL candidates, returns an array (this function).
- *   - `resolve…` → THE single active answer (see resolveActiveEventBaseCollection).
- * Take care before reaching for `[0]` here — if you want the one active
- * collection for the current chat, call resolveActiveEventBaseCollection instead.
+ * The registry, not `buildEventBaseCollectionId`, is the source of truth for which collection holds a chat's data: the
+ * ID embeds a sanitized form of `name1`/`name2`, whose sanitization has changed over time.
  *
  * @param {string} uuid Chat UUID
- * @param {string} [preferredBackend] Backend to prefer (e.g. 'qdrant', 'vectra')
- * @returns {{ registryKey: string, collectionId: string }[]}
+ * @returns {{ registryKey: string, collectionId: string, backend: string|null }[]} In registry order, a legacy ID's backend null
  */
-export function findEventBaseCollectionsForChat(uuid, preferredBackend) {
+export function findEventBaseCollectionsForChat(uuid) {
     if (!uuid) return [];
     const matches = [];
     for (const registryKey of getCollectionRegistry()) {
-        const parsed = parseRegistryKey(registryKey);
-        const colId = parsed.collectionId;
-        if (!colId?.startsWith(COLLECTION_PREFIXES.VECTFOX_EVENTBASE)) continue;
-        if (!colId.endsWith(uuid)) continue;
-        matches.push({ registryKey, collectionId: colId, backend: parsed.backend });
+        const { backend, collectionId } = parseRegistryKey(registryKey);
+        if (!collectionId?.startsWith(COLLECTION_PREFIXES.VECTFOX_EVENTBASE)) continue;
+        if (parseCollectionId(collectionId).chatUUID !== uuid) continue;
+        matches.push({ registryKey, collectionId, backend });
     }
-
-    // A single chat UUID can have MULTIPLE EventBase collections on the same
-    // backend — one per persona/handle (e.g. an imported archive under a different
-    // name1). Backend rank alone then picks an arbitrary one, which is how the
-    // auto-sync marker ended up reading a stale import instead of the active
-    // collection. Disambiguate by the chat lock: the collection locked to the
-    // CURRENT chat is the one the rest of the system treats as active (DB Browser
-    // "Active here only", isCollectionActiveForContext). Rank it first so callers
-    // that take [0] resolve correctly. Only meaningful when resolving the current
-    // chat; for any other UUID lock state is irrelevant and we keep backend order.
-    const lockedKeys = (uuid === getChatUUID())
-        ? new Set(getChatLockedCollections(getCurrentChatId()))
-        : new Set();
-    const isLocked = (m) => lockedKeys.has(m.registryKey) || lockedKeys.has(m.collectionId);
-
-    const wantBackend = String(preferredBackend || '').toLowerCase();
-    const backendRank = (m) => {
-        if (wantBackend && m.backend === wantBackend) return 0;
-        if (m.backend) return 1;
-        return 2;
-    };
-    // Lock dominates; backend preference tie-breaks within each lock tier.
-    const rank = (m) => (isLocked(m) ? 0 : 10) + backendRank(m);
-    matches.sort((a, b) => rank(a) - rank(b));
-    return matches.map(({ registryKey, collectionId }) => ({ registryKey, collectionId }));
+    return matches;
 }
 
 /**
- * Turn OFF auto-sync for the chat's EventBase collection(s) so a bad model
- * stops silently re-failing on every message. The user re-enables it after fixing
- * the model. Dispatches `vectfox:collections-updated` so the UI checkbox updates.
+ * Turn auto-sync off for a collection, the one in use whose run failed on a model the provider no longer knows, so it
+ * stops failing on every message. The user turns it on again after fixing the model. Dispatches
+ * `vectfox:collections-updated` so the AutoSync page's switch follows.
  *
- * @param {string} chatUUID
- * @param {string} backend - registry backend, i.e. getRegistryBackend(settings.vector_backend)
+ * @param {string} registryKey - The collection's registry key ("backend:id")
  */
-export function pauseAutoSyncForChat(chatUUID, backend) {
-    if (!chatUUID || !backend) return;
-    let paused = 0;
-    for (const { registryKey } of findEventBaseCollectionsForChat(chatUUID, backend)) {
-        setCollectionAutoSync(registryKey, false);
-        paused++;
-    }
-    if (paused > 0) {
-        globalThis.document?.dispatchEvent(new CustomEvent('vectfox:collections-updated'));
-    }
-}
-
-/**
- * Resolve THE active EventBase collection for a chat — the canonical answer to
- * "which EventBase collection does this chat use right now?".
- *
- * This is the single entry point callers should use when they want one
- * collection (not a list). It is:
- *   - ownership-filtered (via getCollectionListing → drops collections owned by
- *     other personas/users, matching the DB Browser and the auto-sync status), and
- *   - lock-aware (a chat UUID can map to MULTIPLE per-persona collections; the
- *     lock picks the one the rest of the system treats as active — "Active here
- *     only" / the auto-sync write target).
- *
- * Prefer this over `findEventBaseCollectionsForChat(...)[0]`. The plural `find…`
- * is only for the rare case where you genuinely need every candidate (e.g.
- * pausing auto-sync on all of a chat's collections).
- *
- * READ vs WRITE: the default (read) semantics honor a lock even when the locked
- * collection belongs to another conversation — that is the documented way to
- * share an older chat's EventBase with the current one. Ingestion must NOT use
- * those semantics: writing this chat's events into another conversation's
- * collection mixes two `source_window_end` index spaces in one sort frame and
- * corrupts chronology (see `_orderEventsForPresentation` in
- * eventbase-injection.js). Write callers go through
- * {@link resolveEventBaseWriteTarget}, which passes `requireUuidMatch`.
- *
- * @param {object} settings - extension_settings.vectfox
- * @param {string} [chatUUID] - defaults to the current chat's UUID
- * @param {{ requireUuidMatch?: boolean, shouldLogResolution?: boolean }} [options]
- *   `requireUuidMatch` — write mode: reject collections whose embedded chat UUID
- *   differs from this chat (a foreign lock can never become a write target) or
- *   that are registered on a backend other than `vector_backend`.
- *   `shouldLogResolution` — false skips the `[EventBase][resolve]` lifecycle
- *   diagnostics, for passive UI refreshes while VectFox is disabled.
- * @returns {{ collectionId: string, registryKey: string } | null}
- */
-export function resolveActiveEventBaseCollection(settings, chatUUID, { requireUuidMatch = false, shouldLogResolution = true } = {}) {
-    const uuid = chatUUID || getChatUUID();
-    if (!uuid) return null;
-
-    // Disambiguate persona collections: lock dominates, current backend
-    // tie-breaks, otherwise listing order. The lock index is keyed by the active
-    // chat id, so the lock is only meaningful when resolving the current chat.
-    // Computed up front because the ownership filter below also consults it.
-    const chatId = (uuid === getChatUUID()) ? getCurrentChatId() : null;
-    const isLocked = (m) => !!chatId && isCollectionActiveForContextAnyKey(
-        [m.registryKey, m.collectionId], { chatId });
-
-    // Match by UUID (stable across legacy ID formats and character renames).
-    const patterns = buildChatSearchPatterns(null, uuid);
-    const hasUuidMatch = (entry) =>
-        matchesPatterns(entry.collectionId, patterns) || matchesPatterns(entry.registryKey, patterns);
-    const wantBackend = getRegistryBackend(settings?.vector_backend);
-    const isEbMatch = (entry) => {
-        const { collectionId } = entry;
-        const idLower = String(collectionId || '').toLowerCase();
-        if (!idLower.startsWith('vf_eventbase_') && !idLower.includes('eventbase_')) return false;
-        // Write mode: the UUID match is mandatory, so a lock can widen ownership
-        // but never redirect ingestion into another conversation's collection.
-        // The collection must also live on the current backend: every write caller
-        // sends the bare ID to the current backend, so a collection registered on
-        // another backend would be re-created there under that backend's name
-        // (a Qdrant collection called vf_eventbase_standard_…).
-        // Returning null here is the correct outcome on a chat's first ingestion —
-        // runEventBaseIngestion then falls through to buildEventBaseCollectionId
-        // and creates this chat's own collection.
-        if (requireUuidMatch) {
-            return entry.backend === wantBackend && hasUuidMatch(entry) && (isLocked(entry) || entry.isOwn);
-        }
-        // An explicit per-chat lock is a deliberate user override: the collection
-        // is eligible regardless of ownership AND regardless of whether its
-        // embedded UUID still matches this chat. The UUID can drift from the lock
-        // after a delete + re-vectorize cycle (the chat gets a fresh UUID, but the
-        // user re-locks the old collection), or when intentionally binding another
-        // chat's EventBase here. This matches the DB Browser's lock-only "Active
-        // here" badge and the retrieval path (_gatherLockedEventBaseCollections),
-        // both of which honor the lock without a UUID check. Without this the lock
-        // resolves as ACTIVE in the UI yet auto-sync reports "no collection".
-        if (isLocked(entry)) return true;
-        // Auto-association (no lock): must be owned by the current persona AND its
-        // embedded UUID must match the current chat.
-        if (!entry.isOwn) return false;
-        return hasUuidMatch(entry);
-    };
-    const listing = getCollectionListing(settings);
-    const ebMatches = listing.filter(isEbMatch);
-
-    // Diagnostic: why each EventBase collection was/ wasn't picked. Surfaces the
-    // exact reason auto-sync sees "no collection" (e.g. lock missing, or UUID
-    // drifted after a re-vectorize and no lock to override it).
-    const logResolution = shouldLogResolution ? log.lifecycle : () => {};
-    if (shouldLogResolution && log.enabled('lifecycle')) {
-        const ebAll = listing.filter(e => {
-            const il = String(e.collectionId || '').toLowerCase();
-            return il.startsWith('vf_eventbase_') || il.includes('eventbase_');
-        });
-        const rows = ebAll.map(e =>
-            `${e.collectionId} [own=${e.isOwn} locked=${isLocked(e)} uuidMatch=${hasUuidMatch(e)} eligible=${isEbMatch(e)}]`);
-        logResolution(`[EventBase][resolve] chatUUID=${uuid} chatId=${chatId || '(none)'} requireUuidMatch=${requireUuidMatch}: ${ebAll.length} eb collection(s), ${ebMatches.length} eligible`);
-        for (const r of rows) logResolution(`[EventBase][resolve]   ${r}`);
-    }
-
-    if (ebMatches.length === 0) {
-        logResolution('[EventBase][resolve] → no eligible collection (auto-sync will report "no-collection")');
-        return null;
-    }
-
-    // Ranking tiers, most significant first: lock, then own-UUID, then current
-    // backend. The UUID tier matters when a chat has BOTH its own collection and
-    // a foreign one locked in for cross-chat retrieval — without it both score 0
-    // and the winner is decided by registry insertion order, which silently flips
-    // if a collection is ever deleted and re-registered.
-    const rank = (m) => (isLocked(m) ? 0 : 10)
-        + (hasUuidMatch(m) ? 0 : 4)
-        + (m.backend === wantBackend ? 0 : 1);
-    const active = ebMatches.slice().sort((a, b) => rank(a) - rank(b))[0];
-    logResolution(`[EventBase][resolve] → picked ${active.collectionId} (locked=${isLocked(active)} uuidMatch=${hasUuidMatch(active)})`);
-    return { collectionId: active.collectionId, registryKey: active.registryKey };
-}
-
-/**
- * Resolve the EventBase collection that ingestion may WRITE to for this chat.
- *
- * Same resolution as {@link resolveActiveEventBaseCollection} with two extra
- * requirements:
- *   - The collection's embedded chat UUID must match; a foreign lock is not
- *     enough. A lock is a read-side sharing mechanism (lock an older chat's
- *     EventBase into this chat so its events are retrieved here). Honoring it on
- *     the write side put this chat's events into that older collection, where the
- *     two chats' independent `source_window_end` values collide inside one sort
- *     frame — the injected timeline then interleaves both conversations, and
- *     Resume reads the foreign collection's tip and skips every window
- *     ("0 events extracted").
- *   - The collection must be registered on the current `vector_backend`. Write
- *     callers send the bare ID to the current backend, so a collection from the
- *     other backend would be re-created there under the wrong backend's name.
- *
- * Returns null when this chat has no collection of its own on the current
- * backend yet; the caller is expected to fall back to `buildEventBaseCollectionId`
- * and create one.
- *
- * @param {object} settings - extension_settings.vectfox
- * @param {string} [chatUUID] - defaults to the current chat's UUID
- * @param {{ shouldLogResolution?: boolean }} [options] - see resolveActiveEventBaseCollection
- * @returns {{ collectionId: string, registryKey: string } | null}
- */
-export function resolveEventBaseWriteTarget(settings, chatUUID, { shouldLogResolution = true } = {}) {
-    return resolveActiveEventBaseCollection(settings, chatUUID, { requireUuidMatch: true, shouldLogResolution });
+export function pauseCollectionAutoSync(registryKey) {
+    if (!registryKey) return;
+    setCollectionAutoSync(registryKey, false);
+    globalThis.document?.dispatchEvent(new CustomEvent('vectfox:collections-updated'));
 }
 
 // ---------------------------------------------------------------------------

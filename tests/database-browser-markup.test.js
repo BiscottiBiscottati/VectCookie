@@ -43,11 +43,11 @@ const VIEW = {
     isSelected: false,
     scope: 'chat',
     backend: 'Qdrant',
-    source: 'openrouter',
+    embedding: 'openrouter/qwen3-embedding-8b',
     model: '',
     hasMultipleModels: false,
     activeHereLine: '',
-    activationMode: 'auto',
+    canCompact: false,
     hasStoryLinks: false,
 };
 
@@ -104,7 +104,7 @@ describe('a collection in the list', () => {
         expect(entry.querySelector('.vfx-row-name').textContent).toBe('Mira\'s road');
         expect(entry.textContent).toContain('Chunks: 14');
         expect(entry.textContent).toContain(`ID: ${VIEW.id}`);
-        expect(entry.textContent).toContain('Stored in: Qdrant, embedded by openrouter');
+        expect(entry.textContent).toContain('Stored in: Qdrant, embedded by openrouter/qwen3-embedding-8b');
         expect(pillsOf(entry)).toEqual(['Chat']);
     });
 
@@ -121,12 +121,18 @@ describe('a collection in the list', () => {
         expect(pillsOf(entry)).toContain('bge-m3');
     });
 
-    it('says which lock makes it active here, and names its activation mode', () => {
+    it('says which lock makes it active here', () => {
         const line = 'Locked to this chat';
-        const entry = parse(collectionEntryMarkup({ ...VIEW, activeHereLine: line, activationMode: 'triggers' }));
-        expect(pillsOf(entry)).toEqual(expect.arrayContaining(['Active here', 'Triggers']));
+        const entry = parse(collectionEntryMarkup({ ...VIEW, activeHereLine: line }));
+        expect(pillsOf(entry)).toEqual(['Chat', 'Active here']);
         expect(entry.textContent).toContain(line);
-        expect(pillsOf(parse(collectionEntryMarkup({ ...VIEW, activationMode: 'conditions' })))).toContain('Conditions');
+    });
+
+    it('offers Compact collection, just before Delete, only to a collection it can clean', () => {
+        expect(actionsOf(parse(collectionEntryMarkup(VIEW)))).not.toContain('compact');
+        const compactable = parse(collectionEntryMarkup({ ...VIEW, canCompact: true }));
+        expect(actionsOf(compactable).slice(-2)).toEqual(['compact', 'delete']);
+        expect(compactable.querySelector('[data-collection-action="compact"]').title).toBe('Compact collection');
     });
 
     it('gets a StoryArc links row only when it holds links, reading until its count is in', () => {

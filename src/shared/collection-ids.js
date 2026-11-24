@@ -27,11 +27,15 @@ export const INTERNAL_COLLECTION_IDS = Object.freeze([
 export const COLLECTION_PREFIXES = {
     // VectFox formats
     VECTFOX_LOREBOOK: 'vf_lorebook_',
+    // Retired sources of Vectorize Content: no longer made, kept so start-up deletes what is left of them
+    // (features/collections/retired-content-collections-core.js).
     VECTFOX_CHARACTER: 'vf_character_',
     VECTFOX_DOCUMENT: 'vf_document_',
     VECTFOX_ARCHIVE_EVENT: 'vf_archiveevent_',
     VECTFOX_EVENTBASE: 'vf_eventbase_',
-    // LoreBase's per-book passage index; no timestamp, unlike the old vf_lorebook_ collections.
+    // LoreBase's vectors: each book's ID inside its account's Qdrant collection, and that collection when "One shared
+    // collection" is off (features/lorebase/lorebase-vectors-core.js). Never a collection of the registry or the
+    // Database Browser: discovery and registering skip them (getCollectionFilterReason in collection-loader.js).
     VECTFOX_LOREBASE: 'vf_lorebase_',
 };
 
@@ -39,14 +43,7 @@ export const COLLECTION_PREFIXES = {
 export const COLLECTION_TYPES = {
     CHAT: 'chat',
     LOREBOOK: 'lorebook',
-    LOREBASE: 'lorebase',
-    CHARACTER: 'character',
-    DOCUMENT: 'document',
     ARCHIVE_EVENT: 'archive_event',
-    FILE: 'file',
-    URL: 'url',
-    WIKI: 'wiki',
-    YOUTUBE: 'youtube',
     UNKNOWN: 'unknown',
 };
 
@@ -102,7 +99,7 @@ export function normalizeBackendForId(backend) {
  */
 export function getBackendFromCollectionId(collectionId) {
     if (!collectionId || typeof collectionId !== 'string') return null;
-    // Strip the registry-key prefix if present (e.g. `qdrant:vf_lorebook_...`).
+    // Strip the registry-key prefix if present (e.g. `qdrant:vf_document_...`).
     const colonIdx = collectionId.indexOf(':');
     const bare = colonIdx > 0 ? collectionId.slice(colonIdx + 1) : collectionId;
     const match = bare.match(/^vf_[^_]+_([^_]+)_/);
@@ -209,6 +206,20 @@ export function remapCollectionIdToHandle(collectionId, targetHandle) {
 export function getRegistryBackend(vectorBackend) {
     const b = String(vectorBackend || 'standard').toLowerCase();
     return b === 'standard' ? 'vectra' : b;
+}
+
+/**
+ * A backend's name as the Core page shows it, from the setting's form ('standard', 'qdrant') or the registry's
+ * ('vectra', 'qdrant'): Standard or Qdrant; any other is shown as it is.
+ *
+ * @param {string} backend
+ * @returns {string}
+ */
+export function vectorBackendName(backend) {
+    const key = String(backend || '').toLowerCase();
+    if (key === 'standard' || key === 'vectra') return 'Standard';
+    if (key === 'qdrant') return 'Qdrant';
+    return String(backend || '');
 }
 
 /**
@@ -324,9 +335,8 @@ export function sanitizeIdSegment(name, { maxLen = 30, trim = false, fallback = 
 /**
  * Sanitize a name segment for use in collection IDs (lowercase, alphanumeric +
  * underscores, length-capped). No edge-trim and no fallback word — matches the
- * positional name segment used by the lorebook/character/document builders and
- * the registry-scan matchers in collection-loader / content-vectorization /
- * world-info-integration.
+ * positional name segment of an old lorebook collection's ID, which LoreBase's
+ * old-collection cleanup reads back.
  *
  * @param {string} name
  * @param {number} maxLength
@@ -349,76 +359,6 @@ export function sanitizeNameSegment(name, maxLength) {
  */
 export function sanitizeHandleId(name) {
     return sanitizeIdSegment(name, { maxLen: 30, trim: true, fallback: 'user' });
-}
-
-/**
- * Sanitize the persona handle from the active context. Must match the logic in the eventbase /
- * archive builders so registerCollection's stamp check sees the handle in the collection name.
- */
-function _currentHandleId() {
-    return sanitizeHandleId(getContext()?.name1);
-}
-
-/**
- * Builds a lorebook collection ID following the unified protocol:
- *   vf_lorebook_<backend>_<handle>_<name>_<timestamp>
- * Backend is optional but recommended; without it the format drops the backend segment:
- *   vf_lorebook_<handle>_<name>_<timestamp>
- *
- * @param {string} lorebookName Lorebook name
- * @param {string} [backend]    Vector backend (e.g. 'qdrant', 'standard')
- * @param {number} [timestamp]  Optional timestamp, defaults to Date.now()
- * @returns {string} Collection ID
- */
-export function buildLorebookCollectionId(lorebookName, backend, timestamp) {
-    const sanitizedName = sanitizeNameSegment(lorebookName, 50);
-    const handle = _currentHandleId();
-    const normalizedBackend = normalizeBackendForId(backend);
-    const ts = timestamp || Date.now();
-    if (normalizedBackend) {
-        return `${COLLECTION_PREFIXES.VECTFOX_LOREBOOK}${normalizedBackend}_${handle}_${sanitizedName}_${ts}`;
-    }
-    return `${COLLECTION_PREFIXES.VECTFOX_LOREBOOK}${handle}_${sanitizedName}_${ts}`;
-}
-
-/**
- * Builds a character collection ID following the unified protocol:
- *   vf_character_<backend>_<handle>_<name>_<timestamp>
- *
- * @param {string} characterName Character name
- * @param {string} [backend]     Vector backend
- * @param {number} [timestamp]   Optional timestamp
- * @returns {string} Collection ID
- */
-export function buildCharacterCollectionId(characterName, backend, timestamp) {
-    const sanitizedName = sanitizeNameSegment(characterName, 50);
-    const handle = _currentHandleId();
-    const normalizedBackend = normalizeBackendForId(backend);
-    const ts = timestamp || Date.now();
-    if (normalizedBackend) {
-        return `${COLLECTION_PREFIXES.VECTFOX_CHARACTER}${normalizedBackend}_${handle}_${sanitizedName}_${ts}`;
-    }
-    return `${COLLECTION_PREFIXES.VECTFOX_CHARACTER}${handle}_${sanitizedName}_${ts}`;
-}
-
-/**
- * Builds a document collection ID following the unified protocol:
- *   vf_document_<backend>_<handle>_<name>_<timestamp>
- *
- * @param {string} documentName Document name
- * @param {string} [backend]    Vector backend
- * @param {number} [timestamp]  Optional timestamp
- * @returns {string} Collection ID
- */
-export function buildDocumentCollectionId(documentName, backend, timestamp) {
-    const sanitizedName = sanitizeNameSegment(documentName, 50);
-    const handle = _currentHandleId();
-    const normalizedBackend = normalizeBackendForId(backend);
-    const ts = timestamp || Date.now();
-    if (normalizedBackend) {
-        return `${COLLECTION_PREFIXES.VECTFOX_DOCUMENT}${normalizedBackend}_${handle}_${sanitizedName}_${ts}`;
-    }
-    return `${COLLECTION_PREFIXES.VECTFOX_DOCUMENT}${handle}_${sanitizedName}_${ts}`;
 }
 
 /**
@@ -479,18 +419,42 @@ export function buildArchiveEventCollectionId({ filenameCharName, archiveUUID, b
 // COLLECTION ID PARSER
 // ============================================================================
 
+// A chat's integrity UUID as SillyTavern makes it: 36 characters, five groups of hex digits joined by hyphens.
+const UUID_FORM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The chat UUID an EventBase or archive collection's ID holds, read from the ID after its prefix: its last segment, or
+ * the one before it when that has a UUID's form and the last has not, as a later collection of a chat ends in the time
+ * it was made (`…_{chatUUID}_mh3k2x1a`, §2.5 of InternalProject/Vectfox/plans/executed/vectfox-multi-collection-per-chat.md). A
+ * chat whose UUID is its file name (getChatUUID's fallback, for a chat with no integrity UUID, which SillyTavern gives
+ * every chat it loads) gives the ID's last segment, all of the file name only when the name holds no underscore.
+ * @param {string} rawId - The ID after its prefix
+ * @returns {string|null}
+ */
+function chatUUIDOfRawId(rawId) {
+    const segments = rawId.split('_');
+    const last = segments[segments.length - 1];
+    const beforeLast = segments.length > 1 ? segments[segments.length - 2] : '';
+    if (UUID_FORM.test(beforeLast) && !UUID_FORM.test(last)) return beforeLast;
+    return last || null;
+}
+
 /**
  * Parses any collection ID format and returns structured info
  * Handles all legacy and current formats.
  *
  * Scope mapping (must stay in sync with `getEffectiveScope`):
  *   - `vf_eventbase_*` / `vf_archiveevent_*` → 'chat'
- *   - `vf_lorebook_*` / `vf_character_*` / `vf_document_*` → 'character'
- *   - invalid input → 'unknown' (sentinel; `getEffectiveScope` falls through
+ *   - `vf_lorebook_*` → 'character'
+ *   - anything else → 'unknown' (sentinel; `getEffectiveScope` falls through
  *     to its 'character' default)
  *
+ * `chatUUID` is the chat UUID an EventBase collection's ID holds, the same for the chat's first collection and its
+ * later ones (chatUUIDOfRawId), or the archive UUID of an archive collection; null for every other collection. Every
+ * reader of a chat's UUID in an ID asks it here.
+ *
  * @param {string} collectionId Collection ID to parse
- * @returns {{type: string, rawId: string, scope: string, format: string}} Parsed info
+ * @returns {{type: string, rawId: string, scope: string, format: string, chatUUID: string|null}} Parsed info
  */
 export function parseCollectionId(collectionId) {
     if (!collectionId || typeof collectionId !== 'string') {
@@ -499,6 +463,7 @@ export function parseCollectionId(collectionId) {
             rawId: 'unknown',
             scope: COLLECTION_SCOPES.UNKNOWN,
             format: 'invalid',
+            chatUUID: null,
         };
     }
 
@@ -509,46 +474,19 @@ export function parseCollectionId(collectionId) {
             rawId: collectionId.replace(COLLECTION_PREFIXES.VECTFOX_LOREBOOK, ''),
             scope: COLLECTION_SCOPES.CHARACTER,
             format: 'vectfox',
-        };
-    }
-
-    // LoreBase index: vf_lorebase_*, locked to a chat or character like a lorebook
-    if (collectionId.startsWith(COLLECTION_PREFIXES.VECTFOX_LOREBASE)) {
-        return {
-            type: COLLECTION_TYPES.LOREBASE,
-            rawId: collectionId.replace(COLLECTION_PREFIXES.VECTFOX_LOREBASE, ''),
-            scope: COLLECTION_SCOPES.CHARACTER,
-            format: 'vectfox',
-        };
-    }
-
-    // VectFox character format: vf_character_*
-    if (collectionId.startsWith(COLLECTION_PREFIXES.VECTFOX_CHARACTER)) {
-        return {
-            type: COLLECTION_TYPES.CHARACTER,
-            rawId: collectionId.replace(COLLECTION_PREFIXES.VECTFOX_CHARACTER, ''),
-            scope: COLLECTION_SCOPES.CHARACTER,
-            format: 'vectfox',
-        };
-    }
-
-    // VectFox document format: vf_document_*
-    if (collectionId.startsWith(COLLECTION_PREFIXES.VECTFOX_DOCUMENT)) {
-        return {
-            type: COLLECTION_TYPES.DOCUMENT,
-            rawId: collectionId.replace(COLLECTION_PREFIXES.VECTFOX_DOCUMENT, ''),
-            scope: COLLECTION_SCOPES.CHARACTER,
-            format: 'vectfox',
+            chatUUID: null,
         };
     }
 
     // VectFox eventbase format: vf_eventbase_*
     if (collectionId.startsWith(COLLECTION_PREFIXES.VECTFOX_EVENTBASE)) {
+        const rawId = collectionId.replace(COLLECTION_PREFIXES.VECTFOX_EVENTBASE, '');
         return {
             type: COLLECTION_TYPES.CHAT,
-            rawId: collectionId.replace(COLLECTION_PREFIXES.VECTFOX_EVENTBASE, ''),
+            rawId,
             scope: COLLECTION_SCOPES.CHAT,
             format: 'vectfox',
+            chatUUID: chatUUIDOfRawId(rawId),
         };
     }
 
@@ -556,11 +494,13 @@ export function parseCollectionId(collectionId) {
     // Scope is 'chat' to match getEffectiveScope's documented behavior — archive
     // event collections hold chat-shaped events and belong to the chat scope.
     if (collectionId.startsWith(COLLECTION_PREFIXES.VECTFOX_ARCHIVE_EVENT)) {
+        const rawId = collectionId.replace(COLLECTION_PREFIXES.VECTFOX_ARCHIVE_EVENT, '');
         return {
             type: COLLECTION_TYPES.ARCHIVE_EVENT,
-            rawId: collectionId.replace(COLLECTION_PREFIXES.VECTFOX_ARCHIVE_EVENT, ''),
+            rawId,
             scope: COLLECTION_SCOPES.CHAT,
             format: 'vectfox',
+            chatUUID: chatUUIDOfRawId(rawId),
         };
     }
 
@@ -570,52 +510,8 @@ export function parseCollectionId(collectionId) {
         rawId: collectionId,
         scope: COLLECTION_SCOPES.UNKNOWN,
         format: 'unknown',
+        chatUUID: null,
     };
-}
-
-// ============================================================================
-// PATTERN MATCHING FOR DISCOVERY
-// ============================================================================
-
-/**
- * Builds search patterns for finding a chat's collections
- * Used by EventBase to find a chat's collections (eventbase-store.js)
- *
- * @param {string} [chatId] Chat ID (filename)
- * @param {string} [chatUUID] Chat UUID
- * @returns {string[]} Array of patterns to search for (all lowercase)
- */
-export function buildChatSearchPatterns(chatId, chatUUID) {
-    const patterns = [];
-    const uuid = chatUUID || getChatUUID();
-
-    // Primary: UUID (the unique identifier)
-    if (uuid) {
-        patterns.push(uuid.toLowerCase());
-    }
-
-    return patterns;
-}
-
-/**
- * Checks if a collection ID matches any of the given patterns
- * Case-insensitive, uses substring matching for flexibility
- *
- * @param {string} collectionId Collection ID to check
- * @param {string[]} patterns Patterns to match against
- * @returns {boolean} True if matches any pattern
- */
-export function matchesPatterns(collectionId, patterns) {
-    if (!collectionId || !patterns || patterns.length === 0) {
-        return false;
-    }
-
-    const idLower = collectionId.toLowerCase();
-
-    return patterns.some(pattern =>
-        idLower === pattern ||
-        idLower.includes(pattern)
-    );
 }
 
 /**

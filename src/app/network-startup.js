@@ -3,7 +3,8 @@
  * VectFox OFF-BOX STARTUP WORK
  * ============================================================================
  * Everything VectFox does at load time that reaches off the page — collection
- * discovery, the EventBase payload-index backfill, and the Similharity version
+ * discovery, the deletion of the old vectorized lorebook collections LoreBase
+ * replaced, the EventBase payload-index backfill, and the Similharity version
  * check. All of it talks to either Qdrant or the Similharity plugin.
  *
  * WHY THIS IS A MODULE AND NOT INLINE IN index.js
@@ -38,7 +39,7 @@
  */
 
 import { discoverExistingCollections } from '../features/collections/index.js';
-import { pruneOrphanedEventBaseChatMaps } from '../features/eventbase/index.js';
+import { deleteRetiredCollections } from './retired-collections.js';
 import { checkPluginAvailable, PLUGIN_UPDATE_INSTRUCTIONS, similharityStanding } from '../shared/similharity-plugin.js';
 import { retry } from '../shared/retry.js';
 import { log } from '../sillytavern/log.js';
@@ -128,14 +129,10 @@ export function runNetworkStartup(startupSettings) {
                 if (collections.length > 0) {
                     log.lifecycle(`VectFox: Discovered ${collections.length} existing collections`);
                 }
-                // Discovery succeeded → registry reflects reality. Sweep stale per-chat
-                // EventBase settings (marker / last-window-size / tip) for chats whose
-                // collection no longer exists. Skipped automatically on an empty registry.
-                try {
-                    pruneOrphanedEventBaseChatMaps();
-                } catch (pruneError) {
-                    log.warn('VectFox: Orphan-sweep of per-chat EventBase settings failed (non-fatal):', pruneError?.message || pruneError);
-                }
+                // The collections VectFox no longer reads go, under one notice: the old vectorized lorebooks LoreBase
+                // replaced, and those Vectorize Content made from sources it no longer reads. It needs the registry
+                // discovery just filled, and waits for SillyTavern to load; it logs its own errors.
+                deleteRetiredCollections(startupSettings);
             } catch (error) {
                 log.error('VectFox: Collection discovery failed after retries:', error.message);
                 toastr.warning(

@@ -152,7 +152,7 @@ The normal search keeps every event it found a seat for, and these searches **ad
 
 Semantic retrieval answers *"which old event is relevant to this message?"*. But every reply also needs a second, different question answered: *"what just happened over the last few turns?"* — the running thread, who's present, the deal struck two replies ago. That continuity shouldn't have to **win** a relevance contest to be remembered; it should always be there.
 
-**Summarizer Injection** does exactly that. Every turn it pulls the **most recent N extracted events** (default 20) straight off the EventBase collection — newest-first by message index — and pins them into the prompt in chronological order, each tagged with how far back it is:
+**Summarizer Injection** does exactly that. Every turn it pulls the **most recent N extracted events** (default 15) straight off the EventBase collection — newest-first by message index — and pins them into the prompt in chronological order, each tagged with how far back it is:
 
 ```
 <VectFoxSummarizer>
@@ -176,7 +176,7 @@ Once Summarizer Injection guarantees the recent thread is always in the prompt, 
 - **Scales to any chat length.** "Keep the last N raw" auto-scales — a 2,000-message chat sends roughly the same number of raw turns as a 200-message one, with everything older served from memory. Token cost stops growing with chat length.
 - **Recall is the dial.** The fewer raw turns you keep, the more the AI relies on retrieval quality — so **check your recall as you keep fewer** and stop where the model still tracks the scene cleanly.
 - **World Info stays safe.** The wipe is floored so it never blanks a message World Info needs to scan, and it auto-pauses if WI could scan the whole chat — keyword triggers keep firing at any setting.
-- **Cache-friendly batches (optional).** Set *Blank in batches of* above 1 (e.g. 10–20, with the default 10 kept raw) and the wipe boundary only advances in whole batches, so the prompt prefix stays byte-identical across turns and prompt caching (DeepSeek, etc.) can reuse it. The raw window grows up to *Messages kept verbatim + batch − 1* between jumps; make sure your context fits it. Batch size 1 keeps today's rolling behaviour.
+- **Batches for prompt caching (optional).** Set **Blank in batches of** above 1, and the blanking waits until that many messages can go, then blanks them together. So the start of your prompt stays the exact same for a few turns, and a provider that caches prompts (DeepSeek, OpenAI) bills that part as cached. Think of a bus that leaves only when it's full, not every time 1 person gets on. The cost: up to batch size − 1 extra messages stay verbatim until the next batch, so your context has to fit them. At 1, the default, blanking moves every turn.
 
 Because it leans entirely on EventBase being current, ghosting **requires Summarizer Injection** (which in turn forces the auto-sync window to 1, keeping the database one turn behind the live chat). Enable it right under Summarizer Injection in the **AutoSync** tab; default off.
 
@@ -325,7 +325,7 @@ Both signals (meaning + keywords) operate over this rich field set, so a query l
 
 ### 🧠 Summarizer Injection — guaranteed recent-turn memory
 
-Pins the most recent **N extracted events** (default 20) into every prompt, in chronological order, each labeled with its recency (`latest turn`, `3 turns ago`). Independent of — and stacked on top of — semantic retrieval, so short-term continuity is *always* present while long-term recall stays relevance-driven. With **full detail** on (default) each event carries its structured fields (cause, result, characters, locations, items, time, concepts, keywords, open threads); a character budget (default 10 000) caps the block, dropping oldest-first if it overflows so it can never blow out the model's context.
+Pins the most recent **N extracted events** (default 15) into every prompt, in chronological order, each labeled with its recency (`latest turn`, `3 turns ago`). Independent of — and stacked on top of — semantic retrieval, so short-term continuity is *always* present while long-term recall stays relevance-driven. With **full detail** on (default) each event carries its structured fields (cause, result, characters, locations, items, time, concepts, keywords, open threads); a character budget (default 10 000) caps the block, dropping oldest-first if it overflows so it can never blow out the model's context.
 
 It's the useful half of a rolling summary — *"always remind the AI what just happened"* — rebuilt on structured events instead of a lossy recursive text blob, so recent context is guaranteed without the detail loss. Requires auto-sync (forces the window to 1 turn while on, keeping the database current). **Summarizer preview** on the Action page shows the exact block that would be injected — same code path, minus the injection. Configure it in the **AutoSync** tab; default off. Needs the Similharity plugin on the Standard backend (it reads per-event metadata); works natively on Qdrant.
 
@@ -385,17 +385,17 @@ New collections auto-activate for the current chat. In a collection's settings, 
 
 ### 📡 Smarter status indicators
 
-Auto-Sync card shows whether the current chat is vectorized and how many events exist. World Info card shows vectorized lorebooks by name. Both link to the right vectorizer if something's missing.
+Auto-Sync card shows whether the current chat is vectorized and how many events exist, and links to the vectorizer if it's not. The WorldInfo page lists the lorebooks your chat loads, how many entries you picked for LoreBase in each, whether their keys and vectors are ready, and where each book is locked. Its **LoreBase tester** card shows what LoreBase did on each reply.
 
 ### 🗂️ Tabbed interface
 
-Settings split into **Core** (backend, embedding, hybrid), **EventBase** (chat hsitory/archive chat file .jsonl), **ChunkBase** (lorebook/docs/URLs/wiki), **Action** (diagnostics, dev tools).
+Settings split into **Action** (vectorization, Database Browser, diagnostics, dev tools), **Core** (backend, embedding, retrieval, hybrid), **ChatHistory** (EventBase: chat history/archive chat file .jsonl), **AutoSync** (keeps the open chat in sync), **WorldInfo** (LoreBase), **RAG** (how memory is wrapped in the prompt), **AgentMode** (the search planner) and **StoryArc** (story threads).
 
 ### ⚡ Windows at once — Vectorization Speedup
 
 Vectorizing a long chat normally processes one window at a time: send window 1 to the LLM → wait → embed → send window 2 → wait → embed → ... For a 2000-message chat that's a lot of serialized waiting.
 
-The **Windows at once** slider (the Chunking card on Vectorize Content's Chat page) lets you spawn up to **8 LLM extraction + embedding calls at the same time**. Window 1 is being extracted while windows 2–8 are also in flight, dramatically cutting total ingestion time.
+The **Windows at once** slider (the Windows card on Vectorize Content's Chat page) lets you spawn up to **8 LLM extraction + embedding calls at the same time**. Window 1 is being extracted while windows 2–8 are also in flight, dramatically cutting total ingestion time.
 
 | Slider value   | Behavior                                                                                             |
 | -------------- | ---------------------------------------------------------------------------------------------------- |
@@ -404,6 +404,16 @@ The **Windows at once** slider (the Chunking card on Vectorize Content's Chat pa
 | **5–8 (fast)** | Aggressive parallelism. Best for cloud providers with high rate limits (OpenRouter, OpenAI, vLLM). May trip rate limits on free tiers. |
 
 Use **1** if you're on a strict rate-limited free tier or a single local GPU. Crank to **8** if you're on a paid cloud provider and want a 2000-message chat ingested in minutes instead of an hour.
+
+**Regenerate links** on the **StoryArc** page has the same kind of slider, **Events at once**: how many events its link model decides at the same time, from 1 to 8. It starts at 3 each time the page opens.
+
+### 🔁 Read part of a chat again
+
+Two people writing the same story on two branches, or a stretch read with a bad model or a status panel taken for story: you can read just that part again. In Vectorize Content, set **Start from message** and **End at message**, switch on **Read windows already read again**, and press **Vectorize**. Each end snaps to the whole window that holds it.
+
+Before anything runs, a red confirm shows the messages it reads, the windows (one EventBase call each), the events those windows hold now, and both models. It shows a price only where VectFox can read the model's price (a model on OpenRouter, picked by hand); on a connection profile it shows no price, since you may run any model there.
+
+Each window's events are replaced by what the new read finds, and a window that now finds nothing loses its old events. A window whose read fails keeps its events. With StoryArc on, its links follow on the same progress panel: the new events get linked, and every event whose links pointed into that stretch is decided again. Stop keeps what's done, and the StoryArc tab's button picks up any event left.
 
 ### 🧹 Multilingual keyword quality
 
@@ -417,21 +427,13 @@ Numerous bug fixes around mixed-backend search, handle ID filtering, and other e
 
 ## 🎭 Activation Rules
 
-Each collection has activation settings: Edit collection settings on its row in the Database Browser. Activation is a chain of gates; every gate that applies must pass:
+Each collection has activation settings on its row in the Database Browser: the pause button, and the lock in Edit collection settings. Activation is a chain of gates; every gate must pass:
 
 1. **Disabled** (pause button) → never queries
-2. **Active for this chat / Active for this character** → required. A collection not locked to this chat or character never queries
-3. **Triggers**, if set → a keyword must match recent messages this turn
-4. **Advanced Conditions**, if set → the condition rules must also pass this turn
-5. **Locked, nothing else set** → queries every turn
+2. **Active for this chat** → required. A collection not locked to this chat never queries
+3. **Locked, not paused** → queries every turn
 
-Triggers and conditions only narrow a locked collection; neither can switch one on.
-
-Conditions support keywords/patterns, speaker, character-present, message/turn count, time of day, and combined AND/OR rules.
-
-> ⚠️ **Legacy feature note:** Triggers and condition-based activation are **inherited from VectHare** and kept here for backward compatibility only. **Always switch on "Active for this chat" or "Active for this character"**. That is what switches a collection on, and triggers and conditions can only narrow it further. The whole point of vector search is to let the search engine search everything. Narrowing it with keyword triggers defeats that purpose.
->
-> **CJK note:** Triggers and condition-based activation are **language-neutral** — keyword/pattern matching uses plain substring search, which works for Chinese/Japanese/Korean the same as English. (Only user-written regex with ASCII `\b` boundaries won't fire across CJK — use plain substrings or `\p{L}` + the `u` flag.)
+> 💡 **"Active for this chat" is what switches a collection on.** Vectorizing a chat locks its own collection to it. A collection made from an uploaded chat file is locked to no chat: switch it on in each chat that should read it.
 
 ---
 
@@ -478,7 +480,7 @@ That's it! VectFox will be downloaded and enabled automatically.
 | Event search & injection                  | ✅ Full functionality               | ✅ Full functionality           | ✅ Full functionality                                                             |
 | Summarizer Injection (recent-turn memory) | ❌ Needs per-event metadata         | ✅ Available                    | ✅ Available                                                                      |
 | Embedding & vectorization                 | ⚠️ Not on a llama.cpp, KoboldCPP or Custom profile | ✅ Works                        | ✅ Works                                                                          |
-| Keywords stored in DB (boost search)      | ❌ Saved to local settings only     | ✅ Stored in vector DB          | ✅ Stored in vector DB                                                            |
+| Keywords stored in DB (boost search)      | ✅ Kept in each event's text        | ✅ Stored in vector DB          | ✅ Stored in vector DB                                                            |
 | Event importance score                    | ❌ Lost (native API drops metadata) | ⚠️ Stored, not used in re-rank | ✅ Stored & used in re-rank                                                       |
 | View Chunks in Database Browser           | ❌ Not available                    | ✅ Available                    | ✅ Available                                                                      |
 | Edit individual chunks                    | ❌ Not available                    | ✅ Available                    | ✅ Available                                                                      |
@@ -486,7 +488,7 @@ That's it! VectFox will be downloaded and enabled automatically.
 | Scales to large datasets                  | ⚠️ Degrades on long story          | ⚠️ Degrades on long story      | ✅ 10 k+ messages, stays fast                                                     |
 | Setup                                     | None                                | Plugin install                  | Plugin install + Free cloud account **or** [local install](Doc/Qdrant_install.md) |
 
-On the Standard backend without the plugin, event search and injection still work. You just don't get chunk inspection, keyword metadata, or embedding on a llama.cpp, KoboldCPP or Custom profile. For the best retrieval quality, I strongly recommend **Qdrant**. The free cloud tier at https://qdrant.tech/ needs no local setup at all.
+On the Standard backend without the plugin, event search and injection still work. You just don't get Summarizer Injection, event importance, chunk inspection, or embedding on a llama.cpp, KoboldCPP or Custom profile. For the best retrieval quality, I strongly recommend **Qdrant**. The free cloud tier at https://qdrant.tech/ needs no local setup at all.
 
 #### First-time on Windows? Install Git and Node.js first
 
@@ -546,14 +548,23 @@ You need 2 profiles: one for embedding, and one for the model that writes events
 5. **EventBase model.** Set **Provider** to **SillyTavern profile**, pick a chat profile in **Profile**, and press **Test connection**. This model writes the events when you vectorize.
    - Any profile SillyTavern can chat on works. VectFox sends its own prompts, so the profile's preset is not used.
    - **Recommended models:** for a cheap and fast extraction, `openai/gpt-4o-mini` or `google/gemini-3.1-flash-lite`. If you want better extraction and don't mind paying more, `x-ai/grok-4.3` is stronger. Model IDs change over time, so check the exact ID on OpenRouter before a long run. An old ID such as `x-ai/grok-4.1-fast` can come back as a 404.
-6. **Keywords.** Pick your story's language in **CJK tokenizer**. Pick it before you vectorize, and stick with it (see the FAQ).
+6. **Keywords.** Pick your story's language in **CJK tokenizer**. Pick it before you vectorize, and stick with it (see the FAQ). Whatever you pick, events are written in the chat's own language. The tokenizer only changes how keywords are split.
 7. Most other settings work fine on default. Feel free to tweak.
 8. **Vectorize your chat once.** Open your chat, go to the **Action** page, press **Vectorize content**, pick **Chat**, then press **Vectorize**. You **HAVE** to do this to build your first DB.
 9. **Keep it in sync.** Turn on **Auto-sync this chat** on the **AutoSync** page if you want it automatic. **Turns** sets how many turns go into each run. Or press **Sync chat** on the **Action** page to catch up by hand.
-10. (Optional) Vectorize your lorebook in **Vectorize content** > **Lorebook**, and set it up on the **WorldInfo** page.
+10. (Optional) Let LoreBase pick your lorebook entries. On the **WorldInfo** page, set up the **LoreBase model** card: its notice names anything still missing. Press **Choose entries**, turn on the entries you want LoreBase to decide, and close the screen. Then turn on **Use LoreBase**. It stays off until the model that picks each reply's entries is set: Jev's profile on **Fast and Cheap [Jev]**, the LoreBase model on **High Accuracy**. VectFox asks to write the entries' keys and vectors, and once their keys are written, the book locks to your chat. [Doc/lorebase-choose-entries.md](Doc/lorebase-choose-entries.md) explains every button on that screen, and how each choice picks.
+   - LoreBase keeps each entry's keys and vectors in Qdrant, so it needs Qdrant as the vector backend and VectFox's embedding model. **Fast and Cheap [Jev]**, the default, also needs a SillyTavern profile for Jev, a small model that rates every entry for each reply. **High Accuracy** has the LoreBase model pick the entries and cut each one down to the parts the reply needs.
+   - Your chat doesn't load the book yet? **Add a lorebook**, under the books, adds it to this chat as its Chat Lorebook, or to this character.
+   - If SillyTavern's **Vector Storage** has **Enabled for World Info** on, VectFox asks to turn it off. Vector Storage sends lorebook entries by its own search, so it would send the entries you gave LoreBase in full, even when LoreBase leaves them out. If you keep it on, LoreBase stays off. Vector Storage's chat and file search stay as they are.
+   - The **LoreBase tester** card on the same page shows what LoreBase did on each reply. You see what was picked and why, which parts of each entry went in, and how many tokens that was next to what SillyTavern's keys would send. So if a reply forgot something, you can check if LoreBase left it out. It keeps your replies until you reload the page.
+   - In the prompt, everything LoreBase sends sits inside a `<VectLorebook>` block, each entry in a tag named after it, so you and the AI can tell it apart from SillyTavern's own entries.
+   - The **Database Browser** lists each book's LoreBase keys and vectors, each with Export, Import and Delete. The vectors row's **View chunks** opens its chunks like a chat collection's. A chunk itself is read only, but its **Edit entry** edits the lorebook entry it came from, then writes that entry's vectors again. Export your keys once, since each one costs a LoreBase model call to write, and Import puts them back with no LLM call. [Doc/lorebase-choose-entries.md](Doc/lorebase-choose-entries.md) has the details.
+   - If you vectorized lorebooks with an older VectFox, those old collections can't work with LoreBase, so VectFox deletes them once at start and shows which books they came from. Their old vectors aren't needed: LoreBase writes its own keys and vectors for the entries you choose. Until you set those books up as above, they keep working as plain SillyTavern lorebooks. A chat or character lock on an old collection moves to its book.
 11. (Optional) Turn on **Agent Mode** on the **AgentMode** page once everything else works. Leave **Provider** on **Same as EventBase model**, and the planner runs on the EventBase model's profile. So the same cheap, fast model from step 5 also drives the planner. See "How It Works" > "Agent Mode" above for what it does.
 
 **Manual OpenRouter and vLLM are going away.** They are still in the Provider dropdowns and work like before, with their own key boxes. But a VectFox release 3 months after the one that brought SillyTavern profiles removes them. If you still use one, VectFox tells you once, and lists every dropdown to move.
+
+**Disabled** is the first choice in the Profile dropdown of each model: EventBase model, Agent Mode, StoryArc, LoreBase and Jev. Pick it to clear that model's profile, so it isn't called at all. Anything that needs the model then stops and tells you it has no profile, the same as before you chose one.
 
 ---
 
@@ -583,15 +594,10 @@ Look for the update notification in the Extensions panel, or manually check with
 
 ## ❓ FAQ
 
-**Why are there two separate pipelines under the hood?**
-Internally VectFox routes content through one of two retrieval paths, picked by content type:
+**What does VectFox search?**
+Your chat history, through EventBase: the live chat and uploaded `.jsonl` chat files, stored as events. Each reply searches the event collections locked to its chat.
 
-| Pipeline             | What it handles                                                                              |
-| -------------------- | -------------------------------------------------------------------------------------------- |
-| **EventBase**        | Your chat history (live chat + uploaded`.jsonl` archives)                                    |
-| **Standard (Chunk)** | Everything else: Lorebook, Character Cards, URLs, documents, wiki pages, YouTube transcripts |
-
-They never see each other's content — so the same chat message can't get retrieved twice (once as an event and once as a raw chunk). You don't normally need to think about this; it just means EventBase owns chat, and the standard chunk pipeline owns everything else.
+Your lorebooks only through LoreBase, and only the entries you turned on: on **Fast and Cheap [Jev]**, a reply searches their vectors when the books locked to the chat or its character hold more than 100 ready entries. LoreBase picks the entries a reply needs, and SillyTavern's own World Info sends them.
 
 **Can I change the CJK tokenizer mid-chat?**
 No — don't do it. The CJK tokenizer is **locked into each Qdrant collection at upsert time** via a sentinel point. Switching modes after you've already vectorized content will trigger a "Tokenizer mismatch" warning modal on the next query, and your only real options are:
@@ -600,9 +606,6 @@ No — don't do it. The CJK tokenizer is **locked into each Qdrant collection at
 2. **Re-vectorize the collection from scratch** with the new mode (throw away all extracted events and start over).
 
 Pick your tokenizer mode *before* you start vectorizing a chat and stick with it. There's no in-place migration — sparse vectors were tokenized with the original mode, so they're incompatible with a different tokenizer's output.  Pick your embedding model *before* you start vectorizing a chat and stick with it.
-
-**Can I use triggers/conditions on Chinese/Japanese/Korean chats?**
-Yes. Keyword/pattern matching uses plain substring search, so it works for CJK the same as English. The only caveat is user-written regex using ASCII `\b` word boundaries (which don't fire between CJK characters) — use plain substrings or Unicode `\p{L}` with the `u` flag. Numeric conditions (Message Count / Turn Count) are always language-independent.
 
 **How do I delete a collection safely?**
 **ALWAYS use the Database Browser inside VectFox** (Action page → Database Browser → "Open browser") to delete collections. Click the red trash button on the collection's row. This properly cleans up both the vector database **and** VectFox's internal registry + metadata. Never delete collections manually from Qdrant's web UI or by editing SillyTavern's `settings.json` — doing so leaves orphaned metadata that causes sync conflicts, "collection not found" errors, and other strange behavior.
@@ -664,13 +667,13 @@ A couple of gotchas:
 
 **"No embeddings available"**: open VectFox, go to **Core** > **Embedding** and press **Test connection**. On a profile, the readout under **Profile** says what the server needs. Then run **Diagnostics** on the **Action** page, which checks the plugin, the backend and the embedding call.
 
-**Events/chunks not retrieved** — Open the chat first, not SillyTavern's lobby. Open the Database Browser and find the chat's collection. Its row should say "Locked to this chat". If it doesn't, open the collection's settings and switch on "Active for this chat".
+**Events not retrieved** — Open the chat first, not SillyTavern's lobby. Open the Database Browser and find the chat's collection. Its row should say "Locked to this chat". If it doesn't, open the collection's settings and switch on "Active for this chat".
 
-**"What would the AI actually recall for this message?"** — Press **Test a query** on the Action page. Type any message and run it: Diagnostics shows what EventBase, ChunkBase and Lorebook WI would inject for it, and why one finds nothing, without sending anything to the chat. Useful for tuning thresholds and checking that important events are in.
+**"What would the AI actually recall for this message?"** — Press **Test a query** on the Action page. Type any message and run it: Diagnostics shows what EventBase would inject for it, or why it finds nothing, without sending anything to the chat. Useful for tuning thresholds and checking that important events are in.
 
 **"Backend health check failed"** — On Qdrant, make sure the Qdrant server is running and the Similharity plugin is installed.
 
-**Slow performance** — Switch to Qdrant + A3 (single round-trip, server-side fusion). Lower **Events per reply** on the EventBase page. Use API embedding providers (parallel) instead of local GPU (sequential).
+**Slow performance** — Switch to Qdrant + A3 (single round-trip, server-side fusion). Lower **Events per reply** on the ChatHistory page. Use API embedding providers (parallel) instead of local GPU (sequential).
 
 **Vectorization is slow on large chat histories** — VectFox applies API rate limiting by default (60 calls per 60 seconds) to protect free-tier backends. To speed up vectorization: **Core page → Embedding → Rate limit → set "Max calls" to 0 to disable**. For production Qdrant, you can increase it to 100+ calls/min depending on your server capacity.
 

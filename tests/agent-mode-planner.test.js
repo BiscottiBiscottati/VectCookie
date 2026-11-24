@@ -20,6 +20,8 @@ vi.mock('../src/features/vector-backend/index.js', () => ({
     getBackend: vi.fn(),
 }));
 vi.mock('../src/features/collections/index.js', () => ({ getCollectionMeta: () => ({}), setCollectionMeta: vi.fn() }));
+// A search text is one piece here; tests/search-pieces-core.test.js covers the cutting.
+vi.mock('../src/features/embedding/index.js', () => ({ searchPieces: text => (String(text ?? '').trim() ? [text] : []) }));
 
 const retrieveEventsMock = vi.fn();
 vi.mock('../src/features/eventbase/eventbase-retrieval.js', async (importOriginal) => ({
@@ -30,16 +32,23 @@ vi.mock('../src/features/eventbase/eventbase-retrieval.js', async (importOrigina
 const postChatCompletionMock = vi.fn();
 const checkConnectionProfileMock = vi.fn();
 const sendConnectionTestMock = vi.fn();
-vi.mock('../src/features/llm-provider/index.js', async () => ({
-    postChatCompletion: (...args) => postChatCompletionMock(...args),
-    resolveModelParameterStyle: () => ({ sendTemperature: true, reasoningEffort: 'none' }),
-    // The real rule, so the tests of the planner's connection read what ships.
-    resolveInheritedConnection: (await import('../src/features/llm-provider/inherited-connection.js')).resolveInheritedConnection,
-    resolveConnectionProfileId: (await import('../src/features/llm-provider/connection-profile-core.js')).resolveConnectionProfileId,
-    checkConnectionProfile: (...args) => checkConnectionProfileMock(...args),
-    sendConnectionTest: (...args) => sendConnectionTestMock(...args),
-    LlmCallError: class LlmCallError extends Error {},
-}));
+// The real connection check reads the profile through this mock.
+vi.mock('../src/features/llm-provider/llm-provider-call.js', () => ({ checkConnectionProfile: (...args) => checkConnectionProfileMock(...args) }));
+vi.mock('../src/features/llm-provider/index.js', async () => {
+    const connection = await import('../src/features/llm-provider/llm-connection.js');
+    return {
+        postChatCompletion: (...args) => postChatCompletionMock(...args),
+        resolveModelParameterStyle: () => ({ sendTemperature: true, reasoningEffort: 'none' }),
+        // The real rules, so the tests of the planner's connection read what ships.
+        resolveInheritedConnection: (await import('../src/features/llm-provider/inherited-connection.js')).resolveInheritedConnection,
+        resolveConnectionProfileId: (await import('../src/features/llm-provider/connection-profile-core.js')).resolveConnectionProfileId,
+        resolveLlmConnection: connection.resolveLlmConnection,
+        shownVllmUrl: connection.shownVllmUrl,
+        describeConnectionProblem: connection.describeConnectionProblem,
+        sendConnectionTest: (...args) => sendConnectionTestMock(...args),
+        LlmCallError: class LlmCallError extends Error {},
+    };
+});
 
 const EARLIER_CHAT = [{ is_user: true, name: 'Rin', mes: 'an earlier line' }];
 const chatState = vi.hoisted(() => ({ chat: null }));
@@ -248,7 +257,6 @@ describe('Agent Mode failures', () => {
         expect(describeLlmSetupProblem('Agent Mode', 'missing_model')).toContain('has no model. Set Model on the AgentMode page');
         expect(describeLlmSetupProblem('Agent Mode', 'missing_openrouter_api_key')).toContain('no OpenRouter key is saved');
         expect(describeLlmSetupProblem('Agent Mode', 'missing_vllm_url')).toContain('vLLM with no URL');
-        expect(describeLlmSetupProblem('Agent Mode', 'missing_vllm_api_key')).toContain('no vLLM key is saved');
         expect(describeLlmSetupProblem('Agent Mode', 'unknown_provider_mystery')).toContain('provider "mystery" is not one VectFox knows');
         for (const reason of ['missing_model', 'unknown_provider_mystery', 'a_reason_added_later']) {
             expect(describeLlmSetupProblem('Agent Mode', reason)).toMatch(/^Agent Mode is on, but .+ Until then each turn uses the normal memory search only\.$/);

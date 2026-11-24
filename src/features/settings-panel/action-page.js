@@ -4,8 +4,8 @@
  * ============================================================================
  * Wires the settings panel's Action page (action-page-markup.js): the master switch and
  * its pills, the notice the other pages show while VectFox is off, the buttons that open
- * VectFox's tools, the console's debug switches, and the danger zone's Purge and Clean up,
- * each behind a confirm dialog.
+ * VectFox's tools, the console's debug switches, and the danger zone's Purge everything,
+ * Clean up corrupted and Clean up locks (lock-cleanup.js), each behind a confirm dialog.
  * ============================================================================
  */
 
@@ -15,14 +15,13 @@ import { log } from '../../sillytavern/log.js';
 import { isVectFoxEnabled } from '../../shared/feature-gate.js';
 import { progressTracker } from '../../shared/progress-tracker.js';
 import { textarea } from '../../shared/gui-dna/gui-dna-core.js';
-import { clearInterceptorPrompts, openContentVectorizer, syncOpenChat } from '../chunkbase/index.js';
 import { cleanupCorruptedCollections, deleteVectorsFolder } from '../collections/index.js';
 import { openDatabaseBrowser } from '../database-browser/index.js';
 import { openDiagnostics, refreshHealthPill } from '../diagnostics/index.js';
-import { buildSummarizerInjection, refreshWorldInfoEntryDepthCache } from '../eventbase/index.js';
+import { buildSummarizerInjection, clearInterceptorPrompts, openContentVectorizer, refreshWorldInfoEntryDepthCache, syncOpenChat } from '../eventbase/index.js';
 import { openTextCleaningDialog } from '../text-cleaning/index.js';
-import { clearLorebookPrompt } from '../world-info/index.js';
 import { ACTION_PAGE_ELEMENT_ID as ID, DEBUG_SWITCHES } from './action-page-markup.js';
+import { cleanUpLocks } from './lock-cleanup.js';
 import { VECTFOX_OFF_NOTICE_HOOK, VECTFOX_TURN_ON_HOOK } from './panel-shell-markup.js';
 
 const TOAST_TITLE = 'VectFox';
@@ -31,6 +30,7 @@ const TOAST_TITLE = 'VectFox';
 const SUMMARIZER_EMPTY_REASONS = {
     'no-chat': { text: 'No chat is open.' },
     'no-collection': { text: 'This chat has no EventBase collection yet. Vectorize it first.' },
+    paused: { text: 'Its collection in use is paused in the Database Browser.' },
     'no-events': { text: 'Its collection holds no events yet.' },
     'backend-error': { text: 'The vector backend did not answer:' },
     'listchunks-error': { text: 'Its collection could not be read:' },
@@ -142,7 +142,8 @@ async function previewSummarizerInjection(settings) {
     await noticePopup([
         { text: 'Summarizer preview' },
         { text: 'Nothing would be injected this turn.' },
-        reason ? { text: reason.text, name: result.error } : { text: 'Reason:', name: result.reason },
+        // A chat with collections and none in use: why, in the words every reader of it gives (collectionInUse).
+        result.problem ? { text: result.problem } : reason ? { text: reason.text, name: result.error } : { text: 'Reason:', name: result.reason },
         ...offLine,
     ]);
 }
@@ -176,7 +177,6 @@ export function wireActionPage(settings, { refreshAutoSyncCheckbox, runNetworkSt
                 // Take every VectFox block out of the prompt now. ST keeps extension prompts until they are
                 // overwritten, and quiet generations skip the interceptor that would otherwise clear them.
                 clearInterceptorPrompts(settings);
-                clearLorebookPrompt(settings);
                 await refreshAutoSyncCheckbox(settings);
                 return;
             }
@@ -240,4 +240,5 @@ export function wireActionPage(settings, { refreshAutoSyncCheckbox, runNetworkSt
 
     $(`#${ID.purge}`).on('click', () => purgeEverything());
     $(`#${ID.cleanupCorrupted}`).on('click', () => cleanUpCorruptedCollections());
+    $(`#${ID.cleanupLocks}`).on('click', () => cleanUpLocks());
 }

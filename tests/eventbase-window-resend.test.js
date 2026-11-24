@@ -23,7 +23,6 @@ vi.mock('../src/shared/collection-ids.js', () => ({
     getChatUUID: () => 'resend-uuid', parseRegistryKey: (k) => ({ collectionId: k }),
     COLLECTION_PREFIXES: { VECTFOX_ARCHIVE_EVENT: 'vf_archiveevent_', VECTFOX_EVENTBASE: 'vf_eventbase_' },
     buildRegistryKey: (id) => `qdrant:${id}`, buildEventBaseCollectionId: () => 'vf_eventbase_resend', getRegistryBackend: () => 'qdrant',
-    buildChatSearchPatterns: () => [], matchesPatterns: () => false,
 }));
 vi.mock('../src/features/collections/collection-loader.js', () => ({ getCollectionRegistry: () => [], registerCollection: vi.fn(), getCollectionListing: vi.fn() }));
 vi.mock('../src/features/vector-backend/vector-api.js', () => ({
@@ -45,6 +44,17 @@ vi.mock('../src/features/eventbase/eventbase-extractor.js', () => ({
     }),
 }));
 vi.mock('../src/features/eventbase/generation-rate-limiter.js', () => ({ generationRateLimiter: { execute: (run) => run() }, generationRateLimitSettings: () => ({}) }));
+// The chat's collections: the run's collection is put in use in the chat (eventbase-collection-in-use.test.js holds the rule).
+vi.mock('../src/features/eventbase/eventbase-chat-collections.js', async () => {
+    const { setCollectionMeta } = await import('../src/features/collections/collection-metadata.js');
+    return {
+        collectionInUse: () => ({ collection: null, reason: 'no-collection', collections: [], lockedElsewhere: [] }),
+        noCollectionInUseText: () => null, resolveEventBaseRunTarget: () => null,
+        sharedCollectionsLockedHere: () => ({ otherChats: [], archives: [] }),
+        // In use in the chat: scoped to chats, as the real one leaves it.
+        useChatCollection: vi.fn(registryKey => setCollectionMeta(registryKey, { scope: 'chat' })),
+    };
+});
 vi.mock('../src/features/eventbase/eventbase-store.js', async (importOriginal) => ({
     ...(await importOriginal()),
     insertEvents: vi.fn(async (events) => { state.points.push(...events); }),
@@ -55,9 +65,11 @@ vi.mock('../src/features/vector-backend/backend-registry.js', () => ({
 vi.mock('../src/features/eventbase/eventbase-retrieval.js', () => ({ retrieveEvents: vi.fn() }));
 vi.mock('../src/features/eventbase/agentic-retrieval.js', () => ({ retrieveEventsForTurn: vi.fn() }));
 vi.mock('../src/features/eventbase/eventbase-injection.js', () => ({ formatEventsForInjectionDetailed: vi.fn() }));
-vi.mock('../src/features/collections/collection-metadata.js', () => ({
+// The real records, where each collection keeps its pointer; locks and pauses are left out.
+vi.mock('../src/features/collections/collection-metadata.js', async (importOriginal) => ({
+    ...(await importOriginal()),
     isCollectionEnabled: () => true, isCollectionActiveForContextAnyKey: () => true,
-    setCollectionLock: vi.fn(), setCollectionMeta: vi.fn(), getChatLockedCollections: () => [],
+    setCollectionLock: vi.fn(), getChatLockedCollections: () => [],
 }));
 vi.mock('../src/shared/progress-tracker.js', () => ({ progressTracker: new Proxy({}, { get: () => () => {} }) }));
 vi.mock('../src/sillytavern/log.js', () => ({ log: { lifecycle: vi.fn(), verbose: vi.fn(), trace: vi.fn(), warn: vi.fn(), error: vi.fn(), enabled: () => false } }));
@@ -70,7 +82,7 @@ vi.mock('../../../../textgen-settings.js', () => ({}));
 vi.mock('../../../../utils.js', () => ({}));
 
 const { runEventBaseIngestion, isChatFullyVectorized } = await import('../src/features/eventbase/eventbase-workflow.js');
-const { getUnfinishedWindowFingerprints, clearExtractionCachesForChat } = await import('../src/features/eventbase/eventbase-store.js');
+const { getUnfinishedWindowFingerprints, clearExtractionCaches, writeEventBaseProgress } = await import('../src/features/eventbase/eventbase-store.js');
 const { EventBaseFatalError, EventBaseExtractionError } = await import('../src/features/eventbase/eventbase-schema.js');
 
 const SETTINGS = { eventbase_window_size: 2, eventbase_window_overlap: 0, eventbase_min_importance_store: 1, eventbase_autosync_window_turns: 1 };
@@ -81,22 +93,29 @@ const buildChat = (count) => Array.from({ length: count }, (_, i) => ({
 }));
 
 const extractionError = () => new EventBaseExtractionError('EventBase: model reply could not be used');
+const rejection = () => Object.assign(
+    new EventBaseExtractionError('EventBase: profile "Harbor" rejected the request — Bad Request'),
+    { rejectionCauses: 'Common causes: a parameter.' },
+);
 
 let chatNumber = 0;
 const newChatUUID = () => `resend-uuid-${++chatNumber}`;
+/** Each chat reads into a collection of its own, so no test sees another's pointer. */
+const collectionIdOf = chatUUID => `vf_eventbase_resend_${chatUUID}`;
+const collectionKeyOf = chatUUID => `qdrant:${collectionIdOf(chatUUID)}`;
 
 const manualRun = (messages, chatUUID, options = {}) => runEventBaseIngestion({
     messages, chatUUID, settings: SETTINGS, isAutoSync: false, parallelWindows: 8,
-    collectionIdOverride: 'vf_eventbase_resend', ...options,
+    collectionIdOverride: collectionIdOf(chatUUID), ...options,
 });
 
 const autoSyncRun = (messages, chatUUID) => runEventBaseIngestion({
     messages, chatUUID, settings: SETTINGS, isAutoSync: true, parallelWindows: 8,
-    collectionIdOverride: 'vf_eventbase_resend', windowSizeOverride: WINDOW_SIZE, windowOverlapOverride: 0,
+    collectionIdOverride: collectionIdOf(chatUUID), windowSizeOverride: WINDOW_SIZE, windowOverlapOverride: 0,
 });
 
 const sendsOf = (windowStart) => state.sends.filter(start => start === windowStart).length;
-const unfinishedCount = (chatUUID) => getUnfinishedWindowFingerprints(chatUUID, WINDOW_SIZE).size;
+const unfinishedCount = (chatUUID) => getUnfinishedWindowFingerprints(collectionKeyOf(chatUUID), WINDOW_SIZE).size;
 
 describe('window re-send', () => {
     /** Delays the run asked for, in order. Each wait ends at once so the tests stay fast. */
@@ -186,6 +205,26 @@ describe('window re-send', () => {
             expect(result.windowsFailed).toBe(1);
             expect(result.firstFailureDetail).toContain('could not be used');
             expect(globalThis.toastr.error).not.toHaveBeenCalled();
+        });
+
+        it('hands a rejection\'s causes to whoever reports the run when the window keeps failing', async () => {
+            state.failureFor = (start) => (start === 2 ? rejection() : null);
+
+            const result = await manualRun(buildChat(8), newChatUUID());
+
+            expect(result.windowsFailed).toBe(1);
+            expect(result.rejectionCauses).toBe('Common causes: a parameter.');
+        });
+
+        // A provider rejected one window once and took it on the next send: nothing is left to report.
+        it('forgets a rejection the window got past on a later send', async () => {
+            state.failureFor = (start, sendNumber) => (start === 2 && sendNumber === 1 ? rejection() : null);
+
+            const result = await manualRun(buildChat(8), newChatUUID());
+
+            expect(result.windowsFailed).toBe(0);
+            expect(result.rejectionCauses).toBeNull();
+            expect(globalThis.toastr.warning).not.toHaveBeenCalled();
         });
 
         it('sends a timed-out window again', async () => {
@@ -375,7 +414,7 @@ describe('window re-send', () => {
             const chat = buildChat(8);
             state.failureFor = (start) => (start === 2 ? extractionError() : null);
             await manualRun(chat, chatUUID);
-            state.extensionSettings.vectfox.eventbase_autosync_start_marker = { [chatUUID]: 8 };
+            writeEventBaseProgress(collectionKeyOf(chatUUID), { autoSyncStartMarker: 8 });
 
             state.sends.length = 0;
             state.failureFor = () => null;
@@ -396,11 +435,11 @@ describe('window re-send', () => {
             const chat = buildChat(8);
             state.failureFor = (start) => (start === 2 ? extractionError() : null);
             await manualRun(chat, chatUUID);
-            expect(isChatFullyVectorized(chat, SETTINGS, chatUUID, WINDOW_SIZE, 0)).toBe(false);
+            expect(isChatFullyVectorized(chat, SETTINGS, collectionKeyOf(chatUUID), WINDOW_SIZE, 0)).toBe(false);
 
             state.failureFor = () => null;
             await manualRun(chat, chatUUID);
-            expect(isChatFullyVectorized(chat, SETTINGS, chatUUID, WINDOW_SIZE, 0)).toBe(true);
+            expect(isChatFullyVectorized(chat, SETTINGS, collectionKeyOf(chatUUID), WINDOW_SIZE, 0)).toBe(true);
         });
 
         it('applies only to the window size it was recorded under', async () => {
@@ -408,8 +447,8 @@ describe('window re-send', () => {
             state.failureFor = (start) => (start === 2 ? extractionError() : null);
             await manualRun(buildChat(8), chatUUID);
 
-            expect(getUnfinishedWindowFingerprints(chatUUID, 2).size).toBe(1);
-            expect(getUnfinishedWindowFingerprints(chatUUID, 4).size).toBe(0);
+            expect(getUnfinishedWindowFingerprints(collectionKeyOf(chatUUID), 2).size).toBe(1);
+            expect(getUnfinishedWindowFingerprints(collectionKeyOf(chatUUID), 4).size).toBe(0);
         });
 
         it('is dropped with the other extraction caches', async () => {
@@ -417,7 +456,7 @@ describe('window re-send', () => {
             state.failureFor = (start) => (start === 2 ? extractionError() : null);
             await manualRun(buildChat(8), chatUUID);
 
-            clearExtractionCachesForChat(chatUUID);
+            clearExtractionCaches(collectionKeyOf(chatUUID));
 
             expect(unfinishedCount(chatUUID)).toBe(0);
         });

@@ -20,7 +20,6 @@ vi.mock('../src/shared/collection-ids.js', () => ({
     getChatUUID: () => 'popup-uuid', parseRegistryKey: (k) => ({ collectionId: k }),
     COLLECTION_PREFIXES: { VECTFOX_ARCHIVE_EVENT: 'vf_archiveevent_', VECTFOX_EVENTBASE: 'vf_eventbase_' },
     buildRegistryKey: (id) => `qdrant:${id}`, buildEventBaseCollectionId: () => 'vf_eventbase_popup', getRegistryBackend: () => 'qdrant',
-    buildChatSearchPatterns: () => [], matchesPatterns: () => false,
 }));
 vi.mock('../src/features/collections/collection-loader.js', () => ({ getCollectionRegistry: () => [], registerCollection: vi.fn(), getCollectionListing: vi.fn() }));
 vi.mock('../src/features/vector-backend/vector-api.js', () => ({
@@ -37,6 +36,17 @@ vi.mock('../src/features/eventbase/eventbase-extractor.js', () => ({
     }]),
 }));
 vi.mock('../src/features/eventbase/generation-rate-limiter.js', () => ({ generationRateLimiter: { execute: (run) => run() }, generationRateLimitSettings: () => ({}) }));
+// The chat's collections: the run's collection is put in use in the chat (eventbase-collection-in-use.test.js holds the rule).
+vi.mock('../src/features/eventbase/eventbase-chat-collections.js', async () => {
+    const { setCollectionMeta } = await import('../src/features/collections/collection-metadata.js');
+    return {
+        collectionInUse: () => ({ collection: null, reason: 'no-collection', collections: [], lockedElsewhere: [] }),
+        noCollectionInUseText: () => null, resolveEventBaseRunTarget: () => null,
+        sharedCollectionsLockedHere: () => ({ otherChats: [], archives: [] }),
+        // In use in the chat: scoped to chats, as the real one leaves it.
+        useChatCollection: vi.fn(registryKey => setCollectionMeta(registryKey, { scope: 'chat' })),
+    };
+});
 vi.mock('../src/features/eventbase/eventbase-store.js', async (importOriginal) => ({
     ...(await importOriginal()),
     insertEvents: vi.fn(async (events) => { state.points.push(...events); }),
@@ -48,9 +58,11 @@ vi.mock('../src/features/eventbase/eventbase-retrieval.js', () => ({ retrieveEve
 vi.mock('../src/features/eventbase/agentic-retrieval.js', () => ({ retrieveEventsForTurn: vi.fn() }));
 vi.mock('../src/features/eventbase/story-arc-links.js', () => ({ linkNewStoryEvents: (...args) => linkNewStoryEventsMock(...args) }));
 vi.mock('../src/features/eventbase/eventbase-injection.js', () => ({ formatEventsForInjectionDetailed: vi.fn() }));
-vi.mock('../src/features/collections/collection-metadata.js', () => ({
+// The real records, where each collection keeps its pointer; locks and pauses are left out.
+vi.mock('../src/features/collections/collection-metadata.js', async (importOriginal) => ({
+    ...(await importOriginal()),
     isCollectionEnabled: () => true, isCollectionActiveForContextAnyKey: () => true,
-    setCollectionLock: vi.fn(), setCollectionMeta: vi.fn(), getChatLockedCollections: () => [],
+    setCollectionLock: vi.fn(), getChatLockedCollections: () => [],
 }));
 vi.mock('../src/shared/progress-tracker.js', () => ({ progressTracker: new Proxy({}, { get: () => () => {} }) }));
 vi.mock('../src/sillytavern/log.js', () => ({ log: { lifecycle: vi.fn(), verbose: vi.fn(), trace: vi.fn(), warn: vi.fn(), error: vi.fn(), enabled: () => false } }));
@@ -65,6 +77,8 @@ vi.mock('../../../../utils.js', () => ({}));
 const { runEventBaseIngestion } = await import('../src/features/eventbase/eventbase-workflow.js');
 
 const COLLECTION = 'vf_eventbase_links';
+/** Each chat reads into a collection of its own, so no test sees another's pointer. */
+const collectionIdOf = chatUUID => `${COLLECTION}_${chatUUID}`;
 const buildChat = (count) => Array.from({ length: count }, (_, i) => ({
     name: i % 2 === 0 ? 'User' : 'Bot', is_user: i % 2 === 0, mes: `message ${i}`,
 }));
@@ -72,7 +86,7 @@ const ingest = (settings, chatUUID, extra = {}) => runEventBaseIngestion({
     messages: buildChat(4),
     chatUUID,
     settings: { eventbase_min_importance_store: 1, ...settings },
-    collectionIdOverride: COLLECTION,
+    collectionIdOverride: collectionIdOf(chatUUID),
     windowSizeOverride: 2,
     windowOverlapOverride: 0,
     ...extra,
@@ -91,7 +105,7 @@ describe('new events after an ingestion run', () => {
         await ingest(settings, 'links-on-uuid');
         expect(linkNewStoryEventsMock).toHaveBeenCalledTimes(1);
         const [{ collectionId, newEventIds, settings: passedSettings }] = linkNewStoryEventsMock.mock.calls[0];
-        expect(collectionId).toBe(COLLECTION);
+        expect(collectionId).toBe(collectionIdOf('links-on-uuid'));
         expect(newEventIds.length).toBeGreaterThan(0);
         expect(newEventIds).toEqual(state.points.map(point => point.event_id));
         expect(passedSettings.story_arc_mode_enabled).toBe(true);

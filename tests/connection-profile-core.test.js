@@ -1,8 +1,8 @@
 /**
  * The pure rules of a chat call on a SillyTavern connection profile (src/features/llm-provider/connection-profile-core.js,
  * connection plan §1, §2, §4): which profile each consumer runs on, Same as EventBase model included; the request's
- * closed override keys by API; what stops a call before it starts; and what each way SillyTavern's sendRequest fails
- * means, first match winning.
+ * closed override keys by API, the reasoning effort sent again as custom_include_body on a Custom source; what stops a
+ * call before it starts; and what each way SillyTavern's sendRequest fails means, first match winning.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -19,26 +19,26 @@ const ON_PROFILE = 'connection_profile';
 describe('the profile each chat consumer runs on', () => {
     const settings = {
         chat_provider: ON_PROFILE, chat_connection_profile_id: 'profile-eventbase',
-        agent_provider: '', agent_connection_profile_id: 'profile-agent-hidden',
-        reformat_provider: ON_PROFILE, reformat_connection_profile_id: 'profile-reformat',
+        agent_provider: '', agent_connection_profile_id: 'profile-agent',
         story_arc_link_provider: ON_PROFILE, story_arc_link_connection_profile_id: 'profile-storyarc',
+        lorebase_provider: ON_PROFILE, lorebase_connection_profile_id: 'profile-lorebase',
     };
 
     it('reads each consumer\'s own profile while it is on one', () => {
         expect(resolveConnectionProfileId(settings, 'eventbase')).toBe('profile-eventbase');
-        expect(resolveConnectionProfileId(settings, 'reformat')).toBe('profile-reformat');
+        expect(resolveConnectionProfileId({ ...settings, agent_provider: ON_PROFILE }, 'agent')).toBe('profile-agent');
         expect(resolveConnectionProfileId(settings, 'storyarc')).toBe('profile-storyarc');
+        expect(resolveConnectionProfileId(settings, 'lorebase')).toBe('profile-lorebase');
     });
 
     it('runs Same as EventBase model on the EventBase model\'s profile, not the consumer\'s hidden one', () => {
         expect(resolveConnectionProfileId(settings, 'agent')).toBe('profile-eventbase');
-        expect(resolveConnectionProfileId({ ...settings, reformat_provider: '' }, 'reformat')).toBe('profile-eventbase');
     });
 
     it('has no profile on a manual provider, the stored ID kept but unused', () => {
-        const manual = { ...settings, chat_provider: 'vllm', agent_provider: 'openrouter', story_arc_link_provider: 'openrouter' };
-        expect(['eventbase', 'agent', 'storyarc'].map(consumer => resolveConnectionProfileId(manual, consumer))).toEqual(['', '', '']);
-        expect(resolveConnectionProfileId({ ...manual, reformat_provider: '' }, 'reformat')).toBe('');
+        const manual = { ...settings, chat_provider: 'vllm', agent_provider: 'openrouter', story_arc_link_provider: 'openrouter', lorebase_provider: 'vllm' };
+        expect(['eventbase', 'agent', 'storyarc', 'lorebase'].map(consumer => resolveConnectionProfileId(manual, consumer))).toEqual(['', '', '', '']);
+        expect(resolveConnectionProfileId({ ...manual, agent_provider: '' }, 'agent')).toBe('');
     });
 
     it('refuses a consumer it does not know', () => {
@@ -67,13 +67,26 @@ describe('the request a profile call sends', () => {
             .toEqual({ maxTokens: 900, overridePayload: { num_predict: 900, n_predict: 900 } });
     });
 
+    it('sends the reasoning effort again as custom_include_body on a Custom source, where SillyTavern merges it for any model', () => {
+        expect(connectionProfileRequestShape({ api: 'chat', source: 'custom', ...switches }).overridePayload).toEqual({
+            temperature: 0.2, max_completion_tokens: 900, reasoning_effort: 'none', custom_include_body: '{"reasoning_effort":"none"}', response_format: { type: 'json_object' },
+        });
+        expect(connectionProfileRequestShape({ api: 'chat', source: 'custom', ...switches, reasoningEffort: 'low' }).overridePayload.custom_include_body).toBe('{"reasoning_effort":"low"}');
+        // Another source forwards the top-level field itself; no effort, nothing to send.
+        expect(connectionProfileRequestShape({ api: 'chat', source: 'openrouter', ...switches }).overridePayload).not.toHaveProperty('custom_include_body');
+        expect(connectionProfileRequestShape({ api: 'chat', source: 'custom', ...switches, reasoningEffort: null }).overridePayload).not.toHaveProperty('custom_include_body');
+        expect(connectionProfileRequestShape({ api: 'text', source: 'custom', ...switches }).overridePayload).not.toHaveProperty('custom_include_body');
+    });
+
     it('never sends a key outside the closed set, for any combination of switches', () => {
         for (const api of ['chat', 'text']) {
-            for (const sendTemperature of [true, false]) {
-                for (const tokenLimitParameter of ['max_tokens', 'max_completion_tokens']) {
-                    for (const reasoningEffort of [null, 'low']) {
-                        const { overridePayload } = connectionProfileRequestShape({ ...switches, api, sendTemperature, tokenLimitParameter, reasoningEffort });
-                        expect(Object.keys(overridePayload).filter(key => !CONNECTION_PROFILE_OVERRIDE_KEYS[api].includes(key))).toEqual([]);
+            for (const source of [null, 'custom', 'openrouter']) {
+                for (const sendTemperature of [true, false]) {
+                    for (const tokenLimitParameter of ['max_tokens', 'max_completion_tokens']) {
+                        for (const reasoningEffort of [null, 'low']) {
+                            const { overridePayload } = connectionProfileRequestShape({ ...switches, api, source, sendTemperature, tokenLimitParameter, reasoningEffort });
+                            expect(Object.keys(overridePayload).filter(key => !CONNECTION_PROFILE_OVERRIDE_KEYS[api].includes(key))).toEqual([]);
+                        }
                     }
                 }
             }
@@ -157,8 +170,24 @@ describe('what a failed profile call means', () => {
             .toMatchObject({ kind: 'connection', detail: 'Connection refused: 127.0.0.1:8080' });
     });
 
-    it('8: anything else, a moderation block included, skips only its window', () => {
-        expect(classifyConnectionProfileFailure(failed(causeOf('Forbidden')), context)).toMatchObject({ kind: 'upstream_error' });
-        expect(classifyConnectionProfileFailure(failed(causeOf('Too Many Requests')), context)).toMatchObject({ kind: 'upstream_error' });
+    // As on the manual path: nothing the user changes fixes it, and a later send usually gets through.
+    it('8: a provider\'s own server error skips only its window and is no rejection', () => {
+        for (const detail of ['Internal Server Error', 'Bad Gateway', 'Service Unavailable', 'Gateway Timeout', 'Too Many Requests']) {
+            expect(classifyConnectionProfileFailure(failed(causeOf(detail)), context), detail).toEqual({
+                kind: 'upstream_error',
+                isServerFailure: true,
+                detail,
+                message: `EventBase: the provider of profile "Harbor chat" had a server error on model "harbor-model" — ${detail}`,
+            });
+        }
+    });
+
+    it('9: anything else, a moderation block included, is a rejection that skips only its window', () => {
+        expect(classifyConnectionProfileFailure(failed(causeOf('Forbidden')), context)).toEqual({
+            kind: 'upstream_error',
+            isServerFailure: false,
+            detail: 'Forbidden',
+            message: 'EventBase: profile "Harbor chat" rejected the request — Forbidden',
+        });
     });
 });

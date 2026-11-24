@@ -4,9 +4,11 @@
  * ============================================================================
  * The Provider dropdowns of the four LLM consumers and of embedding (connection plan
  * §1, §3): what each saves, the SillyTavern profile option with the Profile dropdown
- * and readout it shows, the rows a profile supplies hidden while one is chosen, the
- * profile Agent Mode and Auto-Reformat take from the EventBase model, and each card's
- * Test connection. The Profile dropdowns repaint when a profile is made, saved or
+ * and readout it shows, each LLM model's Profile dropdown, Jev's included, opening on
+ * Disabled, which clears the profile, the rows a profile supplies hidden while one is chosen, the
+ * profile Agent Mode takes from the EventBase model, and each card's
+ * Test connection; and what LoreBase's Accuracy leaves each model to do, with Jev's
+ * profile group shown on Fast and Cheap [Jev] only. The Profile dropdowns repaint when a profile is made, saved or
  * deleted in SillyTavern, and embedding's readout once the Similharity probe settles.
  * ============================================================================
  */
@@ -19,14 +21,23 @@ import { connectionProfileRowIds } from '../../shared/connection-profile-rows-ma
 import { checkPluginAvailable } from '../../shared/similharity-plugin.js';
 import { resultList, selectOption } from '../../shared/gui-dna/gui-dna-core.js';
 import { setShown } from '../../shared/gui-dna/gene-behaviours.js';
-import { testAutoReformatConnection } from '../chunkbase/index.js';
 import { embeddingProfileKind, resolveEmbeddingProfile } from '../embedding/index.js';
 import { testAgentModeConnection, testEventBaseConnection, testStoryArcConnection } from '../eventbase/index.js';
 import { describeChatConnectionProfile, resolveInheritedConnection } from '../llm-provider/index.js';
+import {
+    FAST_AND_CHEAP, JEV_PROFILE_SETTING, loreBaseAccuracyOf, resolveJevConnection, testJevConnection, testLoreBaseConnection,
+} from '../lorebase/index.js';
 import { getBackend } from '../vector-backend/index.js';
 import { CHAT_CONSUMER_CONNECTIONS, chatProfileReadoutLines, embeddingProfileReadoutLines, ownProviderOf, profileSelectOptions } from './connection-rows-core.js';
 
 const EMBEDDING_PREFIX = 'VectFox_embedding';
+const JEV_PREFIX = 'VectFox_lorebase_jev';
+const JEV_GROUP_ID = 'VectFox_lorebase_jev_group';
+// The first choice of an LLM model's Profile dropdown: it clears the profile, so that model runs on none.
+const DISABLED_PROFILE_TEXT = 'Disabled';
+const ACCURACY_SELECT_ID = 'VectFox_lorebase_accuracy';
+// The profiles Jev runs on: OpenRouter and Custom, whose key Similharity sends only where SillyTavern does.
+const isJevProfileSource = provider => provider === 'openrouter' || provider === 'custom';
 
 /** What embedding's Test connection embeds: a fixed line, so a test never carries chat text. */
 const EMBEDDING_TEST_TEXT = 'This is a connection test from VectFox.';
@@ -60,16 +71,12 @@ const CHAT_CONSUMERS = [
         ],
     },
     {
-        ...connectionOf('VectFox_reformat'), test: testAutoReformatConnection,
-        manualRows: view => [
-            [byId('VectFox_reformat_vllm_row'), view.ownProvider === 'vllm'],
-            [fieldOf('VectFox_reformat_model'), !view.isOnProfile],
-            [byId('VectFox_reformat_provider_hint'), !view.isOnProfile],
-        ],
-    },
-    {
         ...connectionOf('VectFox_story_arc_link'), test: testStoryArcConnection,
         manualRows: view => [[fieldOf('VectFox_story_arc_link_model'), !view.isOnProfile]],
+    },
+    {
+        ...connectionOf('VectFox_lorebase'), test: testLoreBaseConnection,
+        manualRows: view => [[fieldOf('VectFox_lorebase_model'), !view.isOnProfile]],
     },
 ];
 
@@ -84,9 +91,9 @@ function profilesFor(isManagerAvailable, offer) {
     return listConnectionProfileChoices().map(choice => ({ ...choice, isOffered: offer(choice) }));
 }
 
-function paintProfileSelect(select, { profiles, selectedId, isManagerAvailable }) {
+function paintProfileSelect(select, { profiles, selectedId, isManagerAvailable, pickableEmptyText = '' }) {
     if (!select) return;
-    const options = profileSelectOptions({ profiles, selectedId, isManagerAvailable });
+    const options = profileSelectOptions({ profiles, selectedId, isManagerAvailable, pickableEmptyText });
     select.innerHTML = options.map(({ value, text, name, isSelected }) => selectOption({ value, text, name, isSelected })).join('');
     options.forEach(({ isDisabled }, index) => { select.options[index].disabled = isDisabled; });
     select.selectedIndex = Math.max(0, options.findIndex(option => option.isSelected));
@@ -116,7 +123,7 @@ function refreshChatConsumer(consumer, settings, isManagerAvailable) {
     if (view.isOwnProfile) {
         const selectedId = textOf(settings[consumer.profileKey]);
         const profiles = profilesFor(isManagerAvailable, choice => choice.isSupported);
-        paintProfileSelect(byId(ids.select), { profiles, selectedId, isManagerAvailable });
+        paintProfileSelect(byId(ids.select), { profiles, selectedId, isManagerAvailable, pickableEmptyText: DISABLED_PROFILE_TEXT });
         const description = describeChatConnectionProfile(selectedId, { feature: consumer.feature, page: consumer.page });
         paintReadout(byId(ids.readout), chatProfileReadoutLines(description));
     }
@@ -164,6 +171,31 @@ function refreshEmbedding(choice, settings, isManagerAvailable) {
     }));
 }
 
+/**
+ * Show what LoreBase's Accuracy leaves each model to do: on High Accuracy its own model's Keys and picks; on Fast and
+ * Cheap [Jev] (plan D16) its own model's Keys and Jev's group, offering Disabled, which clears Jev's profile, then the
+ * OpenRouter and Custom profiles, with what keeps the chosen one from running. Jev's group shows on Fast and Cheap [Jev]
+ * only.
+ * @param {object} settings
+ * @param {boolean} isManagerAvailable
+ * @param {string} accuracy - The dropdown's choice: the saved one, or the one just picked, which another listener saves
+ */
+function refreshAccuracyRows(settings, isManagerAvailable, accuracy) {
+    const ids = connectionProfileRowIds(JEV_PREFIX);
+    const isFastAndCheap = loreBaseAccuracyOf(accuracy) === FAST_AND_CHEAP;
+    setShown(byId('VectFox_lorebase_role_picks'), !isFastAndCheap);
+    setShown(byId('VectFox_lorebase_role_keys'), isFastAndCheap);
+    setShown(byId(JEV_GROUP_ID), isFastAndCheap);
+    setShown(byId(ids.rows), isFastAndCheap);
+    if (!isFastAndCheap) return;
+    const profiles = profilesFor(isManagerAvailable, choice => isJevProfileSource(choice.embeddingProvider));
+    paintProfileSelect(byId(ids.select), {
+        profiles, selectedId: textOf(settings[JEV_PROFILE_SETTING]), isManagerAvailable, pickableEmptyText: DISABLED_PROFILE_TEXT,
+    });
+    const connection = resolveJevConnection(settings);
+    paintReadout(byId(ids.readout), connection.ok ? [] : [{ status: 'warning', name: connection.problem }]);
+}
+
 /** Embedding's Test connection: the fixed line embedded as a query is, on the active backend. */
 async function testEmbeddingConnection(settings) {
     const backend = await getBackend(settings);
@@ -192,7 +224,8 @@ async function runConnectionTest(button, feature, test) {
 }
 
 /**
- * Wire the five Provider dropdowns, their profile rows and their Test connection buttons.
+ * Wire the five Provider dropdowns, their profile rows and their Test connection buttons, and the rows LoreBase's
+ * Accuracy shows, Jev's profile group among them.
  *
  * @param {object} settings - The settings panel's settings object
  * @param {{onEmbeddingProviderChange: () => void}} hooks - Runs after embedding's provider or profile is saved
@@ -250,12 +283,30 @@ export function wireConnectionRows(settings, { onEmbeddingProviderChange }) {
         runConnectionTest(this, 'Embedding', () => testEmbeddingConnection(settings));
     });
 
+    const jevIds = connectionProfileRowIds(JEV_PREFIX);
+    let shownAccuracy = textOf(settings.lorebase_accuracy);
+    const refreshAccuracy = () => refreshAccuracyRows(settings, isConnectionManagerAvailable(), shownAccuracy);
+    $(`#${jevIds.select}`).on('change', function () {
+        settings[JEV_PROFILE_SETTING] = String($(this).val());
+        save(settings);
+        refreshAccuracy();
+    });
+    $(`#${jevIds.testButton}`).on('click', function () {
+        runConnectionTest(this, 'Jev', () => testJevConnection(settings));
+    });
+    $(`#${ACCURACY_SELECT_ID}`).on('change', function () {
+        shownAccuracy = String($(this).val());
+        refreshAccuracy();
+    });
+
     onConnectionProfilesChanged(() => {
         refreshChatConsumers();
         refreshEmbeddingRows();
+        refreshAccuracy();
     });
     refreshChatConsumers();
     refreshEmbeddingRows();
+    refreshAccuracy();
     // A llama.cpp, KoboldCPP or Custom profile's readout reads the Similharity probe, which may not have settled when
     // the panel is drawn at startup, so the readout is drawn again once it has.
     checkPluginAvailable().then(refreshEmbeddingRows, error => {

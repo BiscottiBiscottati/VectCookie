@@ -20,10 +20,9 @@ import { navBrand, navItem, pageHeader } from '../../shared/gui-dna/panel-page-g
 export const PANEL_TABS = Object.freeze([
     { name: 'action', group: 'General', icon: 'fa-bolt', title: 'Action', subtitle: 'Run vectorization, browse the database and run diagnostics.' },
     { name: 'core', group: 'General', icon: 'fa-gear', title: 'Core', subtitle: 'Embedding, vector backend, retrieval and the model that writes events.' },
-    { name: 'eventbase', group: 'Memory', icon: 'fa-database', title: 'EventBase', subtitle: 'Events the AI extracts from this chat and from archived chats.' },
-    { name: 'chunkbase', group: 'Memory', icon: 'fa-layer-group', title: 'ChunkBase', subtitle: 'Chunked content: lorebooks, character cards, web pages and documents.' },
+    { name: 'chathistory', group: 'Memory', icon: 'fa-database', title: 'ChatHistory', subtitle: 'Events EventBase extracts from this chat and from archived chats.' },
     { name: 'autosync', group: 'Memory', icon: 'fa-comments', title: 'AutoSync', subtitle: 'Keeps the open chat and its collection in step as messages arrive.' },
-    { name: 'worldinfo', group: 'Memory', icon: 'fa-globe', title: 'WorldInfo', subtitle: 'Lorebook entries chosen by meaning instead of keywords.' },
+    { name: 'worldinfo', group: 'Memory', icon: 'fa-globe', title: 'WorldInfo', subtitle: 'Lorebook entries LoreBase picks and trims for each reply.' },
     { name: 'rag', group: 'Retrieval', icon: 'fa-quote-left', title: 'RAG', subtitle: 'How retrieved memory is wrapped in the prompt.' },
     { name: 'agentmode', group: 'Retrieval', icon: 'fa-robot', title: 'AgentMode', subtitle: 'An LLM planner that adds searches beside the normal one.' },
     { name: 'storyarc', group: 'Retrieval', icon: 'fa-timeline', title: 'StoryArc' },

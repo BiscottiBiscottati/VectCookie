@@ -14,16 +14,20 @@
  *
  * Uses its OWN extension-prompt tag so it stacks cleanly with the semantic
  * EventBase injection (`*_eventbase`) instead of clobbering it.
+ *
+ * It and ghosting read the chat's collection in use, from the one route every reader
+ * asks (collectionInUse); with none in use, or the one in use paused, they read nothing
+ * (D18 of vectfox-multi-collection-per-chat.md).
  * ============================================================================
  */
 
 import { setExtensionPrompt } from '../../sillytavern/prompt-injection.js';
 import { getContext } from '../../sillytavern/chat.js';
 import { getWorldInfoSettings, getSortedEntries } from '../../sillytavern/world-info.js';
-import { getBackend } from '../vector-backend/index.js';
-import { getChatUUID } from '../../shared/collection-ids.js';
-import { resolveActiveEventBaseCollection, getVectorizationTip } from './eventbase-store.js';
-import { SUMMARIZER_PROMPT_TAG, GHOST_STEP_MAX } from '../../shared/constants.js';
+import { getBackend, UNBOUNDED_RUN } from '../vector-backend/index.js';
+import { NOT_IN_USE_REASON, collectionInUse, noCollectionInUseText } from './eventbase-chat-collections.js';
+import { getVectorizationTip } from './eventbase-store.js';
+import { SUMMARIZER_PROMPT_TAG } from '../../shared/constants.js';
 import { isVectFoxEnabled } from '../../shared/feature-gate.js';
 import { log } from '../../sillytavern/log.js';
 
@@ -33,14 +37,21 @@ import { log } from '../../sillytavern/log.js';
  * unconditionally every turn is safe and keeps stale injections from lingering.
  *
  * @param {object} settings - extension_settings.vectfox
+ * @param {object|null} [inUse] - The chat's collection in use (collectionInUse), as the reply step resolved it
+ * @param {{isCurrent: () => boolean}} [boundedRun] - The reply step's bounded run (runBoundedRetrieval): a build that
+ *   settles once its bound has passed leaves the slot as the reply step emptied it, as the reply went without it
  * @returns {Promise<{ injected: number, error?: string }>}
  */
-export async function runSummarizerInjection(settings) {
+export async function runSummarizerInjection(settings, inUse = null, boundedRun = UNBOUNDED_RUN) {
     const clear = () => setExtensionPrompt(SUMMARIZER_PROMPT_TAG, '', settings.position, settings.depth, false);
 
     if (!settings?.summarizer_injection_enabled) { clear(); return { injected: 0 }; }
 
-    const { text, count } = await buildSummarizerInjection(settings);
+    const { text, count } = await buildSummarizerInjection(settings, inUse);
+    if (!boundedRun.isCurrent()) {
+        log.lifecycle(`[Summarizer] The injection settled past its bound with ${count} event(s): the reply went without them, so nothing is injected`);
+        return { injected: 0 };
+    }
     setExtensionPrompt(SUMMARIZER_PROMPT_TAG, text, settings.position, settings.depth, false);
     if (count > 0) log.domain('injection', 'trace', `[Summarizer] Injected ${count} event(s) under ${SUMMARIZER_PROMPT_TAG}`);
     return { injected: count };
@@ -140,38 +151,23 @@ function blankPromptClone(m) {
 }
 
 /**
- * Normalize the ghost batch size (`eventbase_ghost_step`) to a whole number of messages
- * in the slider's 1..GHOST_STEP_MAX range. Missing, non-numeric, zero, negative,
- * fractional or non-finite values → 1 (rolling), so a corrupt settings value can never
- * disable ghosting or break prompt assembly. Values above the maximum clamp down to it,
- * so a hand-edited settings.json can never put the wipe on a grid the UI cannot show.
- *
- * @param {*} v
- * @returns {number}
- */
-export function normalizeGhostStep(v) {
-    const n = Math.floor(Number(v));
-    return Number.isFinite(n) && n >= 1 ? Math.min(n, GHOST_STEP_MAX) : 1;
-}
-
-/**
  * Ephemeral "ghosting": keep the most recent N messages verbatim and blank ALL older
  * already-vectorized messages from the OUTGOING prompt only. The chat array we get is
  * ST's interceptor working copy; we replace each wiped slot with a sanitized clone
  * (see blankPromptClone), so the saved chat + UI never change and the whole effect
  * resets on the next generation (nothing to un-ghost, branch-safe).
  *
- * Wipe boundary `cutoff = min(vectorizedInCore, chat.length - keepFloor)`, then snapped
- * DOWN to a multiple of the batch size (`eventbase_ghost_step`):
+ * Wipe boundary `cutoff`: `rollingCutoff = min(vectorizedInCore, chat.length - keepFloor)`,
+ * snapped DOWN to a multiple of the batch size (`eventbase_ghost_batch_size`):
  *   - `vectorizedInCore` — the vectorization tip translated from FULL-chat index space
  *     into the coreChat space we actually receive (see below). Messages below it are in
  *     EventBase; nothing above it (not yet vectorized) is ever wiped.
  *   - `chat.length - keepFloor` — keeps the last `keepRecent` messages raw, with a hard
  *     floor of 1 so the current outgoing turn is NEVER blanked (even at keepRecent=0).
- *   - snap-down — a batch size > 1 moves the boundary only every N messages, so the
- *     prompt's leading prefix stays byte-stable between jumps (provider prompt caching
- *     can reuse it). It can only wipe LESS than the rolling rule, so every bound above
- *     still holds.
+ *   - the snap — at a batch size above 1 the boundary moves only once a whole batch can
+ *     go, so the prompt's opening stays byte-identical between moves and a provider's
+ *     prompt cache can reuse it. The raw window then spans keepFloor to keepFloor +
+ *     batch size - 1 messages. Snapping down only wipes fewer, so both bounds above hold.
  * Messages [0, cutoff) are wiped. "Keep last N" auto-scales to any chat length.
  *
  * Wipe mechanism : flag each wiped message
@@ -184,7 +180,8 @@ export function normalizeGhostStep(v) {
  * error occurred while counting tokens"). So we wipe EVERY message in the span — including
  * empty and tool/system ones — and skip only null slots.
  *
- * Gated to Summarizer Injection (forces auto-sync window=1 → the tip stays current).
+ * Gated to Summarizer Injection (forces auto-sync window=1 → the tip stays current). A tip past the chat's end, as
+ * after messages are deleted or a summary replaces some, wipes nothing.
  *
  * World Info safety: ST scans WI from this same chat array AFTER us, so the wipe is floored
  * to keep WI's full scan window raw (see worldInfoScanFloor) — keyword triggers keep firing
@@ -192,26 +189,37 @@ export function normalizeGhostStep(v) {
  *
  * @param {Array} chat - ST interceptor chat array (coreChat; mutated by slot replacement)
  * @param {object} settings - extension_settings.vectfox
+ * @param {object|null} [inUse] - The chat's collection in use (collectionInUse), as the reply step resolved it
  * @returns {{ wiped: number, charsRemoved: number }}
  */
-export function applyGhosting(chat, settings) {
+export function applyGhosting(chat, settings, inUse = null) {
     if (!settings?.eventbase_ghost_enabled || !settings?.summarizer_injection_enabled) {
         return { wiped: 0, charsRemoved: 0 };
     }
     let wiped = 0;
     let charsRemoved = 0;
-    // Readout values published even when nothing is wiped this turn.
-    let cutoff = 0;
-    let rawKept = Array.isArray(chat) ? chat.length : 0;
-    let nextJumpIn = null;
+    // The batch readout: set only on a turn that ghosts at a batch size above 1, null otherwise.
+    let keptVerbatimCount = null;
+    let messagesUntilNextBatch = null;
 
     const keepRecent = Math.max(0, Math.floor(Number(settings.eventbase_ghost_keep_recent) || 0));
-    const batchSize = normalizeGhostStep(settings.eventbase_ghost_step);
-    const uuid = getChatUUID();
-    // tip = highest extracted message index + 1, in FULL-chat index space.
-    const tip = uuid ? getVectorizationTip(uuid) : undefined;
+    // A missing or unreadable batch size moves the boundary every turn, as 1 does.
+    const batchSize = Math.max(1, Math.floor(Number(settings.eventbase_ghost_batch_size) || 1));
+    // tip = highest extracted message index + 1, in FULL-chat index space: the tip of the chat's collection in
+    // use, unless it is paused, as no reply then reads its events. A collection of another chat locked in here
+    // counts that chat's messages, so it never sets the tip.
+    const { collection } = inUse ?? collectionInUse(settings);
+    const ownCollection = collection && !collection.isPaused ? collection : null;
+    const tip = ownCollection ? getVectorizationTip(ownCollection.registryKey) : undefined;
+    const fullChat = getContext()?.chat;
+    // A tip past the chat's end was read on a longer chat (messages deleted, or a summary replacing some), so it
+    // cannot say which messages here are in memory: nothing is blanked until the chat passes it again.
+    const isTipPastChatEnd = typeof tip === 'number' && Array.isArray(fullChat) && tip > fullChat.length;
+    if (isTipPastChatEnd) {
+        log.domain('injection', 'verbose', `[Ghost] Blanking nothing: the tip (${tip}) is past the chat's ${fullChat.length} messages`);
+    }
 
-    if (Array.isArray(chat) && chat.length > 0 && typeof tip === 'number' && tip > 0) {
+    if (!isTipPastChatEnd && Array.isArray(chat) && chat.length > 0 && typeof tip === 'number' && tip > 0) {
         // INDEX-SPACE FIX: `tip` indexes the full chat (incl. is_system messages), but the
         // interceptor hands us coreChat — ST filters is_system OUT before calling us. Using
         // `tip` directly as a coreChat cutoff over-reaches whenever system/narrator messages
@@ -221,7 +229,6 @@ export function applyGhosting(chat, settings) {
         // than risk a not-yet-vectorized message. Falls back to raw `tip` if the live chat is
         // unavailable (the keepFloor below still caps the reach).
         let vectorizedInCore = tip;
-        const fullChat = getContext()?.chat;
         if (Array.isArray(fullChat)) {
             vectorizedInCore = 0;
             const end = Math.min(tip, fullChat.length);
@@ -237,15 +244,13 @@ export function applyGhosting(chat, settings) {
         //                   whole chat (uncapped min-activations), the floor is Infinity →
         //                   cutoff clamps to 0 → ghosting wipes nothing this turn.
         const keepFloor = Math.max(keepRecent, 1, worldInfoScanFloor());
-        // Rolling boundary, then snap DOWN to the batch grid so the wipe line only moves
-        // every `batchSize` messages. 1 is the identity (today's behaviour).
-        const rawCutoff = Math.max(0, Math.min(vectorizedInCore, chat.length - keepFloor));
-        cutoff = batchSize > 1 ? Math.floor(rawCutoff / batchSize) * batchSize : rawCutoff;
-        rawKept = Math.max(0, chat.length - cutoff);
-        // Messages until the boundary next jumps. Omitted at batch 1 (no batching) or when an
-        // infinite WI floor pauses ghosting entirely (a countdown there would be noise).
+        const rollingCutoff = Math.max(0, Math.min(vectorizedInCore, chat.length - keepFloor));
+        // Snap down to the batch grid; at batch size 1 the boundary stays where it is.
+        const cutoff = Math.floor(rollingCutoff / batchSize) * batchSize;
+        // No readout while World Info could scan the whole chat: ghosting is paused, so no batch is coming.
         if (batchSize > 1 && Number.isFinite(keepFloor)) {
-            nextJumpIn = Math.max(0, cutoff + batchSize - rawCutoff);
+            keptVerbatimCount = chat.length - cutoff;
+            messagesUntilNextBatch = cutoff + batchSize - rollingCutoff;
         }
 
         // ST's ignore flag: drop the message from the prompt entirely. Optional — falls back
@@ -278,11 +283,11 @@ export function applyGhosting(chat, settings) {
     // readout reflects "0 saved this turn" (e.g. tip hasn't advanced yet) instead of a
     // stale value from an earlier generation.
     const approxTokens = Math.round(charsRemoved / 4); // rough 4-chars/token heuristic
-    window.VectFox_LastGhost = { wiped, charsRemoved, approxTokens, at: Date.now(), step: batchSize, cutoff, rawKept, nextJumpIn };
+    window.VectFox_LastGhost = { wiped, charsRemoved, approxTokens, at: Date.now(), batchSize, keptVerbatimCount, messagesUntilNextBatch };
     if (wiped > 0) {
-        const batchNote = batchSize > 1
-            ? ` [batch ${batchSize}; boundary ${cutoff}; raw window ${rawKept}; next jump in ${nextJumpIn}]`
-            : '';
+        const batchNote = keptVerbatimCount === null
+            ? ''
+            : `; batches of ${batchSize}: ${keptVerbatimCount} message(s) kept verbatim, ${messagesUntilNextBatch} message(s) until the next batch`;
         log.domain('injection', 'lifecycle', `[Ghost] Wiped ${wiped} vectorized message(s) from prompt — ~${charsRemoved} chars (~${approxTokens} tokens) saved${batchNote}`);
     }
     return { wiped, charsRemoved };
@@ -295,18 +300,23 @@ export function applyGhosting(chat, settings) {
  * Action page's Summarizer preview shows the real result even while the feature is off.
  *
  * @param {object} settings - extension_settings.vectfox
- * @returns {Promise<{ text: string, count: number, reason?: string, collectionId?: string, requested?: number, error?: string }>}
- *   `reason` is set on a 0-count outcome (disabled handled by the caller).
+ * @param {object|null} [inUse] - The chat's collection in use (collectionInUse), as the reply step resolved it
+ * @returns {Promise<{ text: string, count: number, reason?: string, problem?: string, collectionId?: string, requested?: number, error?: string }>}
+ *   `reason` is set on a 0-count outcome (disabled handled by the caller): `no-chat`, a reason collectionInUse gives
+ *   (`no-collection`, `none-in-use`, `several-in-use`, `other-backend`, the last three with `problem` saying why),
+ *   `paused`, or a read that failed.
  */
-export async function buildSummarizerInjection(settings) {
-    const n = Math.max(1, Math.min(50, settings.summarizer_injection_count ?? 20));
-    const uuid = getChatUUID();
-    if (!uuid) return { text: '', count: 0, reason: 'no-chat', requested: n };
-
-    // Lock-aware, ownership-filtered active collection (same source of truth as
-    // the auto-sync marker and the auto-sync status).
-    const active = resolveActiveEventBaseCollection(settings, uuid);
-    if (!active) return { text: '', count: 0, reason: 'no-collection', requested: n };
+export async function buildSummarizerInjection(settings, inUse = null) {
+    const n = Math.max(1, Math.min(50, settings.summarizer_injection_count ?? 15));
+    // The chat's collection in use, from the one route the auto-sync marker and status read too.
+    const route = inUse ?? collectionInUse(settings);
+    if (route.reason === NOT_IN_USE_REASON.NO_CHAT) return { text: '', count: 0, reason: 'no-chat', requested: n };
+    const active = route.collection;
+    if (!active) {
+        const problem = noCollectionInUseText(route, 'Summarizer Injection reads nothing') ?? undefined;
+        return { text: '', count: 0, reason: route.reason, problem, requested: n };
+    }
+    if (active.isPaused) return { text: '', count: 0, reason: 'paused', collectionId: active.collectionId, requested: n };
 
     let backendInstance;
     try {

@@ -8,10 +8,13 @@
  * ============================================================================
  */
 
+import { CONNECTION_PROFILE_PROVIDER } from '../../shared/constants.js';
+
 /**
  * The four LLM consumers' connection settings: the setting each Provider dropdown and Profile dropdown saves, the
  * feature and page messages name, and `blankProvider`, what an unset provider means; '' is Same as EventBase model for
- * the two that `inheritsEventBase`.
+ * Agent Mode, which `inheritsEventBase`. The manual-connection notice reads this list, so a consumer added here is named
+ * there while it runs on manual OpenRouter or vLLM.
  */
 export const CHAT_CONSUMER_CONNECTIONS = Object.freeze([
     {
@@ -23,12 +26,12 @@ export const CHAT_CONSUMER_CONNECTIONS = Object.freeze([
         profileKey: 'agent_connection_profile_id', feature: 'Agent Mode', page: 'AgentMode', blankProvider: '', inheritsEventBase: true,
     },
     {
-        prefix: 'VectFox_reformat', providerSelectId: 'VectFox_reformat_provider', providerKey: 'reformat_provider',
-        profileKey: 'reformat_connection_profile_id', feature: 'Auto-Reformat', page: 'ChunkBase', blankProvider: '', inheritsEventBase: true,
-    },
-    {
         prefix: 'VectFox_story_arc_link', providerSelectId: 'VectFox_story_arc_link_provider', providerKey: 'story_arc_link_provider',
         profileKey: 'story_arc_link_connection_profile_id', feature: 'StoryArc', page: 'StoryArc', blankProvider: 'openrouter', inheritsEventBase: false,
+    },
+    {
+        prefix: 'VectFox_lorebase', providerSelectId: 'VectFox_lorebase_provider', providerKey: 'lorebase_provider',
+        profileKey: 'lorebase_connection_profile_id', feature: 'LoreBase', page: 'WorldInfo', blankProvider: CONNECTION_PROFILE_PROVIDER, inheritsEventBase: false,
     },
 ].map(connection => Object.freeze(connection)));
 
@@ -49,31 +52,36 @@ const MANAGER_OFF_TEXT = 'Turn on Connection Manager in SillyTavern\'s extension
 const NO_KEY_TEXT = 'No key stored: none is sent';
 
 /**
- * A Profile dropdown's options. "Choose a profile" comes first and cannot be picked, so it shows only while none is
- * chosen; then the profiles offered, in SillyTavern's order. A chosen profile that is no longer offered stays selected
- * and cannot be picked again, under its name, or as "(deleted profile)" when no profile has its ID: never a silent
- * blank. With the Connection Manager off, one option says so.
+ * A Profile dropdown's options. First the empty choice: "Choose a profile", which cannot be picked, so it shows only
+ * while none is chosen; or, where `pickableEmptyText` names one, a choice that can be picked and clears the profile (a
+ * model's Disabled). Then the profiles offered, in SillyTavern's order. A chosen profile that is no longer offered stays
+ * selected and cannot be picked again, under its name, or as "(deleted profile)" when no profile has its ID: never a
+ * silent blank. With the Connection Manager off, one option says so.
  *
  * @param {object} facts
  * @param {Array<{id: string, name: string, isOffered: boolean}>} facts.profiles - Every profile, and whether this dropdown offers it
  * @param {string} facts.selectedId - The stored profile ID, '' for none
  * @param {boolean} facts.isManagerAvailable
+ * @param {string} [facts.pickableEmptyText] - The text of an empty choice that can be picked, in place of "Choose a profile"
  * @returns {Array<{value: string, text?: string, name?: string, isSelected: boolean, isDisabled: boolean}>}
  */
-export function profileSelectOptions({ profiles, selectedId, isManagerAvailable }) {
+export function profileSelectOptions({ profiles, selectedId, isManagerAvailable, pickableEmptyText = '' }) {
     if (!isManagerAvailable) return [{ value: selectedId, text: MANAGER_OFF_TEXT, isSelected: true, isDisabled: true }];
     const chosen = selectedId ? profiles.find(profile => profile.id === selectedId) : null;
     const options = profiles
         .filter(profile => profile.isOffered || profile === chosen)
         .map(profile => ({ value: profile.id, name: profile.name || '(unnamed)', isSelected: profile === chosen, isDisabled: !profile.isOffered }));
     const deleted = selectedId && !chosen ? [{ value: selectedId, text: DELETED_PROFILE_TEXT, isSelected: true, isDisabled: true }] : [];
-    return [{ value: '', text: PLACEHOLDER_TEXT, isSelected: !selectedId, isDisabled: true }, ...deleted, ...options];
+    const empty = pickableEmptyText
+        ? { value: '', text: pickableEmptyText, isSelected: !selectedId, isDisabled: false }
+        : { value: '', text: PLACEHOLDER_TEXT, isSelected: !selectedId, isDisabled: true };
+    return [empty, ...deleted, ...options];
 }
 
 /**
  * The readout of a chat consumer's profile: why it cannot be used, or its SillyTavern API, its model and, when it
  * stores no key, that none is sent. `inheritedFrom` names the EventBase model's profile on the first line, for Agent
- * Mode and Auto-Reformat on Same as EventBase model.
+ * Mode on Same as EventBase model.
  *
  * @param {{problem: string, name?: string, api?: string, model?: string, storesKey?: boolean}} description - From describeChatConnectionProfile
  * @param {{isInherited?: boolean}} [options]

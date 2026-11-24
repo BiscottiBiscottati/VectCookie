@@ -12,9 +12,9 @@
 import { SECRET_KEYS } from '../../sillytavern/secrets.js';
 import { textgen_types, textgenerationwebui_settings } from '../../sillytavern/connection-settings.js';
 import {
-    connectionProfileEmbeddingKeyField,
-    connectionProfileEmbeddingProvider,
+    connectionProfileKeyIdField,
     connectionProfileServerUrl,
+    connectionProfileSource,
     connectionProfileStoresKey,
     findConnectionProfile,
     isConnectionManagerAvailable,
@@ -25,11 +25,17 @@ import { embeddingProfileKind, embeddingProfileProblem } from './embedding-profi
 /**
  * All supported embedding providers
  * This is the canonical list - update here and it applies everywhere
+ *
+ * searchPieceTokens: the most a search text may measure (search-pieces-core.js searchTokens) to be embedded whole; a
+ * longer one is searched in pieces of this size (InternalProject/Vectfox/plans/executed/search-text-pieces.md §2).
+ * Each sits under the provider's limit with room for the measure's error.
  */
 export const EMBEDDING_PROVIDERS = {
     // Local providers (no API key needed)
     transformers: {
         name: 'Local (Transformers)',
+        // jina, SillyTavern's shipped default, crashes near 6,000 tokens; transformers.js does not cut it.
+        searchPieceTokens: 4000,
         local: true,
         requiresModel: false,
         requiresApiKey: false,
@@ -39,6 +45,8 @@ export const EMBEDDING_PROVIDERS = {
     // Local server providers (need URL)
     ollama: {
         name: 'Ollama',
+        // SillyTavern asks Ollama to cut at the model's context, 2,048 for nomic-embed-text by default.
+        searchPieceTokens: 2000,
         local: true,
         requiresModel: true,
         modelField: 'embedding_ollama_model',
@@ -47,6 +55,8 @@ export const EMBEDDING_PROVIDERS = {
     },
     vllm: {
         name: 'vLLM',
+        // The model's own length decides, 8,192 for bge-m3.
+        searchPieceTokens: 6000,
         local: true,
         requiresModel: true,
         modelField: 'embedding_vllm_model',
@@ -58,6 +68,8 @@ export const EMBEDDING_PROVIDERS = {
     // plan §3), so they have no fields of their own.
     llamacpp: {
         name: 'llama.cpp',
+        // A default server rejects more than its physical batch, 512 tokens.
+        searchPieceTokens: 500,
         local: true,
         requiresModel: false,
         requiresApiKey: false,
@@ -65,6 +77,8 @@ export const EMBEDDING_PROVIDERS = {
     },
     koboldcpp: {
         name: 'KoboldCPP',
+        // Its embedding limit is not documented; as low as llama.cpp, on which it is built.
+        searchPieceTokens: 500,
         local: true,
         requiresModel: false,
         requiresApiKey: false,
@@ -72,6 +86,8 @@ export const EMBEDDING_PROVIDERS = {
     },
     custom: {
         name: 'Custom (OpenAI-compatible)',
+        // The embedding model's length: 8,192 for bge-m3 and OpenAI's text-embedding-3.
+        searchPieceTokens: 6000,
         local: false,
         requiresModel: true,
         requiresApiKey: false,
@@ -84,6 +100,8 @@ export const EMBEDDING_PROVIDERS = {
     // togetherai: { name: 'TogetherAI', local: false, requiresModel: true, modelField: 'togetherai_model', requiresApiKey: true, secretKey: SECRET_KEYS.TOGETHERAI, requiresUrl: false },
     openrouter: {
         name: 'OpenRouter',
+        // Most of its embedding models take 8,192 tokens or more.
+        searchPieceTokens: 6000,
         local: false,
         requiresModel: true,
         modelField: 'embedding_openrouter_model',
@@ -145,7 +163,7 @@ export function resolveEmbeddingProfile(settings) {
     const profile = findConnectionProfile(profileId);
     const url = profile ? connectionProfileServerUrl(profile) : '';
     const model = String(profile?.model ?? '').trim();
-    const profileProvider = profile ? connectionProfileEmbeddingProvider(profile) : null;
+    const profileProvider = profile ? connectionProfileSource(profile) : null;
     return {
         profileName: profile?.name ?? '',
         url,
@@ -177,6 +195,43 @@ export function getModelFromSettings(settings, fallback = '') {
     const modelField = getModelField(settings?.embedding_provider);
     if (!modelField) return fallback;
     return settings[modelField] || fallback;
+}
+
+/**
+ * Why VectFox's embedding model cannot embed now, or '' when it can: no provider, one VectFox does not know, a
+ * connection profile that cannot be used, or no model where the provider needs one. A profile's Similharity check reads
+ * the probe's settled result, so a caller that must be sure waits for checkPluginAvailable() first, as the diagnostics
+ * check does.
+ *
+ * @param {object} settings - VectFox settings
+ * @returns {string}
+ */
+export function embeddingSetupProblem(settings) {
+    const source = settings?.embedding_provider;
+    if (!source) return 'No embedding provider selected';
+    const config = getProviderConfig(source);
+    if (!config) return `Unknown provider: ${source}`;
+    const onProfile = resolveEmbeddingProfile(settings);
+    if (onProfile?.problem) return onProfile.problem;
+    if (config.requiresModel && !getModelFromSettings(settings)) return `${config.name} selected but no model configured`;
+    return '';
+}
+
+/**
+ * VectFox's embedding model in words, for a page that names it: the model and its provider, or the SillyTavern profile
+ * it runs on; a provider that takes no model name runs its own default, and one that needs a name says none is set.
+ *
+ * @param {object} settings - VectFox settings
+ * @returns {string} '' when no known provider is set
+ */
+export function embeddingModelName(settings) {
+    const config = getProviderConfig(settings?.embedding_provider);
+    if (!config) return '';
+    const onProfile = resolveEmbeddingProfile(settings);
+    if (onProfile) return `${onProfile.model || "the server's model"} on the SillyTavern profile "${onProfile.profileName}"`;
+    const model = getModelFromSettings(settings);
+    if (model) return `${model} at ${config.name}`;
+    return config.requiresModel ? `${config.name}, with no model set` : `${config.name}'s default model`;
 }
 
 /**
@@ -245,7 +300,7 @@ export function resolveProviderApiUrl(settings, source = settings?.embedding_pro
  * It waits for the Similharity probe first, so the plugin check never reads a probe that has not settled.
  *
  * @param {object} settings - VectFox settings
- * @returns {Promise<object>} apiUrl, and the key field connectionProfileEmbeddingKeyField gives
+ * @returns {Promise<object>} apiUrl, and the key field connectionProfileKeyIdField gives
  * @throws {Error} With `code: 'invalid_model_config'`, from resolveProviderApiUrl
  */
 export async function embeddingProfileRequestFields(settings) {
@@ -253,5 +308,5 @@ export async function embeddingProfileRequestFields(settings) {
     await checkPluginAvailable();
     const apiUrl = resolveProviderApiUrl(settings);
     const profile = findConnectionProfile(String(settings.embedding_connection_profile_id ?? '').trim());
-    return { apiUrl, ...connectionProfileEmbeddingKeyField(profile) };
+    return { apiUrl, ...connectionProfileKeyIdField(profile) };
 }

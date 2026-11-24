@@ -29,9 +29,9 @@ vi.mock('../src/features/eventbase/eventbase-extractor.js', () => ({ extractEven
 vi.mock('../src/features/eventbase/generation-rate-limiter.js', () => ({ generationRateLimiter: {}, generationRateLimitSettings: {} }));
 vi.mock('../src/features/eventbase/eventbase-store.js', () => ({
     insertEvents: vi.fn(), isWindowAlreadyExtracted: vi.fn(), markWindowExtracted: vi.fn(),
-    clearExtractionCachesForChat: vi.fn(), buildEventBaseCollectionId: vi.fn(), isLastWindowExtracted: vi.fn(), getVectorizationTip: vi.fn(),
+    clearExtractionCaches: vi.fn(), isLastWindowExtracted: vi.fn(), getVectorizationTip: vi.fn(),
+    readEventBaseProgress: vi.fn(() => ({})), getAutoSyncMarker: vi.fn(),
     setVectorizationTip: vi.fn(), ensureVectorizationTip: vi.fn(), shouldUseTipFallback: vi.fn(),
-    resolveEventBaseWriteTarget: vi.fn(),
 }));
 vi.mock('../src/features/eventbase/eventbase-retrieval.js', () => ({ retrieveEvents: vi.fn() }));
 vi.mock('../src/features/eventbase/agentic-retrieval.js', () => ({ retrieveEventsForTurn: vi.fn() }));
@@ -113,7 +113,7 @@ describe('notifyUnfinishedWindows', () => {
         notifyUnfinishedWindows(run({ windowsFailed: 0, windowsTimedOut: 3, firstFailureDetail: null }));
 
         const [message] = globalThis.toastr.warning.mock.calls[0];
-        expect(message).toContain('3 timed out: raise "Extraction timeout" on the EventBase page');
+        expect(message).toContain('3 timed out: raise "Extraction timeout" on the ChatHistory page');
         expect(message).not.toContain('First error');
     });
 
@@ -123,6 +123,15 @@ describe('notifyUnfinishedWindows', () => {
         const [message, , options] = globalThis.toastr.warning.mock.calls[0];
         expect(message).toContain('The next turn sends them again.');
         expect(options).toEqual({ timeOut: 15000 });
+    });
+
+    // A rejection fails the same way on every later run until the user changes a setting.
+    it('names a rejection\'s causes and stays until closed, whatever the caller asks', () => {
+        notifyUnfinishedWindows(run({ rejectionCauses: 'Common causes: a parameter.' }), 'The next turn sends them again.', { timeOut: 15000 });
+
+        const [message, , options] = globalThis.toastr.warning.mock.calls[0];
+        expect(message).toContain('First error: the first reason. Common causes: a parameter. The next turn sends them again.');
+        expect(options).toEqual({ timeOut: 0, extendedTimeOut: 0 });
     });
 
     // Nothing got through, so the run achieved nothing and the fault is not those windows.

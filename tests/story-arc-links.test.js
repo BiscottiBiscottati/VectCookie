@@ -6,6 +6,8 @@
  *   - it stops on an invalid model and on a run of failures, and when asked,
  *   - it can skip events already decided, and shows its cost first,
  *   - a new event is linked only when that spends nothing unasked for,
+ *   - after a stretch is read again, every new event is linked and each event whose links went into it is decided
+ *     again, the new events among its candidates, each step on the panel with its own count,
  *   - a links file reads and writes a collection's links with no LLM call,
  *   - deleting a collection's links leaves its events undecided, with no LLM call.
  */
@@ -29,6 +31,11 @@ vi.mock('../src/shared/collection-ids.js', () => ({
     resolveBackendForCollection: (id) => ({ backend: id.includes(':') ? id.split(':')[0] : null, collectionId: id }),
 }));
 
+// The price from OpenRouter's model list, read through the stubbed fetch; the rest of the barrel reaches SillyTavern.
+vi.mock('../src/features/llm-provider/index.js', async () => ({
+    readOpenRouterModelPrice: (await vi.importActual('../src/features/llm-provider/openrouter-model-price.js')).readOpenRouterModelPrice,
+}));
+
 const callLlmForJsonMock = vi.fn();
 const resolveLinkConfigMock = vi.fn();
 vi.mock('../src/features/eventbase/agentic-retrieval.js', () => ({
@@ -36,10 +43,13 @@ vi.mock('../src/features/eventbase/agentic-retrieval.js', () => ({
     resolveStoryLinkLlmConfig: (...args) => resolveLinkConfigMock(...args),
 }));
 
-const resolveActiveCollectionMock = vi.fn();
-vi.mock('../src/features/eventbase/eventbase-store.js', () => ({
-    resolveActiveEventBaseCollection: (...args) => resolveActiveCollectionMock(...args),
+// The one route to the chat's collection in use (collectionInUse), and its words for a chat with none in use.
+const collectionInUseMock = vi.fn();
+vi.mock('../src/features/eventbase/eventbase-chat-collections.js', () => ({
+    collectionInUse: (...args) => collectionInUseMock(...args),
+    noCollectionInUseText: (inUse, consequence) => (inUse.reason === 'none-in-use' ? `No collection is in use in this chat, so ${consequence}.` : null),
 }));
+const NONE_IN_USE = { collection: null, reason: 'none-in-use', collections: [{ registryKey: 'qdrant:other' }], lockedElsewhere: [] };
 
 const listStoryEventsMock = vi.fn();
 vi.mock('../src/features/eventbase/story-arc-retrieval.js', () => ({
@@ -77,6 +87,7 @@ const {
     buildCollectionLinksFile,
     deleteStoryLinks,
     describeStoryLinkPass,
+    linkEventsReadAgain,
     linkNewStoryEvents,
     planStoryLinksDelete,
     planStoryLinksImport,
@@ -110,7 +121,9 @@ beforeEach(() => {
     callLlmForJsonMock.mockReset().mockResolvedValue({ links: [] });
     listStoryEventsMock.mockReset();
     resolveLinkConfigMock.mockReset().mockReturnValue({ ok: true, provider: 'openrouter', model: 'openai/gpt-6-luna', apiKey: 'key' });
-    resolveActiveCollectionMock.mockReset().mockReturnValue({ collectionId: COLLECTION, registryKey: `qdrant:${COLLECTION}` });
+    collectionInUseMock.mockReset().mockReturnValue({
+        collection: { collectionId: COLLECTION, registryKey: `qdrant:${COLLECTION}`, name: 'Harbor Keeper' }, reason: null, collections: [], lockedElsewhere: [],
+    });
     vi.stubGlobal('fetch', vi.fn(async () => ({
         ok: true,
         json: async () => ({ data: [{ id: 'openai/gpt-6-luna', pricing: { prompt: '0.0000001', completion: '0.0000005' } }] }),
@@ -286,6 +299,16 @@ describe('describeStoryLinkPass', () => {
         expect(pass.allEstimate.costUsd).toBeGreaterThan(pass.undecidedEstimate.costUsd);
         expect(pass.model).toBe('openai/gpt-6-luna');
         expect(pass.collectionId).toBe(COLLECTION);
+        expect(pass.collectionName).toBe('Harbor Keeper');
+    });
+
+    it('reads nothing while the chat has collections and none in use, handing back the route\'s answer', async () => {
+        collectionInUseMock.mockReturnValue(NONE_IN_USE);
+        expect(await describeStoryLinkPass(settings)).toEqual({
+            problem: 'No collection is in use in this chat, so StoryArc has no events or links here.',
+            noneInUse: NONE_IN_USE,
+        });
+        expect(listStoryEventsMock).not.toHaveBeenCalled();
     });
 
     // On GPT-6 Luna, a whole pass cost what this price gives, within 0.1%.
@@ -316,7 +339,7 @@ describe('describeStoryLinkPass', () => {
 
     it('names what is missing', async () => {
         expect((await describeStoryLinkPass({ ...settings, vector_backend: 'standard' })).problem).toContain('Qdrant');
-        resolveActiveCollectionMock.mockReturnValueOnce(null);
+        collectionInUseMock.mockReturnValueOnce({ collection: null, reason: 'no-collection', collections: [], lockedElsewhere: [] });
         expect((await describeStoryLinkPass(settings)).problem).toContain('no EventBase collection');
         listStoryEventsMock.mockResolvedValueOnce([stored(1, 10)]);
         resolveLinkConfigMock.mockReturnValueOnce({ ok: false, reason: 'missing_openrouter_api_key' });
@@ -334,13 +357,19 @@ describe('describeStoryLinkPass', () => {
 describe('readStoryLinkCoverage', () => {
     it('reports coverage', async () => {
         listStoryEventsMock.mockResolvedValueOnce([stored(1, 10, { story_links: [] })]);
-        expect(await readStoryLinkCoverage(settings)).toMatchObject({ totalCount: 1, decidedCount: 1 });
+        expect(await readStoryLinkCoverage(settings)).toMatchObject({ totalCount: 1, decidedCount: 1, collectionName: 'Harbor Keeper' });
+    });
+
+    it('has no links while the chat has collections and none in use, and reads nothing', async () => {
+        collectionInUseMock.mockReturnValue(NONE_IN_USE);
+        expect(await readStoryLinkCoverage(settings)).toEqual({ problem: 'No collection is in use in this chat, so StoryArc has no events or links here.' });
+        expect(listStoryEventsMock).not.toHaveBeenCalled();
     });
 
     // A chat with 1,400 linked events must not read as empty because one listing failed.
     it('tells a failed listing from a chat with nothing stored', async () => {
         expect((await readStoryLinkCoverage({ ...settings, vector_backend: 'standard' })).problem).toContain('Qdrant');
-        resolveActiveCollectionMock.mockReturnValueOnce(null);
+        collectionInUseMock.mockReturnValueOnce({ collection: null, reason: 'no-collection', collections: [], lockedElsewhere: [] });
         expect((await readStoryLinkCoverage(settings)).problem).toContain('no EventBase collection');
         listStoryEventsMock.mockResolvedValueOnce(null);
         expect((await readStoryLinkCoverage(settings)).problem).toContain('Could not read');
@@ -368,19 +397,31 @@ describe('linkNewStoryEvents', () => {
         expect(writtenLinks()).toEqual({ 3: [{ event_id: 'id1', type: 'continues', thread: 'A' }] });
     });
 
-    it('searches for link candidates with no similarity threshold, whatever the EventBase page sets', async () => {
+    it('searches for link candidates with no similarity threshold, whatever the ChatHistory page sets', async () => {
         listStoryEventsMock.mockResolvedValue([...decidedOlder, stored(3, 30)]);
         queryCollectionMock.mockResolvedValue({ hashes: [1, 2], metadata: [{ score: 0.1 }, { score: 0.2 }] });
         await run(['id3'], { eventbase_score_threshold: 0.6, score_threshold: 0.25 });
         expect(queryCollectionMock.mock.calls[0][3].score_threshold).toBe(0);
     });
 
-    it('decides the first event of a chat with no call and no search', async () => {
-        listStoryEventsMock.mockResolvedValue([stored(1, 10)]);
-        await run(['id1']);
+    it('decides a new event with nothing earlier with no call and no search', async () => {
+        listStoryEventsMock.mockResolvedValue([...decidedOlder, stored(3, 5)]);
+        await run(['id3']);
         expect(queryCollectionMock).not.toHaveBeenCalled();
         expect(callLlmForJsonMock).not.toHaveBeenCalled();
-        expect(writtenLinks()).toEqual({ 1: [] });
+        expect(writtenLinks()).toEqual({ 3: [] });
+    });
+
+    // A chat's first read, New collection and Start over: a whole chat's links are paid for only from Regenerate
+    // links, which shows the cost first.
+    it('waits for the button in a collection with no older event, however few its new events', async () => {
+        const firstRead = Array.from({ length: 12 }, (_, i) => stored(i + 1, (i + 1) * 10));
+        listStoryEventsMock.mockResolvedValue(firstRead);
+        await run(firstRead.map(item => item.event_id));
+        expect(queryCollectionMock).not.toHaveBeenCalled();
+        expect(callLlmForJsonMock).not.toHaveBeenCalled();
+        expect(updateChunkMetadataMock).not.toHaveBeenCalled();
+        expect(globalThis.toastr.info).not.toHaveBeenCalled();
     });
 
     // A chat that never had a link pass would otherwise pay on every reply for links nothing can walk yet.
@@ -449,6 +490,73 @@ describe('linkNewStoryEvents', () => {
         listStoryEventsMock.mockRejectedValueOnce(new Error('boom'));
         await expect(run(['id1'])).resolves.toBeUndefined();
         expect(logWarnMock.mock.calls[1][1].message).toBe('boom');
+    });
+});
+
+describe('linkEventsReadAgain', () => {
+    const STEP_TITLES = { newEvents: 'Reading again, step 2 of 3: linking new events', movedLinks: 'Reading again, step 3 of 3: deciding moved links again' };
+    const readAgainLinks = (options = {}) => linkEventsReadAgain({
+        collectionId: COLLECTION, newEventIds: ['id2', 'id3'], eventIdsWithMovedLinks: ['id4'], settings,
+        shouldStop: () => false, stepTitles: STEP_TITLES, ...options,
+    });
+
+    beforeEach(() => {
+        // Event 1 before the stretch, 2 and 3 its new events, 4 after it with a link moved off a replaced event, and 5
+        // after it with links that never went into it.
+        fetchPortableChunksMock.mockResolvedValue([
+            chunk(5, 50, { story_links: [{ event_id: 'id1', type: 'continues', thread: '' }] }),
+            chunk(4, 40, { story_links: [{ event_id: 'id2', type: 'continues', thread: '' }] }),
+            chunk(3, 30),
+            chunk(2, 20),
+            chunk(1, 10, { story_links: [] }),
+        ]);
+    });
+
+    it('links every new event, then decides again the event whose links moved, the new events among its candidates, each step on the panel with its own count', async () => {
+        const tallies = await readAgainLinks();
+
+        const askedAbout = callLlmForJsonMock.mock.calls.map(([call]) => `${call.userMessage.split('NEW:\n')[1].split(')')[0]})`);
+        expect(askedAbout).toEqual(['(message 20)', '(message 30)', '(message 40)']);
+        const movedCall = callLlmForJsonMock.mock.calls[2][0].userMessage;
+        expect(movedCall).toContain('(message 20)');
+        expect(movedCall).toContain('(message 30)');
+        expect(Object.keys(writtenLinks()).sort()).toEqual(['2', '3', '4']);
+        expect(progressMock.show.mock.calls).toEqual([
+            [STEP_TITLES.newEvents, 2, 'Events', { unitLabel: 'Events' }],
+            [STEP_TITLES.movedLinks, 1, 'Events', { unitLabel: 'Events' }],
+        ]);
+        expect(progressMock.updateEmbeddingProgress).toHaveBeenLastCalledWith(1, 1);
+        expect(progressMock.complete).not.toHaveBeenCalled();
+        expect(tallies).toMatchObject({
+            newEvents: { total: 2, finishedCount: 2, failedCount: 0, stopReason: '' },
+            movedLinks: { total: 1, finishedCount: 1, failedCount: 0, stopReason: '' },
+        });
+    });
+
+    it('decides nothing once stopped, leaving every event for the StoryArc tab', async () => {
+        const tallies = await readAgainLinks({ shouldStop: () => true });
+
+        expect(callLlmForJsonMock).not.toHaveBeenCalled();
+        expect(updateChunkMetadataMock).not.toHaveBeenCalled();
+        expect(tallies).toMatchObject({ newEvents: { total: 2, finishedCount: 0 }, movedLinks: { total: 1, finishedCount: 0 } });
+    });
+
+    it('leaves the moved links undone once an invalid model stops the new events, and says so', async () => {
+        callLlmForJsonMock.mockRejectedValue(Object.assign(new Error('No such model'), { code: 'invalid_model_config' }));
+
+        const tallies = await readAgainLinks();
+
+        expect(notifyInvalidModelMock).toHaveBeenCalledWith('No such model');
+        expect(tallies.newEvents.stopReason).toBe('No such model');
+        expect(tallies.movedLinks).toMatchObject({ total: 1, finishedCount: 0 });
+        expect(progressMock.show).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws before reading anything when the link model is not ready', async () => {
+        resolveLinkConfigMock.mockReturnValue({ ok: false, reason: 'no model', problem: 'Choose the StoryArc link model first.' });
+
+        await expect(readAgainLinks()).rejects.toThrow('Choose the StoryArc link model first.');
+        expect(fetchPortableChunksMock).not.toHaveBeenCalled();
     });
 });
 

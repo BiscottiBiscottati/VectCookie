@@ -15,21 +15,24 @@ import { ModuleWorkerWrapper, debounce, debounce_timeout } from './sillytavern/e
 import { extension_settings } from './sillytavern/settings.js';
 
 // VectFox modules - Core
-import { synchronizeChat, rearrangeChat } from './features/chunkbase/index.js';
 import {
+    followChatRenameOfCollections,
     migrateOldEnabledKeys,
     registerCollection,
     setDeletedOrImportedCollectionCleanup,
 } from './features/collections/index.js';
-import { clearCachesForDeletedOrImportedCollection, refreshWorldInfoEntryDepthCache } from './features/eventbase/index.js';
+import { clearCachesForDeletedOrImportedCollection, refreshWorldInfoEntryDepthCache, runEventBaseReplyStep, synchronizeChat } from './features/eventbase/index.js';
 import { setInsertedCollectionRegistrar } from './features/vector-backend/index.js';
 import { migrateLegacyApiKeys } from './shared/api-keys.js';
 import { migration_setting_name_for_connection } from './app/settings-migration-connection-setting-names.js';
 import { migration_embedding_source_key } from './app/settings-migration-embedding-provider-key.js';
-import { migration_world_info_threshold_rrf_workaround, WORLD_INFO_THRESHOLD_DEFAULT } from './app/settings-migration-world-info-threshold.js';
+import { migration_remove_semantic_world_info_settings } from './app/settings-migration-semantic-world-info-settings.js';
+import { migration_remove_chunkbase_settings } from './app/settings-migration-chunkbase-settings.js';
+import { migration_remove_retired_collection_fields } from './app/settings-migration-collection-retired-fields.js';
+import { migration_eventbase_progress_into_collections } from './app/settings-migration-eventbase-progress.js';
+import { forcedSettingValueIds, migration_apply_forced_setting_values } from './app/settings-migration-forced-values.js';
 import { log } from './sillytavern/log.js';
 import {
-    CHUNKBASE_SIMILARITY_THRESHOLD_DEFAULT,
     CONNECTION_PROFILE_PROVIDER,
     RETRIEVAL_TIMEOUT_DEFAULT_MS,
     AGENTIC_PLANNER_TIMEOUT_DEFAULT_MS,
@@ -40,9 +43,10 @@ import { isVectFoxEnabled } from './shared/feature-gate.js';
 import { runNetworkStartup } from './app/network-startup.js';
 
 // VectFox modules - UI
-import { mountSettingsPanel, refreshAutoSyncCheckbox, scheduleManualConnectionNotice } from './features/settings-panel/index.js';
+import { mountSettingsPanel, mountWandMenu, refreshAutoSyncCheckbox, scheduleManualConnectionNotice } from './features/settings-panel/index.js';
 import { initializeDatabaseBrowser } from './features/database-browser/index.js';
-import { initializeWorldInfoIntegration } from './features/world-info/index.js';
+import { KEY_CALLS_AT_ONCE_DEFAULT, LORE_BUDGET_DEFAULT, initializeLoreBase, prepareLoreBesideRetrieval } from './features/lorebase/index.js';
+import { initializeReplyLore } from './features/reply-lore/index.js';
 import { CJK_TOKENIZER_MODES, setCjkTokenizerMode, ensureJiebaTokenizerLoaded, ensureJiebaTwLoaded } from './features/keyword-search/index.js';
 
 // Calls a lower layer makes into a higher one, wired here before anything can delete or insert.
@@ -52,7 +56,7 @@ setInsertedCollectionRegistrar(registerCollection);
 // Default settings
 const defaultSettings = {
     // Master switch — when false, VectFox does no automatic runtime work
-    // (retrieval injection, auto-sync, lorebook WI injection). Default ON.
+    // (retrieval injection, auto-sync, LoreBase's picks). Default ON.
     // Single source of truth for reads: src/shared/feature-gate.js::isVectFoxEnabled.
     enabled: true,
 
@@ -90,8 +94,7 @@ const defaultSettings = {
     generation_rate_limit_interval: 60, // seconds
 
     // VEC-6: Batch insert optimization
-    insert_batch_size: 50, // Chunks per insert batch (50-100 recommended)
-    document_glossary_injection: true, // Document content type only: prepend "Full Name (ACRONYM)" definitions to chunks that reference a bare acronym without it. See src/features/chunkbase/glossary-extractor.js.
+    insert_batch_size: 50, // Texts per embedding request while inserting (insertVectorItems)
     togetherai_model: 'togethercomputer/m2-bert-80M-32k-retrieval',
     openai_model: 'text-embedding-ada-002',
     electronhub_model: 'text-embedding-3-small',
@@ -113,23 +116,19 @@ const defaultSettings = {
 
     // Chat vectorization
     depth: 2,
-    // Placement of every VectFox block (memory, summarizer, lorebook). Their text changes each
+    // Placement of every VectFox block (memory, summarizer). Their text changes each
     // turn, so In-Chat keeps it below the static prompt and leaves that prefix cacheable.
     position: extension_prompt_types.IN_CHAT,
     protect: 5,
-    insert: 5,
     min_chat_length: 0, // Minimum number of messages in chat before injection starts (0 = no minimum)
-    // Number of top results to retrieve from vector DB (top-K)
-    top_k: 10,
     retrieval_popup_on_start: true,    // Show popup when retrieval starts
     retrieval_popup_on_result: true,   // Show popup with number of retrieved results
-    // How long one turn may spend on any single retrieval (EventBase, chunk,
-    // lorebook, summarizer injection) before it proceeds without that memory.
+    // How long one turn may spend on any single retrieval (EventBase, the
+    // summarizer injection) before it proceeds without that memory.
     // Agent Mode ADDS its own planner + fanout timeouts on top of this for the
     // EventBase path — see src/shared/retrieval-budget.js. UI: Core page → Retrieval.
     retrieval_timeout_ms: RETRIEVAL_TIMEOUT_DEFAULT_MS,
     query: 2,
-    score_threshold: CHUNKBASE_SIMILARITY_THRESHOLD_DEFAULT,
 
     // Deduplication settings
     // Recent-context skip: drop candidate events whose source_window_end falls within
@@ -160,9 +159,6 @@ const defaultSettings = {
     // Query keyword budget for retrieval (A1 and A2 paths)
     hybrid_keyword_level: 'balance', // 'minimal' (30) | 'balance' (50) | 'maximum' (70)
 
-    // Keyword extraction level for INGESTION (chat history vectorization) — not retrieval
-    keyword_extraction_level: 'balanced', // 'off', 'minimal', 'balanced', 'aggressive'
-
     // Summarization before vectorization
     chat_provider: CONNECTION_PROFILE_PROVIDER, // 'connection_profile', 'openrouter' or 'vllm'; a new install starts on a profile, none chosen
     has_shown_manual_connection_retirement_notice: false, // the notice that manual OpenRouter and vLLM retire, shown once per install
@@ -176,7 +172,7 @@ const defaultSettings = {
     summarize_prompt: '',             // Custom prompt template (empty = use built-in default)
 
     // Chat-completion request shape — applies to EVERY LLM feature (summarizer,
-    // EventBase extraction, Auto-Reformat, Agent Mode), because one install talks
+    // EventBase extraction, Agent Mode, StoryArc, LoreBase), because one install talks
     // to one chat endpoint family. Reasoning models (gpt-5.x, o1/o3/o4 and hosted
     // builds on them) reject `temperature` and `max_tokens` outright; these two
     // switches reshape the body for them. Reader: resolveModelParameterStyle()
@@ -195,7 +191,7 @@ const defaultSettings = {
     hybrid_native_prefer: true,         // KEPT (no UI): A3 vs A2 selector for backends that support both. Default = prefer native.
 
     // RAG page: the text before, and the tag around, the events and chunks VectFox injects.
-    // Lorebook entries and Summarizer Injection carry their own tags.
+    // Summarizer Injection carries its own tag; LoreBase's entries go in through SillyTavern's World Info.
     rag_context: '',      // Goes before them; ST macros work
     rag_xml_tag: 'VectFoxMemory',      // Wraps them; empty sends them unwrapped
 
@@ -205,16 +201,17 @@ const defaultSettings = {
     // Collection registry (list of known collection IDs)
     vectfox_collection_registry: [],
 
-    // World Info Integration
-    enabled_world_info: false,          // Enable semantic WI activation
-    world_info_threshold: 0.3,          // Score threshold for WI activation
-    world_info_top_k: 3,                // Max entries to activate per lorebook
-    world_info_query_depth: 3,          // Recent messages to use for query
-    world_info_retrieval_popup: false,  // Show popup toast when WI lorebook entries are retrieved
-    world_info_respect_entry_disable: true, // Semantic WI: drop hits whose live lorebook entry is disabled (see resolveLiveEntries)
+    // LoreBase (lorebook plan B6): its own model, a profile none chosen on a new install, and its Accuracy (plan D6)
+    lorebase_provider: CONNECTION_PROFILE_PROVIDER,
+    lorebase_model: 'openai/gpt-6-luna',    // the model the route trials ran; read only on OpenRouter or vLLM
+    lorebase_connection_profile_id: '',     // read only while lorebase_provider is 'connection_profile'
+    lorebase_accuracy: 'fast',              // 'fast', Fast and Cheap [Jev], asks Jev (plan D16); 'high', High Accuracy, is Luna's pick and reviews
+    lorebase_jev_connection_profile_id: '', // Jev's SillyTavern profile, read only on 'fast'
+    lorebase_lore_budget_tokens: LORE_BUDGET_DEFAULT, // Lore budget on the WorldInfo page: the most tokens Jev's picks send a reply, read only on 'fast'
+    lorebase_enabled: false,                // LoreBase's switch on the WorldInfo page: off until the user turns it on
+    lorebase_key_calls_at_once: KEY_CALLS_AT_ONCE_DEFAULT, // Entries at once on the WorldInfo page: entries keyed at once, 1 to 8
 
-    // Keyword Extraction
-    custom_stopwords: '',               // Custom stopwords (comma-separated)
+    // How text splits into words for BM25
     cjk_tokenizer_mode: CJK_TOKENIZER_MODES.intl, // intl | jieba | jieba_tw | tiny_segmenter
 
     // EventBase workflow
@@ -249,7 +246,7 @@ const defaultSettings = {
     // independent of semantic retrieval. Only meaningful with auto-sync active, so
     // it lives on the AutoSync tab and forces the auto-sync window to 1 turn while on.
     summarizer_injection_enabled: false,
-    summarizer_injection_count: 20,               // recent events to inject; range 1-50
+    summarizer_injection_count: 15,               // recent events to inject; range 1-50
     // When on (default), each injected event also includes its structured fields
     // (cause, result, characters, locations, items, DateTime, concepts, keywords,
     // open_threads, message index) beneath the summary line. Off = summary only.
@@ -271,33 +268,13 @@ const defaultSettings = {
     // that forces auto-sync window=1, guaranteeing every message below the vectorization
     // tip is extracted before it could be wiped.
     eventbase_ghost_enabled: false,
-    eventbase_ghost_keep_recent: 10,              // recent messages kept verbatim; everything older that's vectorized is wiped. range 1-50 (summarizer injects ~20 events to cover the wiped span)
-    // Batch size of the wipe boundary: 1 moves it every turn (rolling). Larger values move
-    // it only every N messages, so the prompt's leading prefix stays byte-stable between
-    // jumps for provider prompt caching; the raw window can grow to keep-recent + N - 1.
-    eventbase_ghost_step: 1,
-    // Per-chat marker: auto-sync only processes windows whose start >= marker.
-    // Stamped at "max(source_window_end across existing events) + 1" when auto-sync
-    // is enabled on a non-empty collection, or at current chat length when collection
-    // is empty. Prevents the windowFingerprint cache from triggering a full re-extraction
-    // when the user changes window_size before enabling auto-sync.
-    // Keyed by chat UUID.
-    eventbase_autosync_start_marker: {},
-    // Per-chat record of the window_size that was last used for a successful extraction
-    // run. Used by the Vectorize Content → Continue path to detect window-size changes
-    // and warn the user before triggering a full re-extraction.
-    // Keyed by chat UUID.
-    eventbase_last_used_window_size: {},
-    // Per-chat persisted vectorization tip (= max(source_window_end)+1, the first
-    // uncovered message). Persisted so the "N msgs vectorized" display is correct
-    // immediately after a reload WITHOUT a backend probe — benefits standard+plugin
-    // and qdrant+plugin users. Keyed by chat UUID. See src/features/eventbase/eventbase-store.js.
-    eventbase_vectorization_tip: {},
+    eventbase_ghost_keep_recent: 1,               // recent messages kept verbatim; everything older that's vectorized is wiped. range 1-50 (Summarizer Injection's recent events cover the wiped span)
+    eventbase_ghost_batch_size: 1,                // messages the wipe boundary moves by: 1 moves it every turn; above 1 it waits for a whole batch, so the prompt's opening stays the same for a provider's prompt cache. range 1-100
     eventbase_min_importance_store: 3,            // Drop events below this importance before storing
     eventbase_max_events_per_window: 3,           // Hard cap on events returned per LLM call
     eventbase_retrieval_top_k: 10,                // Events to retrieve per generation
     eventbase_retrieval_min_importance: 1,        // Minimum importance for retrieval
-    eventbase_score_threshold: 0,                 // Similarity floor for every event search (EventBase page → Retrieval); 0 keeps every match
+    eventbase_score_threshold: 0,                 // Similarity floor for every event search (ChatHistory page → EventBase retrieval); 0 keeps every match
     eventbase_injection_format: 'densetext',      // Injection format: 'densetext' or 'jsonarray'
     eventbase_retrieval_filters_enabled: true,
     eventbase_autosync_popup: true,               // Show popup toast when auto-sync extraction runs
@@ -314,7 +291,7 @@ const defaultSettings = {
         raw_llm: false,     // per-window raw LLM text + parser candidate dumps
         qdrant: false,      // native hybrid keyword/fusion diagnostics
         standard: false,    // similharity plugin internals
-        injection: false,   // Chunk Path: what got injected, where, why
+        injection: false,   // What got injected, where, why
         agent: false,       // agent-mode planner / per-query hits
         story_arc: false,   // StoryArc: the Route rule of each turn, and the search text with other names
         rerank: false,      // native vs JS re-rank comparison
@@ -396,28 +373,6 @@ const defaultSettings = {
     // falls back to pre-search. UI: AgentMode tab.
     agentic_retrieval_max_tokens: AGENTIC_MAX_TOKENS_DEFAULT,
 
-    // ─── Auto-Reformat (Document/URL/Wiki) ──────────────────────────────
-    // Optional, per-session LLM pass offered in Vectorize Content for
-    // Document/URL/Wiki sources. Reads the source, classifies content into
-    // named-entity vs. topic/lore records via a self-tagged schema, and
-    // emits the final chunks directly (bypassing the mechanical strategy
-    // picker for that run) once the user reviews and accepts a full
-    // before/after diff. See src/features/chunkbase/reformat-schema.js / reformat-extractor.js
-    // / reformat-store.js. Independent from EventBase (chat's LLM pipeline)
-    // by design — no shared pipeline code, only generic utilities.
-    reformat_provider: '',              // '' → Same as EventBase model: chat_provider and chat_vllm_url, or its profile
-    reformat_connection_profile_id: '', // read only while reformat_provider is 'connection_profile'
-    reformat_model: '',                 // '' → chat_model, whichever provider runs Auto-Reformat
-    reformat_vllm_url: '',              // read only while reformat_provider is 'vllm' ('' → chat_vllm_url)
-    reformat_batch_chars: 6000,         // Target input chars per LLM call (packer)
-    reformat_max_output_tokens: 8000,
-    reformat_temperature: 0.2,
-    reformat_timeout_ms: 90000,
-    reformat_concurrency: 2,            // Parallel batch chains
-    reformat_max_body_chars: 2000,      // Oversize-entity ceiling — falls back to the adaptive splitter above this
-    reformat_name_fuzzy_threshold: 0.8, // Hallucination guardrail — min similarity to count a name as source-grounded
-    reformat_custom_prompt: '',
-
     // ─── Hidden / Power-User ────────────────────────────────────────────
     // SUPERADMIN MODE — no GUI toggle. Set to true by hand-editing settings.json
     // (the `vectfox` block under SillyTavern's extension_settings) to enable.
@@ -427,6 +382,10 @@ const defaultSettings = {
     // multi-persona admin scenarios. Do not expose in the UI — this is a tripwire,
     // not a feature.
     superadmin: false,
+
+    // The forced setting values already applied, by ID. A new install records every push as applied, so none replays
+    // over a newer default; see src/app/settings-migration-forced-values.js.
+    forced_setting_values_applied: forcedSettingValueIds(),
 };
 
 // Runtime settings: the defaults until start-up makes this extension_settings.vectfox itself.
@@ -446,10 +405,13 @@ let _lastChatTriggerEvent = null;
 const onChatEvent = debounce(async () => await moduleWorker.update(), debounce_timeout.relaxed);
 
 /**
- * Generation interceptor - searches and injects relevant messages
+ * The generation interceptor, which SillyTavern runs after slash commands and never on a dry run: EventBase's reply
+ * step (retrieval, the Summarizer and ghosting), and side by side with it LoreBase's pick and reviews, whose picks are
+ * held for SillyTavern's World Info scan once both are done. The chat and context size are the scan's, which LoreBase's
+ * tester keeps.
  */
-async function vectfox_rearrangeChat(chat, _contextSize, _abort, type) {
-    await rearrangeChat(chat, settings, type);
+async function vectfox_rearrangeChat(chat, contextSize, _abort, type) {
+    await prepareLoreBesideRetrieval(type, settings, () => runEventBaseReplyStep(chat, settings, type), { chat, maxContext: contextSize });
 }
 
 // Export to window for ST to call
@@ -530,20 +492,42 @@ jQuery(async () => {
         await saveSettings();
     }
 
-    // One-time reset of world_info_threshold values tuned against raw RRF scores
-    // (the 0.0x workaround for issue #11). Qdrant hybrid now returns cosine, so a
-    // 0.0x gate would flip from "makes Qdrant work" to "inject everything".
-    // Run-once via stamp — see src/app/settings-migration-world-info-threshold.js.
-    const _thresholdReset = migration_world_info_threshold_rrf_workaround(extension_settings.vectfox);
-    if (_thresholdReset.migrated) {
-        log.lifecycle(`VectFox: Reset world_info_threshold ${_thresholdReset.from} → ${WORLD_INFO_THRESHOLD_DEFAULT} (value was a workaround for the pre-cosine RRF score scale)`);
-        globalThis.toastr?.info(
-            `Your Lorebook similarity threshold (${_thresholdReset.from}) was a workaround for a scoring bug that is now fixed — scores are real 0-1 similarities on every backend. It has been reset to the default ${WORLD_INFO_THRESHOLD_DEFAULT}.`,
-            'VectFox — setting updated',
-            { timeOut: 15000 },
-        );
+    // Delete the settings of the vectorized lorebook search LoreBase replaced. Idempotent.
+    // See src/app/settings-migration-semantic-world-info-settings.js.
+    const _semanticWorldInfoRemoval = migration_remove_semantic_world_info_settings(extension_settings.vectfox);
+    if (_semanticWorldInfoRemoval.migrated > 0) {
+        log.lifecycle(`VectFox: Removed ${_semanticWorldInfoRemoval.migrated} semantic World Info setting(s): ${_semanticWorldInfoRemoval.keys.join(', ')}`);
+        const { saveSettings } = await import('./sillytavern/settings.js');
+        await saveSettings();
     }
-    if (_thresholdReset.stamped) {
+
+    // Delete the settings only ChunkBase read, with every per-chunk metadata key, and the fields of each collection's
+    // metadata that retired with it and with triggers and conditions. Idempotent. See
+    // src/app/settings-migration-chunkbase-settings.js and src/app/settings-migration-collection-retired-fields.js.
+    const _chunkBaseRemoval = migration_remove_chunkbase_settings(extension_settings.vectfox);
+    const _collectionFieldRemoval = migration_remove_retired_collection_fields(extension_settings.vectfox);
+    if (_chunkBaseRemoval.migrated > 0 || _collectionFieldRemoval.migrated > 0) {
+        log.lifecycle(`VectFox: Removed ${_chunkBaseRemoval.keys.length} ChunkBase setting(s) (${_chunkBaseRemoval.keys.join(', ')}), ${_chunkBaseRemoval.chunkMetadataCount} per-chunk metadata key(s), and ${_collectionFieldRemoval.migrated} retired field(s) from ${_collectionFieldRemoval.collectionCount} collection(s)`);
+        const { saveSettings } = await import('./sillytavern/settings.js');
+        await saveSettings();
+    }
+
+    // Copy how far EventBase has read each chat, stored per chat until now, into the record of each of the chat's
+    // collections, before anything reads it; an empty registry waits for the next start. Idempotent. See
+    // src/app/settings-migration-eventbase-progress.js.
+    const _eventBaseProgressCopy = migration_eventbase_progress_into_collections(extension_settings.vectfox);
+    if (_eventBaseProgressCopy.storeCount > 0) {
+        log.lifecycle(`VectFox: Copied EventBase's pointer of ${_eventBaseProgressCopy.chatCount} chat(s) onto ${_eventBaseProgressCopy.migrated} collection(s), dropped ${_eventBaseProgressCopy.droppedChatCount} chat(s) no collection holds, and deleted ${_eventBaseProgressCopy.storeCount} per-chat store(s)`);
+        const { saveSettings } = await import('./sillytavern/settings.js');
+        await saveSettings();
+    }
+
+    // Apply each forced setting value this install has not applied yet, over any value the user saved, once per push.
+    // Last of the settings migrations, so a push names a key in its newest shape; before the defaults merge, so an
+    // existing install with no record applies every push. See src/app/settings-migration-forced-values.js.
+    const _forcedValues = migration_apply_forced_setting_values(extension_settings.vectfox);
+    if (_forcedValues.migrated > 0) {
+        log.lifecycle(`VectFox: Applied ${_forcedValues.migrated} forced setting value(s) (${_forcedValues.ids.join(', ')}), changing ${_forcedValues.keys.length ? _forcedValues.keys.join(', ') : 'no saved value'}`);
         const { saveSettings } = await import('./sillytavern/settings.js');
         await saveSettings();
     }
@@ -590,6 +574,9 @@ jQuery(async () => {
     // The settings panel, in SillyTavern's Extensions drawer
     mountSettingsPanel('extensions_settings2', settings, { runNetworkStartup });
 
+    // VectFox's row in SillyTavern's wand menu: Menu opens the panel, Last reply's lore the latest reply's entries
+    mountWandMenu();
+
     // Once SillyTavern has loaded: the one-time notice that manual OpenRouter and vLLM retire
     scheduleManualConnectionNotice(settings);
 
@@ -599,8 +586,11 @@ jQuery(async () => {
     // Initialize database browser
     initializeDatabaseBrowser(settings);
 
-    // Initialize world info integration hooks
-    initializeWorldInfoIntegration();
+    // LoreBase follows generations, so its pick knows a quiet-to-loud one as a reply, and arms each World Info scan
+    initializeLoreBase();
+
+    // The latest reply's lorebook entries, for the wand menu's Last reply's lore
+    initializeReplyLore();
 
     // Off-box startup work (discovery, EventBase index backfill, plugin version check).
     // Master switch OFF → skip it entirely; the switch re-runs this when turned back ON,
@@ -622,7 +612,6 @@ jQuery(async () => {
         onChatEvent();
     };
     eventSource.on(event_types.MESSAGE_DELETED, trigger('MESSAGE_DELETED'));
-    // Note: Semantic WI injection happens in the generate_interceptor (rearrangeChat), not here
     eventSource.on(event_types.MESSAGE_SENT, trigger('MESSAGE_SENT'));
     eventSource.on(event_types.MESSAGE_RECEIVED, trigger('MESSAGE_RECEIVED'));
     eventSource.on(event_types.MESSAGE_SWIPED, trigger('MESSAGE_SWIPED'));
@@ -631,11 +620,11 @@ jQuery(async () => {
     // switch is OFF so the panel shows the current chat; refreshAutoSyncCheckbox then
     // reads cached state only and never calls the backend.
     eventSource.on(event_types.CHAT_CHANGED, () => {
-        if (isVectFoxEnabled(settings)) {
-            log.lifecycle('VectFox: Chat changed, refreshing UI state');
-        }
+        if (isVectFoxEnabled(settings)) log.lifecycle('VectFox: Chat changed, refreshing UI state');
         refreshAutoSyncCheckbox(settings);
     });
+    // A renamed chat keeps its collections' locks (§2.2 of vectfox-multi-collection-per-chat.md).
+    eventSource.on(event_types.CHAT_RENAMED, followChatRenameOfCollections);
 
     // Keep the ghosting WI-scan floor accurate: refresh the cached deepest per-entry World
     // Info scanDepth whenever the active books or WI settings change (off the hot path, so

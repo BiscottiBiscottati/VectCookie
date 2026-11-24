@@ -178,7 +178,7 @@ export class ProgressTracker {
     }
 
     /**
-     * Update what the run found or made: the chunks a source cut into, or the events EventBase found (foundLabel).
+     * Update what the run found or made: the chunks a collection holds, or the events EventBase found (foundLabel).
      * @param {number} totalChunks
      */
     updateChunks(totalChunks) {
@@ -246,12 +246,13 @@ export class ProgressTracker {
     }
 
     /**
-     * Show the panel again after it was closed.
+     * Show the panel again, in front: after it was closed, or when a run still going should be seen.
      * @returns {boolean} true if there was a panel to show
      */
     reopen() {
         if (!this.panel) return false;
-        // Only revealed: show() put it on the page, or moved it off a popup that closed.
+        // Last on the topmost open popup, as show() places it, so it is in front of whatever opened since.
+        placeOnTopmostModalLayer(this.panel);
         showPart(this.panel, true);
         this.isVisible = true;
         this.updateDisplay();

@@ -6,7 +6,7 @@
  *   success:true and qdrantScanned:false → discovery pruned every qdrant
  *   registry entry as "stale" → the next DB-browser refresh fed the shrunken
  *   list to cleanupOrphanedMeta → the qdrant collections' metadata (chat and
- *   character LOCKS, triggers, scope, names) was deleted and persisted. The
+ *   character LOCKS, scope, names) was deleted and persisted. The
  *   collection reappeared on the next healthy scan, but its lock did not.
  *
  * Three guards, one contract: absence is only proof of deletion when the
@@ -51,7 +51,7 @@ import { extension_settings } from '../../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../../script.js';
 import { getSavedHashes } from '../src/features/vector-backend/vector-api.js';
 import { log } from '../src/sillytavern/log.js';
-import { discoverExistingCollections, getCollectionRegistry } from '../src/features/collections/collection-loader.js';
+import { discoverExistingCollections, getCollectionFilterReason, getCollectionRegistry, registerCollection } from '../src/features/collections/collection-loader.js';
 import { resetPluginAvailableCache } from '../src/shared/similharity-plugin.js';
 import { cleanupOrphanedMeta } from '../src/features/collections/collection-metadata.js';
 
@@ -170,7 +170,7 @@ describe('discoverViaPlugin × the shared Qdrant collection', () => {
 describe('cleanupOrphanedMeta outage refusal', () => {
     it('refuses to delete anything when discovery returned zero collections', () => {
         extension_settings.vectfox.collections = {
-            [QDRANT_KEY]: { lockedToChatIds: ['chat-1'], triggers: ['dragon'] },
+            [QDRANT_KEY]: { lockedToChatIds: ['chat-1'] },
             [VECTRA_KEY]: { lockedToCharacterIds: ['2'] },
         };
 
@@ -185,20 +185,25 @@ describe('cleanupOrphanedMeta outage refusal', () => {
         expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('refused'));
     });
 
-    it('still prunes a real orphan when survivors exist, and names it in the log', () => {
+    it('still prunes a real orphan when survivors exist, its chat lock index entries with it, and names it in the log', () => {
         extension_settings.vectfox.collections = {
             [QDRANT_KEY]: { lockedToChatIds: ['chat-1'] },
-            'standard:vf_document_gone_123': { name: 'deleted doc' },
+            'standard:vf_eventbase_gone_123': { name: 'deleted chat', lockedToChatIds: ['chat-1', 'chat-2'] },
+        };
+        extension_settings.vectfox.chat_lock_index = {
+            'chat-1': [QDRANT_KEY, 'standard:vf_eventbase_gone_123'],
+            'chat-2': ['standard:vf_eventbase_gone_123'],
         };
 
         const result = cleanupOrphanedMeta([QDRANT_KEY]);
 
         expect(result.refused).toBe(false);
         expect(result.removed).toBe(1);
-        expect(result.orphanedIds).toEqual(['standard:vf_document_gone_123']);
+        expect(result.orphanedIds).toEqual(['standard:vf_eventbase_gone_123']);
         expect(extension_settings.vectfox.collections[QDRANT_KEY]).toBeDefined();
-        expect(extension_settings.vectfox.collections['standard:vf_document_gone_123']).toBeUndefined();
-        expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('standard:vf_document_gone_123'));
+        expect(extension_settings.vectfox.collections['standard:vf_eventbase_gone_123']).toBeUndefined();
+        expect(extension_settings.vectfox.chat_lock_index).toEqual({ 'chat-1': [QDRANT_KEY] });
+        expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('standard:vf_eventbase_gone_123'));
     });
 
     it('no-ops cleanly when nothing is orphaned', () => {
@@ -247,5 +252,33 @@ describe('discoverViaFallback outage handling', () => {
         await discoverExistingCollections(SETTINGS);
 
         expect(getCollectionRegistry()).not.toContain(VECTRA_KEY);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// LoreBase's vectors (§4.2 of InternalProject/Vectfox/plans/executed/lorebook-multi-vector.md) are LoreBase's tab's to keep: a
+// book's tenant and the account's own collection never enter the registry, so the Database Browser never lists them.
+// ---------------------------------------------------------------------------
+describe("LoreBase's vectors and the registry", () => {
+    const BOOK_ID = 'vf_lorebase_qdrant_testpersona_harbor_atlas_1x2y';
+
+    it("discovery skips every vf_lorebase_ collection, a book inside vectfox_main and the account's own alike", async () => {
+        mockPluginFetch({
+            success: true, qdrantScanned: true, qdrantTenantsScanned: true,
+            collections: [VECTRA_LIVE, { id: BOOK_ID, backend: 'qdrant', source: 'openrouter', chunkCount: 40 },
+                { id: 'vf_lorebase_testpersona', backend: 'qdrant', source: 'openrouter', chunkCount: 40 }],
+        });
+
+        await discoverExistingCollections(SETTINGS);
+
+        expect(getCollectionRegistry().some(key => key.includes('vf_lorebase_'))).toBe(false);
+        expect(getCollectionFilterReason(BOOK_ID)).toBe('lorebase-vectors');
+    });
+
+    it('never registers a book a LoreBase insert wrote to, and registers any other collection', () => {
+        registerCollection(`qdrant:${BOOK_ID}`);
+        registerCollection('qdrant:vf_eventbase_qdrant_testpersona_harbor_chat');
+
+        expect(getCollectionRegistry()).toEqual(['qdrant:vf_eventbase_qdrant_testpersona_harbor_chat']);
     });
 });

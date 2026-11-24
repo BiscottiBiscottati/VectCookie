@@ -8,10 +8,13 @@
  * database-browser.js finds by id, as it finds each control. Rows and buttons
  * carry data-* hooks: `data-browser-action` for a page's buttons,
  * `data-collection-action` with `data-collection-key` for a collection's,
- * `data-collection-select` for its selection box, and `data-size-action` and
- * `data-size-page` for the Size Inspector's (size-inspector.js). A collection's row is drawn from
- * a view (database-browser.js collectionRowView) holding only plain values. Every
- * value is escaped by the builders. Pure: builds strings.
+ * `data-collection-select` for its selection box, `data-lorebase-action` with
+ * `data-lorebase-row` for a LoreBase row's, `data-lorebase-flag` for a lorebook's
+ * ⚠, and `data-size-action` and
+ * `data-size-page` for the Size Inspector's (size-inspector.js). A collection's row
+ * and a lorebook's LoreBase rows are drawn from views (database-browser.js
+ * collectionRowView, loreBaseBookView) holding only plain values. Every value is
+ * escaped by the builders. Pure: builds strings.
  * ============================================================================
  */
 
@@ -35,14 +38,14 @@ import {
 import { buttonWithId, cardHeader, dangerZone, navBrand, navItem, pageHeader, switchRow } from '../../shared/gui-dna/panel-page-genes.js';
 import { escapeHtmlAttribute as escape } from '../../shared/html-escape.js';
 import { formatBytes } from '../../shared/byte-size.js';
-import { counted } from './counted.js';
+import { counted } from '../../shared/counted.js';
 
 export const BROWSER_ROOT_ID = 'vectfox_database_browser';
 
 /** The browser's pages, in nav order. */
 export const BROWSER_PAGES = Object.freeze([
     { name: 'collections', icon: 'fa-folder-open', title: 'Collections', subtitle: 'Your collections: what each holds, where it is stored and when it is used.' },
-    { name: 'search', icon: 'fa-magnifying-glass', title: 'Search', subtitle: 'Searches every collection by meaning, the way retrieval does.' },
+    { name: 'search', icon: 'fa-magnifying-glass', title: 'Search', subtitle: 'Searches every collection by meaning and words, as Core → Keyword scoring sets.' },
     { name: 'size', icon: 'fa-weight-hanging', title: 'Size Inspector', subtitle: 'Finds entries large enough to bloat the prompt.' },
 ]);
 
@@ -64,17 +67,7 @@ const SIMILHARITY_INSTALL_URL = 'https://github.com/KritBlade/VectFox/tree/Simil
 // The icon for each collection type; a type not listed gets a cube (collectionTypeIcon).
 const TYPE_ICONS = Object.freeze({
     chat: 'fa-message',
-    file: 'fa-file-lines',
-    doc: 'fa-file-lines',
-    paste: 'fa-file-lines',
-    select: 'fa-file-lines',
-    current: 'fa-file-lines',
     lorebook: 'fa-book-open',
-    character: 'fa-user',
-    persona: 'fa-user',
-    url: 'fa-globe',
-    wiki: 'fa-globe',
-    youtube: 'fa-globe',
 });
 
 /**
@@ -89,15 +82,11 @@ export function collectionTypeIcon(type) {
 
 const SCOPE_PILL_TEXT = Object.freeze({ character: 'Character', chat: 'Chat' });
 
-const ACTIVATION_PILLS = Object.freeze({
-    triggers: { text: 'Triggers', icon: 'fa-key' },
-    conditions: { text: 'Conditions', icon: 'fa-filter' },
-});
-
 function browserPage(name, content) {
     const page = BROWSER_PAGES.find(each => each.name === name);
     const status = name === 'collections'
         ? statusPill({ name: '', data: { 'browser-count': 'collections' } }) + statusPill({ name: '', data: { 'browser-count': 'chunks' } })
+            + statusPill({ name: '', isHidden: true, data: { 'browser-count': 'lorebooks' } })
         : '';
     return `<div id="${browserPageId(name)}" class="vfx-page"${name === FIRST_BROWSER_PAGE ? '' : HIDDEN}>`
         + pageHeader({ icon: page.icon, eyebrow: `Database Browser / ${page.title}`, title: page.title, subtitle: page.subtitle, status })
@@ -123,10 +112,7 @@ function filtersCard() {
                 select({ id: 'vectfox_browser_type', options: [
                     selectOption({ value: 'all', text: 'All types', isSelected: true }),
                     selectOption({ value: 'chat', text: 'Chats' }),
-                    selectOption({ value: 'lorebook', text: 'Lorebooks' }),
-                    selectOption({ value: 'character', text: 'Characters' }),
-                    selectOption({ value: 'document', text: 'Documents' }),
-                    selectOption({ value: 'web', text: 'Web pages' }),
+                    selectOption({ value: 'lorebase', text: 'LoreBase' }),
                 ] }),
             ])}
             ${field([
@@ -184,10 +170,9 @@ function collectionsPage() {
         + filtersCard()
         + collectionsCard()
         + dangerZone({
-            title: 'Registry and Auto-Reformat originals',
+            title: 'Registry',
             buttons: [
                 { id: 'vectfox_reset_registry', icon: 'fa-arrows-rotate', text: 'Resync registry', tooltip: 'Clears the list of collections VectFox keeps, then scans the backends again.' },
-                { id: 'vectfox_browser_clear_reformat_originals', icon: 'fa-broom', text: 'Clear originals', tooltip: 'Deletes the source text Auto-Reformat kept for review. The chunks stay.' },
             ],
         }));
 }
@@ -217,20 +202,19 @@ export function storyLinksRowMarkup(key, description = '') {
 
 /**
  * One collection in the list: its selection box, then its row (type icon, name, counts, pills and actions) and, for
- * an EventBase collection StoryArc links, its links row.
+ * an EventBase collection StoryArc links, its links row. A collection Compact collection can clean gets its button.
  *
  * @param {{key: string, name: string, id: string, type: string, chunkCount: number, isEnabled: boolean,
  *   isSelected: boolean, scope: string, backend: string, source: string, model: string, hasMultipleModels: boolean,
- *   activeHereLine: string, activationMode: string, hasStoryLinks: boolean, storyLinksDescription?: string}} view
+ *   activeHereLine: string, canCompact: boolean, hasStoryLinks: boolean,
+ *   storyLinksDescription?: string}} view
  * @returns {string}
  */
 export function collectionEntryMarkup(view) {
     const data = action => ({ 'collection-action': action, 'collection-key': view.key });
-    const activation = ACTIVATION_PILLS[view.activationMode];
     const pills = [
         SCOPE_PILL_TEXT[view.scope] ? statusPill({ text: SCOPE_PILL_TEXT[view.scope] }) : '',
         view.hasMultipleModels ? statusPill({ name: view.model, status: 'accent', icon: 'fa-code-branch' }) : '',
-        activation ? statusPill({ text: activation.text, status: 'accent', icon: activation.icon }) : '',
         view.activeHereLine ? statusPill({ text: 'Active here', status: 'success', icon: 'fa-lock' }) : '',
         view.isEnabled ? '' : statusPill({ text: 'Paused', status: 'warning', icon: 'fa-pause' }),
     ].filter(Boolean);
@@ -242,6 +226,7 @@ export function collectionEntryMarkup(view) {
         iconButton({ icon: 'fa-eye', title: 'View chunks', data: data('view-chunks') }),
         iconButton({ icon: 'fa-file-export', title: 'Export as JSON', data: data('export-json') }),
         iconButton({ icon: 'fa-image', title: 'Export as PNG card', data: data('export-png') }),
+        view.canCompact ? iconButton({ icon: 'fa-compress', title: 'Compact collection', data: data('compact') }) : '',
         iconButton({ icon: 'fa-trash-can', title: 'Delete', isDanger: true, data: data('delete') }),
     ].filter(Boolean);
     const row = listRow({
@@ -249,7 +234,7 @@ export function collectionEntryMarkup(view) {
         name: view.name,
         sub: [
             { text: 'Chunks', name: view.chunkCount },
-            view.backend ? { text: 'Stored in', name: view.source ? `${view.backend}, embedded by ${view.source}` : view.backend } : null,
+            view.backend ? { text: 'Stored in', name: view.embedding ? `${view.backend}, embedded by ${view.embedding}` : view.backend } : null,
             { text: 'ID', name: view.id },
             view.activeHereLine ? { name: view.activeHereLine } : null,
         ],
@@ -263,6 +248,102 @@ export function collectionEntryMarkup(view) {
         + '</label>'
         + `<div class="vfx-pick-body">${row}${linksRow}</div>`
         + '</div>';
+}
+
+/**
+ * One branch of a lorebook's LoreBase rows, in one line as a StoryArc links row is: its keys, or the vectors one
+ * collection holds of it, with the actions the view allows.
+ *
+ * @param {{key: string, kind: string, line: string, isElsewhere: boolean, canViewChunks?: boolean, canExport: boolean,
+ *   canImport: boolean, canDelete: boolean}} row - line: what it holds, in words; canViewChunks: a vectors row's
+ * @returns {string}
+ */
+function loreBaseRowMarkup(row) {
+    const isKeys = row.kind === 'keys';
+    const words = isKeys ? 'keys' : 'vectors';
+    const data = action => ({ 'lorebase-action': action, 'lorebase-row': row.key });
+    return listRow({
+        icon: isKeys ? 'fa-key' : 'fa-vector-square',
+        text: isKeys ? 'LoreBase keys' : 'LoreBase vectors',
+        sub: { name: row.line },
+        pills: row.isElsewhere ? [statusPill({ text: 'Not read', status: 'warning' })] : [],
+        actions: [
+            row.canViewChunks ? iconButton({ icon: 'fa-eye', title: 'View chunks', data: data('view-chunks') }) : '',
+            row.canExport ? iconButton({ icon: 'fa-file-export', title: `Export ${words}`, data: data('export') }) : '',
+            row.canImport ? iconButton({ icon: 'fa-file-import', title: `Import ${words}`, data: data('import') }) : '',
+            row.canDelete ? iconButton({ icon: 'fa-trash-can', title: `Delete ${words}`, isDanger: true, data: data('delete') }) : '',
+        ].filter(Boolean),
+        data: { 'lorebase-row-entry': row.key },
+    });
+}
+
+// Where a collection's tick box sits, kept empty beside a lorebook's row, so the two line up.
+const BLANK_PICK_CHECK = '<span class="vfx-pick-check is-blank" aria-hidden="true"><input type="checkbox" class="vfx-check" tabindex="-1" disabled></span>';
+
+/**
+ * One lorebook's LoreBase rows (§3.2 of InternalProject/Vectfox/plans/executed/vectfox-multi-collection-per-chat.md), shaped as a
+ * chat collection's: the lorebook's row, in the collections' column, with the entries its selections hold, and how
+ * many selections when there are more than one, where its vectors are
+ * stored and their ID, the ⚠ flag when the view gives one, and Remove from LoreBase when the view allows it, then a
+ * branch for its keys and one for each collection holding its vectors, whose View chunks opens them read only. No tick
+ * box, lock, pause or rename, none of which means anything for them.
+ *
+ * @param {{key: string, name: string, bookName: string|null, canRemove: boolean, isInSillyTavern: boolean,
+ *   selectedCount: number|null, selectionCount: number|null, storedIn: string, id: string, flag: string, isFlagOpen: boolean,
+ *   rows: object[]}} view - selectedCount: null leaves its line out; flag: the ⚠'s words, '' for none; rows: as
+ *   loreBaseRowMarkup takes them
+ * @returns {string}
+ */
+export function loreBaseBookMarkup(view) {
+    const bookRow = listRow({
+        icon: collectionTypeIcon('lorebook'),
+        name: view.name,
+        sub: [
+            view.selectedCount === null ? null : {
+                text: 'Selected entries',
+                name: view.selectionCount > 1 ? `${view.selectedCount}, in ${view.selectionCount} selections` : view.selectedCount,
+            },
+            { text: 'Stored in', name: view.storedIn },
+            { text: 'ID', name: view.id },
+        ],
+        pills: view.isInSillyTavern ? [] : [statusPill({ text: 'Not in SillyTavern', status: 'warning' })],
+        flag: view.flag ? { title: view.flag, isOpen: view.isFlagOpen, data: { 'lorebase-flag': view.key } } : null,
+        actions: view.canRemove
+            ? [iconButton({ icon: 'fa-trash-can', title: 'Remove from LoreBase', isDanger: true, data: { 'lorebase-remove': view.bookName } })]
+            : [],
+    });
+    return `<div class="vfx-pick-row" data-lorebase-book="${escape(view.key)}">${BLANK_PICK_CHECK}<div class="vfx-pick-body">`
+        + bookRow + view.rows.map(loreBaseRowMarkup).join('')
+        + '</div></div>';
+}
+
+/**
+ * Show leftovers, under the list, and, while it is open, the LoreBase leftovers: what LoreBase cannot use here, each
+ * lorebook's rows as loreBaseBookMarkup draws them.
+ *
+ * @param {{lorebookCount: number, isOpen: boolean, booksMarkup: string}} view
+ * @returns {string}
+ */
+export function loreBaseLeftoversMarkup({ lorebookCount, isOpen, booksMarkup }) {
+    const toggle = controlRow([
+        button({ text: isOpen ? 'Hide leftovers' : 'Show leftovers', icon: 'fa-box-archive', data: { 'browser-action': 'toggle-leftovers' } }),
+        statusPill({ name: counted(lorebookCount, 'lorebook'), status: 'warning' }),
+    ]);
+    if (!isOpen) return `<div class="vfx-list" data-lorebase-leftovers="">${toggle}</div>`;
+    return `<div class="vfx-list" data-lorebase-leftovers="">${toggle}`
+        + groupTitle({ icon: 'fa-box-archive', text: 'LoreBase leftovers' })
+        + hint({ text: 'Keys and vectors LoreBase cannot use here. Export them to keep a copy, or delete them.' })
+        + booksMarkup + '</div>';
+}
+
+/**
+ * Where LoreBase's rows go when its keys and vectors could not be read.
+ *
+ * @param {string} reason
+ * @returns {string}
+ */
+export function loreBaseProblemMarkup(reason) {
+    return notice({ status: 'warning', text: "LoreBase's keys and vectors could not be read", name: reason });
 }
 
 /** The list when no collection passes the filters. */

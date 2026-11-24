@@ -10,8 +10,8 @@
  *
  * Every model path can hit this (EventBase extraction, summarizer, agent mode,
  * embedding), so the user-facing toast lives here once instead of being
- * re-implemented at each catch site. Pausing EventBase auto-sync after such a
- * failure is eventbase-store.js's pauseAutoSyncForChat.
+ * re-implemented at each catch site. Turning EventBase auto-sync off after such a
+ * failure is eventbase-store.js's pauseCollectionAutoSync, on the collection in use.
  * ============================================================================
  */
 
@@ -112,18 +112,37 @@ export function notifyConnectionError(contextLabel, url, detail) {
 const _upstreamNotified = new Set();
 
 /**
+ * What commonly makes a provider reject a request, and where its full error is. Every notice of a rejection names
+ * these: this toast, and the end-of-run notice of a caller that sends a rejected request again (EventBase extraction).
+ * @param {boolean} [isQuotaError] - ST's quota_error flag (429 + insufficient_quota)
+ * @returns {string}
+ */
+export function describeUpstreamRejectionCauses(isQuotaError = false) {
+    const why = isQuotaError
+        ? 'Your provider reports the account is out of quota — check billing/credits.'
+        : 'Common causes: a parameter this model does not accept (see "Use max_completion_tokens", '
+          + '"Send temperature" and "Turn off model thinking" in Core → EventBase model), '
+          + 'a wrong API key, or a prompt the provider refused.';
+    return `${why} SillyTavern only forwards the status text to the browser — the provider's full error is in the `
+        + `SillyTavern SERVER console ("Chat completion request error").`;
+}
+
+/**
  * Sticky, de-duped toast for "the provider rejected this request and ST only told
- * us the status text". Sticky because this class never self-heals: the same bad
- * key / unsupported parameter / invalid model fails identically on every window,
- * and an auto-dismissing toast during a long background extraction is exactly the
- * silence we are trying to remove. A warning because the caller carries on past it
- * and the user must act: red means a run stopped. A provider's own server error
- * asks nothing of the user, so postChatCompletion logs it without calling this.
+ * us the status text". Sticky because a rejection of the user's settings (a bad key,
+ * a parameter the model does not accept) fails the same way on every later request
+ * until they change it, and an auto-dismissing toast during a long background
+ * extraction is exactly the silence we are trying to remove. A warning because the
+ * caller carries on past it and the user must act: red means a run stopped. A
+ * provider's own server error asks nothing of the user, so postChatCompletion logs
+ * it without calling this. A provider also rejects a request now and then and takes
+ * the same one a moment later, so a caller that sends it again turns this toast off
+ * and reports only what still fails (postChatCompletion's shouldNotifyUpstreamRejection).
  *
  * De-dup key is context + model + detail, so a different model or a different
  * upstream status warns afresh while a run of 200 failing windows warns once.
  *
- * @param {string} contextLabel - 'EventBase' | 'Summarizer' | 'Agent Mode' | 'Auto-Reformat'
+ * @param {string} contextLabel - The feature that sent the call, as postChatCompletion names it ('EventBase', 'StoryArc', …)
  * @param {string} model - the model id that was requested
  * @param {string} detail - upstream status text ST forwarded (e.g. 'Bad Request')
  * @param {boolean} [isQuotaError] - ST's quota_error flag (429 + insufficient_quota)
@@ -133,17 +152,10 @@ export function notifyUpstreamRejection(contextLabel, model, detail, isQuotaErro
     if (_upstreamNotified.has(key)) return;
     _upstreamNotified.add(key);
 
-    const why = isQuotaError
-        ? 'Your provider reports the account is out of quota — check billing/credits.'
-        : 'Common causes: a parameter this model does not accept (see "Use max_completion_tokens", '
-          + '"Send temperature" and "Turn off model thinking" in Core → EventBase model), '
-          + 'a wrong API key, or a prompt the provider refused.';
-
     try {
         toastr.warning(
-            `The provider rejected the ${contextLabel} request for model "${model}" (${detail}). ${why} `
-            + `SillyTavern only forwards the status text to the browser — the provider's full error is in the `
-            + `SillyTavern SERVER console ("Chat completion request error").`,
+            `The provider rejected the ${contextLabel} request for model "${model}" (${detail}). `
+            + describeUpstreamRejectionCauses(isQuotaError),
             `VectFox — ${contextLabel} request rejected`,
             { timeOut: 0, extendedTimeOut: 0 },
         );
@@ -156,10 +168,8 @@ export function notifyUpstreamRejection(contextLabel, model, detail, isQuotaErro
 // A retrieval path that catches its own errors and returns an empty result set is
 // indistinguishable, from the user's seat, from a corpus with nothing relevant in
 // it: no toast, no error, the message just sends without the memory it should have
-// had. That is what GitHub issue #11 reported — semantic lorebook activation went
-// silent on one backend and there was nothing in the console at default log level
-// to say why. Retrieval callers still degrade gracefully (a failed lookup must
-// never break a generation), but the degradation is now announced.
+// had. Retrieval callers still degrade gracefully (a failed lookup must never
+// break a generation), but the degradation is announced.
 const _retrievalNotified = new Set();
 
 /**
@@ -174,7 +184,7 @@ const _retrievalNotified = new Set();
  * transient — a restarted Qdrant or a slow embedder recovers on its own, and a
  * sticky toast per turn would be worse than the silence it replaces.
  *
- * @param {string} contextLabel - 'Lorebook' | 'EventBase' | 'Chat memory' | …
+ * @param {string} contextLabel - 'EventBase' | 'Chat memory' | …
  * @param {string} sourceName - human-readable collection / book name
  * @param {unknown} detail - the caught error (or a message string)
  */
@@ -258,52 +268,4 @@ export function notifySetupIncomplete(contextLabel, message) {
  */
 export function resetSetupIncompleteNotifications() {
     _setupNotified.clear();
-}
-
-// ---------------------------------------------------------------------------
-// "Feature is on but nothing it needs is active" surfacing.
-// ---------------------------------------------------------------------------
-// Distinct from notifyRetrievalFailure: there, a query ran and broke. Here, no
-// query was ever issued because every candidate collection was filtered out
-// before the search — disabled, owned by another persona, or not activated by
-// any trigger/condition/lock. The user has the feature switched ON and vectorized
-// content sitting in the registry, so from their seat it simply does nothing, and
-// the per-collection reason is a log.trace nobody has enabled. Same silent class
-// as GitHub issue #11, different cause.
-const _noActiveSourceNotified = new Set();
-
-/**
- * De-duped warning toast for "this feature is enabled, you have vectorized
- * content, and none of it is eligible this turn — here is why".
- *
- * De-dup key is context + scope + reason, where scope is normally the current
- * chat id. Per-chat rather than per-session on purpose: the most common cause is
- * a lock that points at a different chat/character, which is exactly what the
- * user changes when they switch chats. A session-wide de-dup would show it once
- * in the chat where it did not matter and stay quiet in the one where it did.
- *
- * @param {string} contextLabel - 'Semantic Lorebook' | 'ChunkBase' | …
- * @param {string} scopeKey - current chat id (or any per-context de-dup key)
- * @param {string} reason - human-readable breakdown of why nothing qualified
- */
-export function notifyNoActiveCollections(contextLabel, scopeKey, reason) {
-    const key = `${contextLabel}|${scopeKey || ''}|${reason}`;
-    if (_noActiveSourceNotified.has(key)) return;
-    _noActiveSourceNotified.add(key);
-    try {
-        toastr.warning(
-            `${contextLabel} is ON but nothing was searched this turn. ${reason} `
-            + `Open the Database Browser to lock the collection to this chat or character.`,
-            `VectFox — ${contextLabel} inactive`,
-            { timeOut: 15000, extendedTimeOut: 5000 },
-        );
-    } catch (_) { /* toastr unavailable (e.g. unit tests) */ }
-}
-
-/**
- * Forget prior no-active-source notifications.
- * @internal Resets module state between tests.
- */
-export function resetNoActiveCollectionsNotifications() {
-    _noActiveSourceNotified.clear();
 }

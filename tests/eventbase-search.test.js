@@ -2,8 +2,9 @@
  * Tests for how every EventBase search queries an event collection (src/features/eventbase/eventbase-search.js).
  *
  * Guards that:
- *   - an event search runs on EventBase's keyword scoring and similarity threshold, never ChunkBase's,
- *   - the threshold defaults to 0, so ChunkBase's 0.25 never gates events,
+ *   - an event search runs on EventBase's keyword scoring and similarity threshold, never the Core page's keyword
+ *     scoring, which the Database Browser's search reads, or a score_threshold the settings carry,
+ *   - the threshold defaults to 0, so a score_threshold left in the settings never gates events,
  *   - Standard's query applies the threshold, so its hits, which may carry no score, are all kept,
  *   - on Qdrant the hits below the threshold are dropped by their similarity, not a fused score,
  *   - re-ranked events take their similarity from a plain search, and those outside it are dropped,
@@ -34,13 +35,13 @@ beforeEach(() => {
 });
 
 describe('eventSearchSettings', () => {
-    it('swaps in EventBase\'s keyword scoring and threshold for ChunkBase\'s', () => {
+    it('swaps in EventBase\'s keyword scoring and threshold for the settings\' own', () => {
         const settings = { keyword_scoring_method: 'hybrid', score_threshold: 0.25, eventbase_keyword_scoring_method: 'hybrid', eventbase_score_threshold: 0.4 };
         expect(eventSearchSettings(settings)).toMatchObject({ keyword_scoring_method: 'hybrid', score_threshold: 0.4 });
         expect(eventSearchSettings({ keyword_scoring_method: 'hybrid', score_threshold: 0.25 })).toMatchObject({ keyword_scoring_method: 'bm25', score_threshold: 0 });
     });
 
-    it('takes a threshold given over the EventBase page\'s', () => {
+    it('takes a threshold given over the ChatHistory page\'s', () => {
         expect(eventSearchSettings({ eventbase_score_threshold: 0.4 }, 0).score_threshold).toBe(0);
     });
 });
@@ -63,7 +64,7 @@ describe('searchEventCollection', () => {
     ];
     const answer = { hashes: hits.map(hit => hit.hash), metadata: hits };
 
-    it('sends EventBase\'s threshold with the query, never ChunkBase\'s', async () => {
+    it('sends EventBase\'s threshold with the query, never a score_threshold the settings carry', async () => {
         queryCollectionMock.mockResolvedValue({ hashes: [], metadata: [] });
         await searchEventCollection('standard:vf_eventbase_x', 'the duel', 8, { vector_backend: 'standard', score_threshold: 0.25 }, { queryVector: [0.1, 0.2] });
         expect(queryCollectionMock.mock.calls[0].slice(0, 3)).toEqual(['standard:vf_eventbase_x', 'the duel', 8]);
@@ -108,7 +109,7 @@ describe('keepRerankedEventsAtThreshold', () => {
 });
 
 describe('EventBase searches', () => {
-    it('all go through eventbase-search.js, so none can take ChunkBase\'s threshold', () => {
+    it('all go through eventbase-search.js, so none can take another threshold', () => {
         const folder = new URL('../src/features/eventbase/', import.meta.url);
         const importers = readdirSync(folder)
             .filter(name => name.endsWith('.js'))

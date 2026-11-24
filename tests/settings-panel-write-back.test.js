@@ -3,11 +3,12 @@
  * That line must never undo what other code stored since the page loaded.
  *
  * These tests run VectFox's real start-up in src/index.js and hand the object it gives
- * the panel to that same line. They also check the connection defaults that start-up
- * fills in: a new install's LLM consumers and embedding start on a SillyTavern profile,
- * none chosen, and an existing install keeps the provider it saved (connection plan §1, §3);
- * and that start-up schedules the one-time notice on manual OpenRouter and vLLM with the
- * store itself, unshown on an install that never saw it (row N1).
+ * the panel to that same line. They also check that start-up deletes the settings only
+ * ChunkBase read, and every per-chunk metadata key, before the defaults go in; the
+ * connection defaults it fills in: a new install's LLM consumers and embedding start on a
+ * SillyTavern profile, none chosen, and an existing install keeps the provider it saved
+ * (connection plan §1, §3); and that start-up schedules the one-time notice on manual
+ * OpenRouter and vLLM with the store itself, unshown on an install that never saw it (row N1).
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -39,11 +40,8 @@ vi.mock('../src/sillytavern/extension-runtime.js', () => ({
     debounce: callback => callback,
     debounce_timeout: { relaxed: 1 },
 }));
-vi.mock('../src/features/chunkbase/index.js', () => ({
-    synchronizeChat: vi.fn(),
-    rearrangeChat: vi.fn(),
-}));
 vi.mock('../src/features/collections/index.js', () => ({
+    followChatRenameOfCollections: vi.fn(),
     migrateOldEnabledKeys: () => ({ migrated: 0 }),
     cleanupCorruptedCollections: vi.fn(),
     registerCollection: vi.fn(),
@@ -52,6 +50,9 @@ vi.mock('../src/features/collections/index.js', () => ({
 vi.mock('../src/features/eventbase/index.js', () => ({
     clearCachesForDeletedOrImportedCollection: vi.fn(),
     refreshWorldInfoEntryDepthCache: vi.fn(),
+    runEventBaseReplyStep: vi.fn(),
+    synchronizeChat: vi.fn(),
+    showNoCollectionInUse: vi.fn(),
 }));
 vi.mock('../src/features/vector-backend/index.js', () => ({
     setInsertedCollectionRegistrar: vi.fn(),
@@ -64,14 +65,21 @@ vi.mock('../src/app/network-startup.js', () => ({
 }));
 vi.mock('../src/features/settings-panel/index.js', () => ({
     mountSettingsPanel: (_containerId, settings) => { panel.settings = settings; },
+    mountWandMenu: vi.fn(),
     refreshAutoSyncCheckbox: vi.fn(),
     scheduleManualConnectionNotice: (settings) => { panel.noticeSettings = settings; },
+}));
+vi.mock('../src/features/reply-lore/index.js', () => ({
+    initializeReplyLore: vi.fn(),
 }));
 vi.mock('../src/features/database-browser/index.js', () => ({
     initializeDatabaseBrowser: vi.fn(),
 }));
-vi.mock('../src/features/world-info/index.js', () => ({
-    initializeWorldInfoIntegration: vi.fn(),
+vi.mock('../src/features/lorebase/index.js', () => ({
+    KEY_CALLS_AT_ONCE_DEFAULT: 6,
+    LORE_BUDGET_DEFAULT: 4000,
+    initializeLoreBase: vi.fn(),
+    prepareLoreBesideRetrieval: vi.fn(async () => {}),
 }));
 vi.mock('../src/features/keyword-search/index.js', () => ({
     CJK_TOKENIZER_MODES: { intl: 'intl', jieba: 'jieba', jieba_tw: 'jieba_tw' },
@@ -183,9 +191,9 @@ describe('settings panel write-back', () => {
     });
 
     it('gives a stored value priority over its default, and a missing one the default', async () => {
-        await loadPage({ top_k: 25 });
+        await loadPage({ query: 4 });
 
-        expect(panel.settings.top_k).toBe(25);
+        expect(panel.settings.query).toBe(4);
         expect(panel.settings.depth).toBe(2);
     });
 
@@ -195,6 +203,18 @@ describe('settings panel write-back', () => {
         expect(extension_settings.vectfox.embedding_provider).toBe('cohere');
         expect(extension_settings.vectfox.source).toBeUndefined();
     });
+
+    it('deletes the settings only ChunkBase read, and each per-chunk metadata key, keeping the rest', async () => {
+        const { extension_settings } = await loadPage({
+            top_k: 25, score_threshold: 0.25, reformat_provider: 'openrouter', custom_stopwords: 'the, a',
+            vectfox_chunk_meta_1042: { keywords: ['gate'] }, query: 4,
+        });
+
+        for (const key of ['top_k', 'score_threshold', 'reformat_provider', 'custom_stopwords', 'vectfox_chunk_meta_1042']) {
+            expect(extension_settings.vectfox, key).not.toHaveProperty(key);
+        }
+        expect(extension_settings.vectfox.query).toBe(4);
+    });
 });
 
 describe('connection defaults at start-up', () => {
@@ -202,15 +222,16 @@ describe('connection defaults at start-up', () => {
         vi.unstubAllGlobals();
     });
 
-    it('starts a new install\'s EventBase model, StoryArc and embedding on a SillyTavern profile, none chosen, the others as before', async () => {
+    it('starts a new install\'s EventBase model, StoryArc and embedding on a SillyTavern profile, none chosen, and Agent Mode on the EventBase model', async () => {
         const { extension_settings } = await loadPage({});
         expect(extension_settings.vectfox).toMatchObject({
             chat_provider: 'connection_profile', chat_connection_profile_id: '',
             story_arc_link_provider: 'connection_profile', story_arc_link_connection_profile_id: '',
             agent_provider: '', agent_connection_profile_id: '',
-            reformat_provider: '', reformat_connection_profile_id: '',
             embedding_provider: 'custom', embedding_connection_profile_id: '',
         });
+        // No consumer reads an Auto-Reformat connection, so a new install has none.
+        expect(Object.keys(extension_settings.vectfox).filter(key => key.startsWith('reformat_'))).toEqual([]);
     });
 
     it('schedules the notice on manual OpenRouter and vLLM with the store itself, unshown on an install that never saw it', async () => {

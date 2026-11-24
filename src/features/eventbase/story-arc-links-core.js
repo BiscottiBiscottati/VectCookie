@@ -17,6 +17,7 @@
  * ============================================================================
  */
 
+import { counted } from '../../shared/counted.js';
 import { packTimelineSortKey, parseEmbedText } from './eventbase-schema.js';
 
 export const STORY_LINK_TYPE = Object.freeze({
@@ -53,30 +54,49 @@ export const LINK_NEAREST_COUNT = 10;
 const LINK_RECENT_COUNT = 3;
 
 /** Below this share of decided events, walks would stop at undecided events, so recipes do not use links. */
-const USABLE_DECIDED_SHARE = 0.9;
+export const USABLE_DECIDED_SHARE = 0.9;
 
-/** Parallel LLM calls in a link pass, the same as EventBase's own import at its highest. A browser on plain HTTP sends at most 6 to one server at a time. */
-export const LINK_PARALLEL_CALLS = 8;
+/**
+ * Events a link pass from the StoryArc tab decides at once, its Events at once slider: as many as Vectorize Content
+ * reads windows at once, by default and at most. A browser on plain HTTP sends at most 6 to one server at a time.
+ */
+export const LINK_PARALLEL_CALLS_DEFAULT = 3;
+export const LINK_PARALLEL_CALLS_MAX = 8;
 /** Per event, measured on a 1,437-event pass with GPT-6 Luna at medium reasoning, from a browser on plain HTTP. */
 const LINK_INPUT_TOKENS_PER_EVENT = 1810;
 const LINK_OUTPUT_TOKENS_PER_EVENT = 320;
-const LINK_PASS_SECONDS_PER_EVENT = 0.78;
+/** One event's call, from the same pass: 0.78 seconds an event with 8 at once. */
+const LINK_CALL_SECONDS = 6.24;
 
 /**
- * What a link pass would likely cost. Other models think more or less, so this is a guide.
+ * The events a link pass decides at once, from the Events at once box: a whole number from 1 to the most, or the
+ * default for a box that holds no number.
+ *
+ * @param {string|number} value
+ * @returns {number}
+ */
+export function linkParallelCallsOf(value) {
+    const count = Number.parseInt(value, 10);
+    return Number.isFinite(count) ? Math.min(LINK_PARALLEL_CALLS_MAX, Math.max(1, count)) : LINK_PARALLEL_CALLS_DEFAULT;
+}
+
+/**
+ * What a link pass would likely cost, and how long it takes with so many events at once. Other models think more or
+ * less, so this is a guide.
  *
  * @param {number} eventCount
  * @param {{input: number, output: number}|null} pricePerToken - Null when the price is unknown
+ * @param {number} parallelCalls - Events decided at once
  * @returns {{eventCount: number, inputTokens: number, outputTokens: number, minutes: number, costUsd: number|null}}
  */
-export function estimateStoryLinkPass(eventCount, pricePerToken) {
+export function estimateStoryLinkPass(eventCount, pricePerToken, parallelCalls) {
     const inputTokens = eventCount * LINK_INPUT_TOKENS_PER_EVENT;
     const outputTokens = eventCount * LINK_OUTPUT_TOKENS_PER_EVENT;
     return {
         eventCount,
         inputTokens,
         outputTokens,
-        minutes: Math.ceil(eventCount * LINK_PASS_SECONDS_PER_EVENT / 60),
+        minutes: Math.ceil(eventCount * LINK_CALL_SECONDS / parallelCalls / 60),
         costUsd: pricePerToken ? inputTokens * pricePerToken.input + outputTokens * pricePerToken.output : null,
     };
 }
@@ -115,30 +135,55 @@ export function eventsByEventId(events) {
  * link of its reaches a stored event, so links that lead nowhere show as none.
  *
  * @param {object[]} events
- * @returns {{totalCount: number, decidedCount: number, linkedCount: number, hasUsableLinks: boolean}}
- *   `hasUsableLinks` is true when enough events are decided, and at least one has a link, for a walk to be useful.
+ * @returns {{totalCount: number, decidedCount: number, linkedCount: number, isMostlyDecided: boolean, hasUsableLinks: boolean}}
+ *   `isMostlyDecided` is true from USABLE_DECIDED_SHARE of events decided; `hasUsableLinks` is true when they are, and
+ *   at least one has a link, for a walk to be useful.
  */
 export function measureStoryLinkCoverage(events) {
     const decided = events.filter(isDecided);
     const eventById = eventsByEventId(events);
     const linkedCount = decided.filter(event => event.story_links.some(link => eventById.has(link.event_id))).length;
+    const isMostlyDecided = events.length > 0 && decided.length >= events.length * USABLE_DECIDED_SHARE;
     return {
         totalCount: events.length,
         decidedCount: decided.length,
         linkedCount,
-        hasUsableLinks: linkedCount > 0 && decided.length >= events.length * USABLE_DECIDED_SHARE,
+        isMostlyDecided,
+        hasUsableLinks: linkedCount > 0 && isMostlyDecided,
     };
 }
 
+/** How far a collection is linked, for the StoryArc tab's colour (storyLinkState). */
+export const STORY_LINK_STATE = Object.freeze({
+    /** Every event decided: green. */
+    LINKED: 'linked',
+    /** Some decided: yellow, for Regenerate links to catch up. */
+    PARTLY_LINKED: 'partly-linked',
+    /** None decided: red, for Regenerate links to link, its cost shown first. */
+    UNLINKED: 'unlinked',
+});
+
 /**
- * Whether older events are decided well enough for a new event's link pass to be
- * worth paying for. A chat that never had a link pass waits for the StoryArc button.
+ * How far a collection's events are linked, from its coverage (measureStoryLinkCoverage).
+ * @param {{totalCount: number, decidedCount: number}} coverage - Of a collection with events
+ * @returns {string} A STORY_LINK_STATE
+ */
+export function storyLinkState({ totalCount, decidedCount }) {
+    if (decidedCount === 0) return STORY_LINK_STATE.UNLINKED;
+    return decidedCount >= totalCount ? STORY_LINK_STATE.LINKED : STORY_LINK_STATE.PARTLY_LINKED;
+}
+
+/**
+ * Whether a run's new events get their links in the background: only in a collection that has had a link pass, its
+ * older events decided well enough for a new event's link to be worth paying for. A collection with no older event
+ * (a chat's first read, New collection, Start over), or with older events never linked, waits for Regenerate links,
+ * which shows the cost first, so no link is paid for unasked.
  *
  * @param {object[]} olderEvents - Stored events other than the new ones
  * @returns {boolean}
  */
 export function shouldLinkNewEvents(olderEvents) {
-    return olderEvents.filter(isDecided).length >= olderEvents.length * USABLE_DECIDED_SHARE;
+    return olderEvents.length > 0 && olderEvents.filter(isDecided).length >= olderEvents.length * USABLE_DECIDED_SHARE;
 }
 
 /**
@@ -302,7 +347,7 @@ export function describeStoryLinkCoverage(coverage) {
     if (!coverage) return 'Could not read its events. See the console.';
     if (!coverage.totalCount) return 'No events yet';
     const undecidedCount = coverage.totalCount - coverage.decidedCount;
-    return `${coverage.linkedCount} of ${coverage.totalCount} events linked${undecidedCount ? `, ${undecidedCount} not decided yet` : ''}`;
+    return `${coverage.linkedCount} of ${counted(coverage.totalCount, 'event')} linked${undecidedCount ? `, ${undecidedCount} not decided yet` : ''}`;
 }
 
 /**
@@ -311,19 +356,20 @@ export function describeStoryLinkCoverage(coverage) {
  *
  * @param {object[]} events - The collection's stored events
  * @param {{id: string, name: string}} collection
- * @param {string} exportDate
- * @returns {{type: string, exportDate: string, collection: {id: string, name: string}, events: {event_id: string, story_links: object[]}[]}}
+ * @param {{version: string, exportDate: string, generator: string}} header - The header every VectFox file opens with
+ * @returns {{version: string, exportDate: string, generator: string, type: string, collection: {id: string, name: string},
+ *   events: {event_id: string, story_links: object[]}[]}}
  * @throws {Error} when a decided event or one of its links has no `event_id`, since a file could never match it
  */
-export function buildStoryLinksFile(events, collection, exportDate) {
+export function buildStoryLinksFile(events, collection, header) {
     const decided = inTimelineOrder(events.filter(isDecided));
     const unusableCount = decided.filter(event => !event.event_id || event.story_links.some(link => !link.event_id)).length;
     if (unusableCount) {
         throw new Error(`${unusableCount} events hold links without an event_id, so they cannot be exported. Regenerate this collection's links.`);
     }
     return {
+        ...header,
         type: STORY_LINKS_FILE_TYPE,
-        exportDate,
         collection: { id: collection.id, name: collection.name },
         events: decided.map(event => ({ event_id: event.event_id, story_links: event.story_links })),
     };

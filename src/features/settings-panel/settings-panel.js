@@ -19,27 +19,31 @@ import {
     getCustomApiKey,
     fetchQdrantApiKeyPresence,
 } from '../../shared/api-keys.js';
-import { openDatabaseBrowser } from '../database-browser/index.js';
-import { openContentVectorizer } from '../chunkbase/index.js';
 import { resetBackendHealth } from '../vector-backend/index.js';
 import { isVectFoxEnabled } from '../../shared/feature-gate.js';
-import { describeStoryLinkPass, hideStoryArcPage, normalizeGhostStep, readStoryLinkCoverage, runStoryLinkPass, showStoryArcPage, storyArcPageMarkup, wireStoryArcPage } from '../eventbase/index.js';
+import {
+    describeStoryLinkPass, hideStoryArcPage, linkEstimateText, linkParallelCallsOf, linkPassChoices, openContentVectorizer, readStoryLinkCoverage, runStoryLinkPass,
+    showNoCollectionInUse, showStoryArcPage, storyArcPageMarkup, storyLinkPill, storyLinkStatusMarkup, wireStoryArcPage,
+} from '../eventbase/index.js';
 import { getHealthPillHtml, refreshHealthPill } from '../diagnostics/index.js';
+import { keyCallsAtOnceOf, loreBaseAccuracyOf, loreBudgetOf } from '../lorebase/index.js';
 import { PANEL_TABS, panelNavMarkup, panelPageMarkup, vectfoxOffNoticeMarkup } from './panel-shell-markup.js';
 import { wireSettingsPanel } from './panel-shell.js';
 import { drawerLauncherMarkup } from './drawer-launcher-markup.js';
 import { actionPageMarkup, masterSwitchPillsMarkup } from './action-page-markup.js';
 import { agentModePageMarkup } from './agentmode-page-markup.js';
-import { autoSyncPageMarkup, autoSyncStatusMarkup } from './autosync-page-markup.js';
-import { chunkBasePageMarkup } from './chunkbase-page-markup.js';
+import { bindCollectionInUse } from './autosync-collection-in-use.js';
+import { autoSyncCollectionMarkup, autoSyncPageMarkup, autoSyncStatusMarkup } from './autosync-page-markup.js';
 import { corePageMarkup } from './core-page-markup.js';
-import { eventBasePageMarkup } from './eventbase-page-markup.js';
+import { chatHistoryPageMarkup } from './chathistory-page-markup.js';
 import { ragPageMarkup } from './rag-page-markup.js';
-import { worldInfoPageMarkup, worldInfoStatusMarkup } from './worldinfo-page-markup.js';
+import { bindLoreBaseBooksCard, refreshLoreBaseBooks } from './lorebase-books-card.js';
+import { bindLoreBaseModelCard, refreshLoreBaseModelCard } from './lorebase-model-card.js';
+import { bindLoreBaseTester, refreshLoreBaseTester } from './lorebase-tester-card.js';
+import { worldInfoPageMarkup } from './worldinfo-page-markup.js';
 import { bindNumberSetting } from './number-setting.js';
 import { wireConnectionRows } from './connection-rows.js';
 import { wireActionPage } from './action-page.js';
-import { getCollectionListing, getCollectionMeta } from '../collections/index.js';
 import { checkPluginAvailable } from '../../shared/similharity-plugin.js';
 import {
     CJK_TOKENIZER_MODES,
@@ -49,7 +53,6 @@ import {
     LANGUAGE_MODES,
 } from '../keyword-search/index.js';
 import {
-    CHUNKBASE_SIMILARITY_THRESHOLD_DEFAULT,
     RETRIEVAL_TIMEOUT_DEFAULT_MS,
     RETRIEVAL_TIMEOUT_MIN_MS,
     RETRIEVAL_TIMEOUT_MAX_MS,
@@ -73,12 +76,11 @@ function panelMarkup() {
             languageModes: LANGUAGE_MODES,
             retrievalTimeout: { minMs: RETRIEVAL_TIMEOUT_MIN_MS, maxMs: RETRIEVAL_TIMEOUT_MAX_MS, defaultMs: RETRIEVAL_TIMEOUT_DEFAULT_MS },
         })),
-        panelPageMarkup('chunkbase', chunkBasePageMarkup()),
         panelPageMarkup('rag', ragPageMarkup()),
         panelPageMarkup('worldinfo', worldInfoPageMarkup()),
         panelPageMarkup('autosync', autoSyncPageMarkup()),
         panelPageMarkup('action', actionPageMarkup(), { status: `${masterSwitchPillsMarkup()}${getHealthPillHtml()}` }),
-        panelPageMarkup('eventbase', eventBasePageMarkup()),
+        panelPageMarkup('chathistory', chatHistoryPageMarkup()),
         storyArcPageMarkup({ notice: vectfoxOffNoticeMarkup() }),
         panelPageMarkup('agentmode', agentModePageMarkup()),
     ];
@@ -119,7 +121,13 @@ function panelTabsWithHooks() {
     const hooks = {
         action: { onOpen: refreshHealthPill },
         autosync: { onOpen: () => refreshAutoSyncCheckbox(extension_settings.vectfox) },
-        worldinfo: { onOpen: refreshWIStatus },
+        worldinfo: {
+            onOpen: () => {
+                refreshLoreBaseBooks();
+                refreshLoreBaseModelCard();
+                refreshLoreBaseTester();
+            },
+        },
         storyarc: {
             onOpen: () => {
                 refreshStoryLinkStatus(extension_settings.vectfox);
@@ -131,108 +139,60 @@ function panelTabsWithHooks() {
     return PANEL_TABS.map(tab => ({ name: tab.name, ...hooks[tab.name] }));
 }
 
+/** The pill's status classes, one at a time (storyLinkPill). */
+const LINK_PILL_STATUS_CLASSES = 'is-accent is-success is-warning is-danger';
+
 /**
- * Paint the WorldInfo page's switch and status for the open chat. The switch is on iff at least
- * one own-persona lorebook is active for this chat, and enabled_world_info is kept in step with it.
+ * Show how far the collection in use is linked, in the StoryArc tab: the links line and the pill, green with every
+ * event decided, yellow with some, red with none (storyLinkStatusMarkup); the pill hidden on a problem.
  */
-export async function refreshWIStatus() {
-    const $status = $('#VectFox_wi_status');
-    if (!$status.length) return;
-
-    const settings = extension_settings.vectfox || {};
-    const $wiCheckbox = $('#VectFox_enabled_world_info');
-
-    // One helper keeps the setting and the switch identical across the three exit paths below.
-    const _setWIEnabled = (enabled) => {
-        if (settings.enabled_world_info !== enabled) {
-            settings.enabled_world_info = enabled;
-            Object.assign(extension_settings.vectfox, settings);
-            saveSettingsDebounced();
-        }
-        if ($wiCheckbox.length && $wiCheckbox.prop('checked') !== enabled) {
-            $wiCheckbox.prop('checked', enabled);
-            $('#VectFox_world_info_settings').toggle(enabled);
-        }
-    };
-
-    // Single source of truth for ownership AND isActive — getCollectionListing
-    // encodes the superadmin bypass + creatorHandle check + lock-state check.
-    const ownLorebookEntries = getCollectionListing(settings)
-        .filter(e => e.isOwn && e.collectionId.startsWith('vf_lorebook_'));
-
-    if (ownLorebookEntries.length === 0) {
-        $status.html(worldInfoStatusMarkup({ state: 'no-lorebooks' }));
-        _setWIEnabled(false);
-        return;
-    }
-
-    const activeIds = ownLorebookEntries
-        .filter(e => e.isActive)
-        .map(e => e.collectionId);
-
-    if (activeIds.length === 0) {
-        $status.html(worldInfoStatusMarkup({ state: 'none-active' }));
-        _setWIEnabled(false);
-        return;
-    }
-
-    $status.html(worldInfoStatusMarkup({ state: 'active', names: activeIds.map(id => getCollectionMeta(id)?.sourceName || id) }));
-    _setWIEnabled(true);
-}
-
-/** Show how far this chat's link pass has got, in the StoryArc tab. */
 async function refreshStoryLinkStatus(settings) {
     const $status = $('#VectFox_story_arc_link_status');
+    const $pill = $('#VectFox_story_arc_link_pill');
     let coverage;
     try {
         coverage = await readStoryLinkCoverage(settings);
     } catch (err) {
         log.warn('VectFox StoryArc: could not read link status:', err);
-        $status.text('Could not read this chat\'s links. See the console.');
-        return;
+        coverage = { problem: 'Could not read this chat\'s links. See the console.' };
     }
+    $status.html(storyLinkStatusMarkup(coverage));
     if (coverage.problem) {
-        $status.text(coverage.problem);
+        $pill.hide();
         return;
     }
-    const usability = coverage.hasUsableLinks
-        ? 'StoryArc follows threads through these links.'
-        : 'StoryArc searches without links until this pass is mostly done.';
-    $status.text(`${coverage.decidedCount} of ${coverage.totalCount} events decided, ${coverage.linkedCount} with links. ${usability}`);
-    $('#VectFox_story_arc_link_pill').text(`${coverage.linkedCount} of ${coverage.totalCount} linked`).show();
+    const pill = storyLinkPill(coverage);
+    $pill.removeClass(LINK_PILL_STATUS_CLASSES).addClass(`is-${pill.status}`).text(pill.text).show();
 }
 
-/** One line of what a link pass would likely cost. */
-function _describeLinkEstimate({ eventCount, inputTokens, outputTokens, minutes, costUsd }) {
-    const cost = costUsd === null ? 'price unknown' : `about $${costUsd.toFixed(2)}`;
-    return `${eventCount} events: ${cost}, about ${minutes} minutes, about ${Math.round(inputTokens / 1000)}k input and ${Math.round(outputTokens / 1000)}k output tokens`;
-}
-
-/** Show a link pass's cost, and run it if the player accepts. */
+/** Show a link pass's cost, and run it if the player accepts, with as many events at once as the card's slider says. */
 async function _runStoryLinkButton(settings) {
-    const pass = await describeStoryLinkPass(settings);
+    const parallelCalls = linkParallelCallsOf($('#VectFox_story_arc_link_parallel_calls').val());
+    const pass = await describeStoryLinkPass(settings, parallelCalls);
+    if (pass.noneInUse) {
+        showNoCollectionInUse(pass.noneInUse, 'Regenerate links sent nothing');
+        return;
+    }
     if (pass.problem) {
         toastr.warning(pass.problem, 'VectFox StoryArc');
         return;
     }
-    const { collectionId, coverage, allEstimate, undecidedEstimate, model } = pass;
+    const { collectionId, collectionName, coverage, allEstimate, undecidedEstimate, model } = pass;
     const hasUndecided = undecidedEstimate.eventCount > 0;
     const hasDecided = coverage.decidedCount > 0;
     const { choicePopup } = await import('../../sillytavern/popup.js');
     const choice = await choicePopup([
         { icon: 'fa-diagram-project', text: 'Regenerate StoryArc links?' },
+        { text: 'Collection:', name: collectionName },
         { parts: [{ text: "Each event's text goes to " }, { name: model }, { text: ' once, along with up to 13 earlier events.' }] },
-        ...(hasUndecided ? [{ text: 'Events with no decision yet:', name: _describeLinkEstimate(undecidedEstimate) }] : []),
-        ...(hasDecided ? [{ text: 'All events, replacing their links:', name: _describeLinkEstimate(allEstimate) }] : []),
+        ...(hasUndecided ? [{ text: 'Events with no decision yet:', name: linkEstimateText(undecidedEstimate) }] : []),
+        ...(hasDecided ? [{ text: 'All events, replacing their links:', name: linkEstimateText(allEstimate) }] : []),
         { text: 'Estimated from one chat on GPT-6 Luna, and a model that thinks more costs more. You can stop at any time, and finished events keep their links.' },
     ], {
-        choices: [
-            ...(hasUndecided ? [{ text: `Link ${undecidedEstimate.eventCount} events`, value: 'undecided' }] : []),
-            ...(hasDecided || !hasUndecided ? [{ text: `Relink all ${allEstimate.eventCount} events`, value: 'all' }] : []),
-        ],
+        choices: linkPassChoices({ undecidedCount: undecidedEstimate.eventCount, decidedCount: coverage.decidedCount, totalCount: allEstimate.eventCount }),
     });
     if (!choice) return;
-    await runStoryLinkPass({ collectionId, settings, shouldRelinkDecided: choice === 'all' });
+    await runStoryLinkPass({ collectionId, settings, shouldRelinkDecided: choice === 'all', parallelCalls });
 }
 
 /**
@@ -248,14 +208,21 @@ async function _runStoryLinkButton(settings) {
 async function _offerEventBaseFork(settings) {
     const { findEventBaseForkSource, forkEventBaseFromSource } = await import('../eventbase/index.js');
 
-    let source;
+    let found;
     try {
-        source = await findEventBaseForkSource(settings);
+        found = await findEventBaseForkSource(settings);
     } catch (err) {
         log.error('[AutoSync][fork] looking for a parent EventBase failed:', err);
         toastr.error(err?.message || String(err), 'Could not check for a parent chat');
         return 'cancel';
     }
+    // Collections holding this branch's history, none in use in its parent chat: never read (D18), and said in red.
+    if (found.problem) {
+        log.warn(`[AutoSync][fork] ${found.problem}`);
+        toastr.error(found.problem, 'EventBase', { timeOut: 15000, extendedTimeOut: 10000 });
+        return 'cancel';
+    }
+    const { source } = found;
     if (!source) return 'vectorize';
 
     const remainingCount = Math.max(0, source.chatMessageCount - source.sharedPrefixLength);
@@ -292,32 +259,33 @@ export async function refreshAutoSyncCheckbox(settings) {
     const $checkbox = $('#VectFox_autosync_enabled');
     const $status = $('#VectFox_autosync_status');
 
-    const { getChatAutoSyncStatus } = await import('../eventbase/index.js');
-    const { isCollectionAutoSyncEnabled, isCollectionActiveForContextAnyKey } = await import('../collections/index.js');
+    const { chatOwnCollections, getChatAutoSyncStatus } = await import('../eventbase/index.js');
+    const { isCollectionAutoSyncEnabled } = await import('../collections/index.js');
 
     // While VectFox is disabled this refresh only reads cached state: no backend call,
     // no diagnostics. It still runs so the checkbox matches the current chat — the
     // Summarizer Injection toggle reads it. The master switch refreshes again when
     // VectFox is turned back on.
     const isVectFoxOn = isVectFoxEnabled(settings);
-    const status = await getChatAutoSyncStatus(settings, {
-        shouldProbeBackend: isVectFoxOn,
-        shouldLogResolution: isVectFoxOn,
-    });
-    const chatId = getCurrentChatId();
+    const status = await getChatAutoSyncStatus(settings, { shouldProbeBackend: isVectFoxOn });
+    // Collection in use here, over the chat's own collections (§1.2 of vectfox-multi-collection-per-chat.md), the one in
+    // use chosen as the route gives it: a status with a collection in use carries its registry key.
+    $('#VectFox_autosync_collection').html(autoSyncCollectionMarkup(
+        status.state === 'no-chat' ? [] : status.collections ?? chatOwnCollections(settings),
+        status.registryKey ?? null,
+    ));
 
-    // No chat, or a chat with no EventBase collection yet: nothing auto-sync could run on.
-    if (status.state === 'no-chat' || status.state === 'no-collection') {
+    // No chat, a chat with no EventBase collection yet, or one with none of its collections locked to it: nothing
+    // auto-sync could run on.
+    if (status.state === 'no-chat' || status.state === 'no-collection' || status.state === 'none-locked') {
         $checkbox.prop('checked', false);
-        $status.html(autoSyncStatusMarkup({ state: status.state, isVectFoxOn }));
+        $status.html(autoSyncStatusMarkup({ state: status.state, isVectFoxOn, noneInUseText: status.noneInUseText }));
         return;
     }
 
-    // Collection exists. The switch shows the per-collection autoSync flag, for a
-    // collection locked to this chat. Metadata is keyed by registry-key form ("backend:id").
-    const lookupKey = status.registryKey || status.collectionId;
-    const isOnForChat = Boolean(isCollectionAutoSyncEnabled(lookupKey)
-        && chatId && isCollectionActiveForContextAnyKey([status.registryKey, status.collectionId], { chatId }));
+    // The chat's collection in use (collectionInUse, through getChatAutoSyncStatus): the switch shows its auto-sync.
+    // Metadata is keyed by registry-key form ("backend:id").
+    const isOnForChat = isCollectionAutoSyncEnabled(status.registryKey || status.collectionId);
     $checkbox.prop('checked', isOnForChat);
 
     // How far vectorization reaches: the live tip (max source_window_end + 1, kept current by
@@ -339,7 +307,6 @@ export async function refreshAutoSyncCheckbox(settings) {
         chatMessageCount: typeof status.chatMessageCount === 'number' ? status.chatMessageCount : null,
         vectorizedCount,
         isLatestTurnSettling: status.state === 'fully-vectorized' && settleGap > 0,
-        markerValue: status.markerValue,
         unfinishedWindowCount: status.unfinishedWindowCount,
     }));
 }
@@ -401,14 +368,16 @@ function bindSettingsEvents(settings, callbacks) {
     };
 
     // Auto-sync on or off for the open chat's collection.
+    bindCollectionInUse(settings, refreshAutoSyncCheckbox);
+
     // Initial state is set by refreshAutoSyncCheckbox() after chat loads
     $('#VectFox_autosync_enabled')
         .on('input', async function() {
             const enabling = $(this).prop('checked');
             const $checkbox = $(this);
 
-            const { getChatAutoSyncStatus } = await import('../eventbase/index.js');
-            const { setCollectionAutoSync, setCollectionLock } = await import('../collections/index.js');
+            const { askWhichChatCollection, getChatAutoSyncStatus, useChatCollection } = await import('../eventbase/index.js');
+            const { setCollectionAutoSync } = await import('../collections/index.js');
             let status = await getChatAutoSyncStatus(settings);
             const chatId = getCurrentChatId();
             log.lifecycle(`[AutoSync][checkbox] ${enabling ? 'CHECK' : 'UNCHECK'} → status.state=${status.state}, chatId=${chatId || '(none)'}, collection=${status.registryKey || status.collectionId || '(none)'}`);
@@ -422,6 +391,16 @@ function bindSettingsEvents(settings, callbacks) {
             }
 
             if (enabling) {
+                if (status.state === 'none-locked') {
+                    // The chat has collections, none locked to it: ask which one auto-sync writes.
+                    if (!await askWhichChatCollection(settings)) {
+                        $checkbox.prop('checked', false);
+                        _disableSummarizerInjectionBecauseAutoSyncIsOff('needs auto-sync');
+                        await refreshAutoSyncCheckbox(settings);
+                        return;
+                    }
+                    status = await getChatAutoSyncStatus(settings);
+                }
                 if (status.state === 'no-collection') {
                     // A branch or checkpoint can take its parent's events instead of
                     // re-extracting the shared history.
@@ -436,7 +415,7 @@ function bindSettingsEvents(settings, callbacks) {
                         status = await getChatAutoSyncStatus(settings);
                         log.lifecycle(`[AutoSync][checkbox] forked → status.state=${status.state}, collection=${status.registryKey || status.collectionId || '(none)'}`);
                         if (status.state === 'no-collection') {
-                            log.error('[AutoSync][checkbox] fork finished but resolveEventBaseWriteTarget still finds no collection — see [EventBase][resolve] log above');
+                            log.error('[AutoSync][checkbox] fork finished but collectionInUse still finds no collection of this chat');
                             toastr.error('The forked EventBase is not recognized as this chat\'s collection. Check the console log.', 'Auto-sync not enabled');
                             $checkbox.prop('checked', false);
                             _disableSummarizerInjectionBecauseAutoSyncIsOff('needs auto-sync');
@@ -447,14 +426,14 @@ function bindSettingsEvents(settings, callbacks) {
                 }
                 if (status.state === 'no-collection') {
                     // No collection for this chat yet — send the user to vectorize first.
-                    log.lifecycle('[AutoSync][checkbox] state=no-collection → redirecting to Vectorize Content (resolveEventBaseWriteTarget found no eligible collection — see [EventBase][resolve] log above)');
+                    log.lifecycle('[AutoSync][checkbox] state=no-collection → redirecting to Vectorize Content (collectionInUse found no collection of this chat on this backend)');
                     $checkbox.prop('checked', false);
                     toastr.info('Vectorize your chat history first — auto-sync will turn on when it finishes');
                     _disableSummarizerInjectionBecauseAutoSyncIsOff('needs auto-sync, which needs a vectorized chat');
                     // Remember the intent across the redirect so a finished
                     // vectorization resumes the enable the user actually asked for.
                     _autoSyncEnableAwaitingVectorizeForChat = chatId;
-                    openContentVectorizer('chat');
+                    openContentVectorizer();
                     return;
                 }
                 // Collection exists (partial or fully-vectorized).
@@ -471,12 +450,10 @@ function bindSettingsEvents(settings, callbacks) {
                 let markerFloorOverride; // undefined → smart placement (catch up to tip)
                 try {
                     const { FAR_BEHIND_WINDOW_COUNT, countWindowsBehind, getAutoSyncWindowSize, getVectorizationTip } = await import('../eventbase/index.js');
-                    const { getChatUUID } = await import('../../shared/collection-ids.js');
-                    const uuid = getChatUUID();
                     const chatMsgCount = typeof status.chatMessageCount === 'number'
                         ? status.chatMessageCount
                         : (getContext()?.chat || []).filter(m => m.mes && m.mes.trim().length > 0).length;
-                    const tip = getVectorizationTip(uuid) ?? 0;
+                    const tip = getVectorizationTip(lockKey) ?? 0;
                     const windowSize = Math.max(1, getAutoSyncWindowSize(settings));
                     // Clamp the backlog to the commit boundary — the active last turn is
                     // held back by the settle-lag and settles on its own, so it isn't
@@ -496,7 +473,7 @@ function bindSettingsEvents(settings, callbacks) {
                             // Run the backfill now with the progress panel. Resolves at
                             // extraction completion; the marker then lands at the
                             // freshly-advanced tip (smart placement below).
-                            const { backfillCurrentChatWithProgress } = await import('../chunkbase/index.js');
+                            const { backfillCurrentChatWithProgress } = await import('../eventbase/index.js');
                             await backfillCurrentChatWithProgress();
                         } else if (choice === 'keep-up') {
                             // Keep up from here — skip the backlog (floor the marker at "now").
@@ -513,23 +490,20 @@ function bindSettingsEvents(settings, callbacks) {
                     log.warn('[VectFox] auto-sync backlog gate failed (continuing with default placement):', err?.message || err);
                 }
 
-                // Lock + enable (every non-revert path).
-                setCollectionLock(lockKey, chatId);
+                // In use in this chat, the chat's other collections unlocked there, and enabled (every non-revert path).
+                useChatCollection(lockKey);
                 setCollectionAutoSync(lockKey, true);
 
-                // Stamp the auto-sync start marker for this chat. Prevents the
-                // window-fingerprint dedup cache from triggering a full chat
-                // re-extraction when the user changed window_size before enabling
-                // auto-sync. See InternalProject/Vectfox/plans/executed/autosync-independent-window-and-last-n-injection.md §9.
+                // Stamp the collection's auto-sync start marker, so auto-sync reads
+                // no window starting before it, which may hold messages read before
+                // at another window size. See InternalProject/Vectfox/plans/executed/autosync-independent-window-and-last-n-injection.md §9.
                 // Smart placement: stamps at max(source_window_end)+1 when events
                 // exist (backfills the gap at the new window size), or at current
                 // chat length when collection is empty. markerFloorOverride='chatLength'
                 // forces from-now-on when the user chose "just keep up from here".
                 try {
                     const { stampAutoSyncMarker } = await import('../eventbase/index.js');
-                    const { getChatUUID } = await import('../../shared/collection-ids.js');
-                    const uuid = getChatUUID();
-                    if (uuid) await stampAutoSyncMarker(uuid, settings, markerFloorOverride ? { floor: markerFloorOverride } : {});
+                    await stampAutoSyncMarker(lockKey, settings, markerFloorOverride ? { floor: markerFloorOverride } : {});
                 } catch (err) {
                     log.warn('[VectFox] Failed to stamp auto-sync marker on enable:', err?.message || err);
                 }
@@ -543,17 +517,15 @@ function bindSettingsEvents(settings, callbacks) {
                 // Off clears ONLY the auto-sync flag, never the chat lock: the lock marks
                 // the collection active for this chat's retrieval too, and the user may
                 // have set it in the DB Browser. Unlocking is the DB Browser's job.
-                if (status.state !== 'no-collection') {
-                    const lockKey = status.registryKey || status.collectionId;
+                if (status.registryKey) {
+                    const lockKey = status.registryKey;
                     setCollectionAutoSync(lockKey, false);
 
                     // Clear the marker so re-enabling later re-computes a fresh one
                     // against whatever collection state exists at that time.
                     try {
                         const { clearAutoSyncMarker } = await import('../eventbase/index.js');
-                        const { getChatUUID } = await import('../../shared/collection-ids.js');
-                        const uuid = getChatUUID();
-                        if (uuid) clearAutoSyncMarker(uuid);
+                        clearAutoSyncMarker(lockKey);
                     } catch (err) {
                         log.warn('[VectFox] Failed to clear auto-sync marker on disable:', err?.message || err);
                     }
@@ -739,7 +711,7 @@ function bindSettingsEvents(settings, callbacks) {
         if (savedKey) {
             $('#VectFox_summarize_vllm_apikey').attr('placeholder', 'Key saved');
         } else {
-            $('#VectFox_summarize_vllm_apikey').attr('placeholder', 'Paste a key to save it');
+            $('#VectFox_summarize_vllm_apikey').attr('placeholder', 'Blank for a server that needs none');
         }
     };
     updateSummarizeVllmKeyDisplay();
@@ -856,7 +828,7 @@ function bindSettingsEvents(settings, callbacks) {
         if (savedKey) {
             $('#VectFox_agentic_vllm_apikey').attr('placeholder', 'Key saved');
         } else {
-            $('#VectFox_agentic_vllm_apikey').attr('placeholder', 'Paste a key to save it');
+            $('#VectFox_agentic_vllm_apikey').attr('placeholder', 'Blank for a server that needs none');
         }
     };
     updateAgenticVllmKeyDisplay();
@@ -900,40 +872,6 @@ function bindSettingsEvents(settings, callbacks) {
         });
 
 
-    // ─── Auto-Reformat (Document/URL/Wiki LLM restructuring) ───────────────
-    // Same as EventBase model, and a blank model or URL, use the EventBase model's (Core page), as on
-    // the AgentMode page (resolveInheritedConnection). No key fields: it uses the shared OpenRouter and vLLM key slots.
-    // Its Provider and profile rows: connection-rows.js.
-    $('#VectFox_reformat_model')
-        .val(settings.reformat_model || '')
-        .on('input change', function() {
-            settings.reformat_model = String($(this).val()).trim();
-            Object.assign(extension_settings.vectfox, settings);
-            saveSettingsDebounced();
-        });
-
-    $('#VectFox_reformat_vllm_url')
-        .val(settings.reformat_vllm_url || '')
-        .on('change', function() {
-            settings.reformat_vllm_url = String($(this).val()).trim();
-            Object.assign(extension_settings.vectfox, settings);
-            saveSettingsDebounced();
-        });
-
-    bindNumberSetting(settings, { id: 'VectFox_reformat_batch_chars', key: 'reformat_batch_chars', initial: settings.reformat_batch_chars ?? 6000, isInteger: true });
-    bindNumberSetting(settings, { id: 'VectFox_reformat_max_body_chars', key: 'reformat_max_body_chars', initial: settings.reformat_max_body_chars ?? 2000, isInteger: true });
-    bindNumberSetting(settings, { id: 'VectFox_reformat_name_fuzzy_threshold', key: 'reformat_name_fuzzy_threshold', initial: settings.reformat_name_fuzzy_threshold ?? 0.8 });
-    bindNumberSetting(settings, { id: 'VectFox_reformat_concurrency', key: 'reformat_concurrency', initial: settings.reformat_concurrency ?? 2, isInteger: true });
-    bindNumberSetting(settings, { id: 'VectFox_reformat_timeout_ms', key: 'reformat_timeout_ms', initial: settings.reformat_timeout_ms ?? 90000, isInteger: true });
-
-    $('#VectFox_reformat_custom_prompt')
-        .val(settings.reformat_custom_prompt || '')
-        .on('change', function() {
-            settings.reformat_custom_prompt = String($(this).val());
-            Object.assign(extension_settings.vectfox, settings);
-            saveSettingsDebounced();
-        });
-
     // Helper: update visibility of native-hybrid-dependent UI elements
     function updateNativeHybridUI() {
         const backend       = settings.vector_backend || 'standard';
@@ -955,7 +893,7 @@ function bindSettingsEvents(settings, callbacks) {
         // controls would just confuse Qdrant users.
         $('#VectFox_hybrid_params').toggle(isHybridMode);
 
-        // Query keyword budget (ChunkBase page): read by client-side BM25, so A1 and A2
+        // Query keyword budget (Core page, Keyword scoring): read by client-side BM25, so A1 and A2
         $('#VectFox_hybrid_keyword_budget_wrapper').toggle(!nativeActive);
 
         // Native rerank checkbox: Qdrant only
@@ -1182,9 +1120,6 @@ function bindSettingsEvents(settings, callbacks) {
         }
     });
 
-    // Similarity threshold (ChunkBase page). Event searches use EventBase's own (eventbase-search.js).
-    bindNumberSetting(settings, { id: 'VectFox_score_threshold', key: 'score_threshold', initial: settings.score_threshold ?? CHUNKBASE_SIMILARITY_THRESHOLD_DEFAULT });
-
     // "Skip Already-Visible Events" (legacy key name: deduplication_depth).
     // Default 0 = filter disabled. See settings comment in index.js — the assumption
     // that the LLM sees the last N messages in raw form is usually wrong (~3-6 in
@@ -1272,28 +1207,24 @@ function bindSettingsEvents(settings, callbacks) {
     // Query depth (how many recent messages to include in search query)
     bindNumberSetting(settings, { id: 'VectFox_query_depth', key: 'query', initial: settings.query || 2, isInteger: true });
 
-    // Results per collection (ChunkBase page): the chunk pipeline's top-K
-    bindNumberSetting(settings, { id: 'VectFox_topk', key: 'top_k', initial: (settings.top_k ?? settings.insert) || 3, isInteger: true });
-
-    // Auto-sync window (AutoSync page), in turns. A new size re-stamps the chat's auto-sync
-    // marker, so auto-sync starts from the current tip instead of re-extracting the chat.
+    // Auto-sync window (AutoSync page), in turns. A new size re-stamps the auto-sync marker of the
+    // chat's collection, so auto-sync starts from the current tip instead of re-extracting the chat.
     bindNumberSetting(settings, { id: 'VectFox_eventbase_autosync_window_turns', key: 'eventbase_autosync_window_turns', initial: settings.eventbase_autosync_window_turns ?? 1, isInteger: true });
     let _stampedWindowTurns = settings.eventbase_autosync_window_turns ?? 1;
     $('#VectFox_eventbase_autosync_window_turns').on('change', async () => {
         if (settings.eventbase_autosync_window_turns === _stampedWindowTurns) return;
         _stampedWindowTurns = settings.eventbase_autosync_window_turns;
         try {
-            const { stampAutoSyncMarker } = await import('../eventbase/index.js');
-            const { getChatUUID } = await import('../../shared/collection-ids.js');
-            const uuid = getChatUUID();
-            if (uuid) await stampAutoSyncMarker(uuid, extension_settings.vectfox);
+            const { collectionInUse, stampAutoSyncMarker } = await import('../eventbase/index.js');
+            const { collection } = collectionInUse(extension_settings.vectfox);
+            if (collection) await stampAutoSyncMarker(collection.registryKey, extension_settings.vectfox);
         } catch (err) {
             log.warn('[VectFox] Failed to re-stamp marker on auto-sync window change:', err?.message || err);
         }
     });
 
     // --- Summarizer Injection (AutoSync page) ---
-    bindNumberSetting(settings, { id: 'VectFox_summarizer_injection_count', key: 'summarizer_injection_count', initial: settings.summarizer_injection_count ?? 20, isInteger: true });
+    bindNumberSetting(settings, { id: 'VectFox_summarizer_injection_count', key: 'summarizer_injection_count', initial: settings.summarizer_injection_count ?? 15, isInteger: true });
 
     // Full event detail toggle (default ON — includes structured fields per event).
     $('#VectFox_summarizer_injection_full_detail')
@@ -1309,14 +1240,9 @@ function bindSettingsEvents(settings, callbacks) {
 
     // Per-turn token-saved readout, fed by window.VectFox_LastGhost (set inside
     // applyGhosting on every enabled generation). Refreshed on init, on toggle, and
-    // after each AI reply / swipe via the event subscriptions below.
-    // A batched wipe adds where the line sits. The note is omitted at step 1 (plain
-    // rolling, nothing to say) and when ghosting is paused by an infinite World Info
-    // floor, which publishes no next-jump countdown.
-    const _ghostBatchNote = (g) => {
-        if (!(g?.step > 1) || !Number.isFinite(g.rawKept) || !Number.isFinite(g.nextJumpIn)) return '';
-        return ` Batch ${g.step}: boundary after message ${g.cutoff}, ${g.rawKept} kept raw, next jump in ${g.nextJumpIn}.`;
-    };
+    // after each AI reply / swipe via the event subscriptions below. At a batch size above 1
+    // it also says how many messages stay verbatim and how many more until the next batch.
+    const _messageCount = count => (count === 1 ? '1 message' : `${count.toLocaleString()} messages`);
     const _refreshGhostReadout = () => {
         const $el = $('#VectFox_eventbase_ghost_readout .vfx-notice-text');
         if ($el.length === 0) return;
@@ -1329,26 +1255,25 @@ function bindSettingsEvents(settings, callbacks) {
             $el.text('Last turn: no reply yet.');
             return;
         }
-        const note = _ghostBatchNote(g);
+        const batchNote = typeof g.keptVerbatimCount === 'number'
+            ? ` In batches of ${_messageCount(g.batchSize)}: ${_messageCount(g.keptVerbatimCount)} kept verbatim, ${_messageCount(g.messagesUntilNextBatch)} until the next batch is blanked.`
+            : '';
         if (g.wiped === 0) {
-            $el.text(`Last turn: nothing blanked, as no vectorized message is older than those kept.${note}`);
+            $el.text(`Last turn: nothing blanked, as no vectorized message is older than those kept.${batchNote}`);
         } else {
-            const messages = g.wiped === 1 ? '1 message' : `${g.wiped.toLocaleString()} messages`;
-            $el.html(`Last turn: <strong>${messages}</strong> blanked, about <strong>${g.approxTokens.toLocaleString()} tokens</strong> (${g.charsRemoved.toLocaleString()} characters) saved.${note}`);
+            $el.html(`Last turn: <strong>${_messageCount(g.wiped)}</strong> blanked, about <strong>${g.approxTokens.toLocaleString()} tokens</strong> (${g.charsRemoved.toLocaleString()} characters) saved.${batchNote}`);
         }
     };
 
     // Ghosting needs Summarizer Injection on (the wipe checks it too): its controls are
     // disabled while it is off, and the Ghosting card says why.
     const _applyGhostAvailability = () => {
-        const summOn = !!settings.summarizer_injection_enabled;
-        const ghostOn = !!settings.eventbase_ghost_enabled;
-        const off = !summOn || !ghostOn;
-        $('#VectFox_eventbase_ghost_enabled').prop('disabled', !summOn);
-        $('#VectFox_eventbase_ghost_keep_recent, [data-vfx-slider-for="VectFox_eventbase_ghost_keep_recent"]')
-            .add('#VectFox_eventbase_ghost_step, [data-vfx-slider-for="VectFox_eventbase_ghost_step"]')
-            .prop('disabled', off);
-        $('#VectFox_eventbase_ghost_needs_summarizer').toggle(!summOn);
+        const isSummarizerOn = !!settings.summarizer_injection_enabled;
+        const isGhostingOn = !!settings.eventbase_ghost_enabled;
+        $('#VectFox_eventbase_ghost_enabled').prop('disabled', !isSummarizerOn);
+        $('#VectFox_eventbase_ghost_keep_recent, [data-vfx-slider-for="VectFox_eventbase_ghost_keep_recent"], '
+            + '#VectFox_eventbase_ghost_batch_size, [data-vfx-slider-for="VectFox_eventbase_ghost_batch_size"]').prop('disabled', !isSummarizerOn || !isGhostingOn);
+        $('#VectFox_eventbase_ghost_needs_summarizer').toggle(!isSummarizerOn);
         _refreshGhostReadout();
     };
 
@@ -1365,10 +1290,8 @@ function bindSettingsEvents(settings, callbacks) {
             _applyGhostAvailability();
         });
 
-    bindNumberSetting(settings, { id: 'VectFox_eventbase_ghost_keep_recent', key: 'eventbase_ghost_keep_recent', initial: settings.eventbase_ghost_keep_recent ?? 10, isInteger: true });
-    // A hand-edited value above the slider's ceiling is shown clamped (the wipe clamps it too,
-    // in normalizeGhostStep), so the UI can never display a batch the boundary is not on.
-    bindNumberSetting(settings, { id: 'VectFox_eventbase_ghost_step', key: 'eventbase_ghost_step', initial: normalizeGhostStep(settings.eventbase_ghost_step), isInteger: true });
+    bindNumberSetting(settings, { id: 'VectFox_eventbase_ghost_keep_recent', key: 'eventbase_ghost_keep_recent', initial: settings.eventbase_ghost_keep_recent ?? 1, isInteger: true });
+    bindNumberSetting(settings, { id: 'VectFox_eventbase_ghost_batch_size', key: 'eventbase_ghost_batch_size', initial: settings.eventbase_ghost_batch_size ?? 1, isInteger: true });
 
     // While Summarizer Injection is on, the auto-sync window is held at 1 turn, so each reply
     // is extracted before the next injection. The box's own events set it, which saves it and
@@ -1482,86 +1405,37 @@ function bindSettingsEvents(settings, callbacks) {
             saveSettingsDebounced();
         });
 
-    // Semantic activation (WorldInfo page). On needs an own-persona lorebook locked to this
-    // chat; off removes the lock that makes each active one active.
-    $('#VectFox_enabled_world_info')
-        .prop('checked', settings.enabled_world_info || false)
-        .on('change', async function() {
-            const enabled = $(this).prop('checked');
-            const $checkbox = $(this);
+    // LoreBase books and tester (WorldInfo page): drawn for the open chat, again on each chat change and as the page opens.
+    bindLoreBaseBooksCard(settings);
+    refreshLoreBaseBooks();
+    eventSource.on(event_types.CHAT_CHANGED, refreshLoreBaseBooks);
+    bindLoreBaseTester(settings);
+    refreshLoreBaseTester();
+    eventSource.on(event_types.CHAT_CHANGED, refreshLoreBaseTester);
+    // LoreBase's Entries at once: how many entries' keys are written at once, read by each call as it starts.
+    bindNumberSetting(settings, { id: 'VectFox_lorebase_key_calls_at_once', key: 'lorebase_key_calls_at_once', initial: keyCallsAtOnceOf(settings.lorebase_key_calls_at_once), isInteger: true });
 
-            // Single source of truth — getCollectionListing handles superadmin
-            // bypass + creatorHandle ownership + isActive lock-state check.
-            const ownLorebookEntries = getCollectionListing(settings)
-                .filter(e => e.isOwn && e.collectionId.startsWith('vf_lorebook_'));
-
-            const chatId = getCurrentChatId();
-            const characterId = getContext()?.characterId;
-            const { removeCollectionLock, removeCollectionCharacterLock } = await import('../collections/index.js');
-
-            if (enabled) {
-                if (ownLorebookEntries.length === 0) {
-                    $checkbox.prop('checked', false);
-                    toastr.info('Vectorize a lorebook first to use semantic activation');
-                    openContentVectorizer('lorebook');
-                    return;
-                }
-
-                const hasActive = ownLorebookEntries.some(e => e.isActive);
-                if (!hasActive) {
-                    $checkbox.prop('checked', false);
-                    toastr.info('Lock a lorebook to this chat in Database Browser → Collection Settings');
-                    openDatabaseBrowser();
-                    return;
-                }
-            } else {
-                // Uncheck mirrors Collection Settings uncheck: remove the lock that's making each
-                // active own-persona lorebook active. After this, isActive returns false for all
-                // of them and the listing badge drops the 🔒.
-                let removed = 0;
-                for (const e of ownLorebookEntries) {
-                    if (!e.isActive) continue;
-                    const lockKey = e.registryKey || e.collectionId;
-                    if (e.meta.scope === 'chat' && chatId) {
-                        removeCollectionLock(lockKey, chatId);
-                        removed++;
-                    } else if (e.meta.scope === 'character' && characterId) {
-                        removeCollectionCharacterLock(lockKey, String(characterId));
-                        removed++;
-                    }
-                }
-                if (removed > 0) {
-                    document.dispatchEvent(new CustomEvent('vectfox:collections-updated'));
-                }
-            }
-
-            settings.enabled_world_info = enabled;
+    // LoreBase model (WorldInfo page). Its Provider and Profile dropdowns are wired with every consumer's (connection-rows.js).
+    $('#VectFox_lorebase_model')
+        .val(settings.lorebase_model)
+        .on('input change', function() {
+            settings.lorebase_model = String($(this).val()).trim();
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
-            $('#VectFox_world_info_settings').toggle(enabled);
         });
 
-    // Matching (WorldInfo page). The threshold's floor is 0.01: retrieval reads 0 as its 0.3 default.
-    bindNumberSetting(settings, { id: 'VectFox_world_info_threshold', key: 'world_info_threshold', initial: settings.world_info_threshold ?? 0.3 });
-    bindNumberSetting(settings, { id: 'VectFox_world_info_top_k', key: 'world_info_top_k', initial: settings.world_info_top_k ?? 3, isInteger: true });
-    bindNumberSetting(settings, { id: 'VectFox_world_info_query_depth', key: 'world_info_query_depth', initial: settings.world_info_query_depth ?? 3, isInteger: true });
-
-    $('#VectFox_world_info_retrieval_popup')
-        .prop('checked', settings.world_info_retrieval_popup === true)
+    // A value the dropdown no longer offers shows as the choice it runs, High Accuracy (loreBaseAccuracyOf).
+    $('#VectFox_lorebase_accuracy')
+        .val(loreBaseAccuracyOf(settings.lorebase_accuracy))
         .on('change', function() {
-            settings.world_info_retrieval_popup = $(this).prop('checked');
+            settings.lorebase_accuracy = String($(this).val());
             Object.assign(extension_settings.vectfox, settings);
             saveSettingsDebounced();
         });
-
-    // Custom stopwords
-    $('#VectFox_custom_stopwords')
-        .val(settings.custom_stopwords || '')
-        .on('input', function() {
-            settings.custom_stopwords = $(this).val();
-            Object.assign(extension_settings.vectfox, settings);
-            saveSettingsDebounced();
-        });
+    // Fast and Cheap [Jev]'s Lore budget: the most tokens Jev's picks send a reply, read by each reply as it starts.
+    bindNumberSetting(settings, { id: 'VectFox_lorebase_lore_budget_tokens', key: 'lorebase_lore_budget_tokens', initial: loreBudgetOf(settings.lorebase_lore_budget_tokens), isInteger: true });
+    // The model card's setup notice and Vectors line, drawn again as its controls change and as the page opens.
+    bindLoreBaseModelCard(settings);
 
     // CJK tokenizer mode selector
     $('#VectFox_cjk_tokenizer_mode')
@@ -1590,12 +1464,6 @@ function bindSettingsEvents(settings, callbacks) {
                 }
             }
         });
-
-    // Initialize world info settings visibility based on current setting
-    $('#VectFox_world_info_settings').toggle(settings.enabled_world_info || false);
-    refreshWIStatus();
-    document.addEventListener('vectfox:collections-updated', refreshWIStatus);
-    eventSource.on(event_types.CHAT_CHANGED, refreshWIStatus);
 
     // Chat auto-sync UI also follows the same events: collection list changes
     // (e.g. chat just got vectorized) and chat-changed shift the state.
@@ -1799,7 +1667,7 @@ function bindSettingsEvents(settings, callbacks) {
     };
 
     // window_size / window_overlap are bound in the Vectorize Content panel
-    // (src/features/chunkbase/content-vectorizer.js).
+    // (src/features/eventbase/content-vectorizer.js).
     bindNumberSetting(settings, { id: 'VectFox_eventbase_min_importance_store', key: 'eventbase_min_importance_store', initial: settings.eventbase_min_importance_store ?? 3, isInteger: true });
     bindNumberSetting(settings, { id: 'VectFox_eventbase_max_events_per_window', key: 'eventbase_max_events_per_window', initial: settings.eventbase_max_events_per_window ?? 3, isInteger: true });
     bindNumberSetting(settings, { id: 'VectFox_eventbase_temperature', key: 'eventbase_temperature', initial: settings.eventbase_temperature ?? 0.2 });
@@ -2132,15 +2000,6 @@ function bindSettingsEvents(settings, callbacks) {
 
     // Insert batch size: items per embedding request (vector-api.js insertVectorItems)
     bindNumberSetting(settings, { id: 'VectFox_insert_batch_size', key: 'insert_batch_size', initial: settings.insert_batch_size || 50, isInteger: true });
-
-    // Acronym glossary injection (Documents) — see src/features/chunkbase/glossary-extractor.js
-    $('#VectFox_document_glossary_injection')
-        .prop('checked', settings.document_glossary_injection !== false)
-        .on('change', function() {
-            settings.document_glossary_injection = $(this).prop('checked');
-            Object.assign(extension_settings.vectfox, settings);
-            saveSettingsDebounced();
-        });
 
     // Minimum chat length before injection starts
     bindNumberSetting(settings, { id: 'VectFox_min_chat_length', key: 'min_chat_length', initial: settings.min_chat_length ?? 0, isInteger: true });

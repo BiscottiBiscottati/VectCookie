@@ -99,12 +99,17 @@ describe('a chat call on a connection profile', () => {
         const [profileId, messages, maxTokens, custom, overridePayload] = sentRequest();
         expect([profileId, messages[0].content, maxTokens]).toEqual(['p-custom', 'Read this window.', undefined]);
         expect(custom).toMatchObject({ includePreset: false, extractData: false });
-        expect(overridePayload).toEqual({ temperature: 0.2, max_completion_tokens: 900, reasoning_effort: 'none', response_format: { type: 'json_object' } });
+        expect(overridePayload).toEqual({
+            temperature: 0.2, max_completion_tokens: 900, reasoning_effort: 'none', custom_include_body: '{"reasoning_effort":"none"}', response_format: { type: 'json_object' },
+        });
     });
 
-    it('reads Claude\'s content array', async () => {
+    it('reads Claude\'s content array, the reasoning effort sent only as the top-level field, which Claude\'s source forwards', async () => {
         host.reply = { content: [{ type: 'thinking', thinking: '…' }, { type: 'text', text: '[{"name":"bell"}]' }], stop_reason: 'end_turn' };
         expect((await call(PROFILES.claude)).content).toBe('[{"name":"bell"}]');
+        const [, , , , overridePayload] = sentRequest();
+        expect(overridePayload).toMatchObject({ reasoning_effort: 'none' });
+        expect(overridePayload).not.toHaveProperty('custom_include_body');
     });
 
     it('reads a Text Completion reply, llama.cpp\'s content and Ollama\'s response, sending only temperature, the max tokens as num_predict and n_predict, and the no-key ID', async () => {
@@ -182,6 +187,32 @@ describe('a profile call that cannot run', () => {
         host.failure = failed('Connection refused: 127.0.0.1:8080');
         await expect(call(PROFILES.custom)).rejects.toMatchObject({ kind: 'connection' });
         expect(notices.connection).toHaveBeenCalledWith('EventBase', 'profile "Harbor custom"', 'Connection refused: 127.0.0.1:8080');
+    });
+
+    // As on the manual path (llm-provider-call.test.js): the provider's own failure asks nothing of the user.
+    it('keeps a provider server error to the console, with no rejection causes', async () => {
+        host.failure = failed('Internal Server Error');
+        await expect(call(PROFILES.custom)).rejects.toMatchObject({
+            kind: 'upstream_error',
+            message: 'EventBase: the provider of profile "Harbor custom" had a server error on model "harbor-model" — Internal Server Error',
+            rejectionCauses: null,
+        });
+        expect(notices.upstream).not.toHaveBeenCalled();
+    });
+
+    // EventBase extraction sends a rejected window again and names the causes if it still fails at the end of the run.
+    it('turns off only the rejection toast for a caller that sends the request again, naming the causes on the error', async () => {
+        host.failure = failed('Bad Request');
+        await expect(call(PROFILES.custom, { shouldNotifyUpstreamRejection: false })).rejects.toMatchObject({
+            kind: 'upstream_error',
+            message: 'EventBase: profile "Harbor custom" rejected the request — Bad Request',
+            rejectionCauses: expect.stringContaining('Common causes'),
+        });
+        expect(notices.upstream).not.toHaveBeenCalled();
+
+        host.failure = failed('Connection refused: 127.0.0.1:8080');
+        await expect(call(PROFILES.custom, { shouldNotifyUpstreamRejection: false })).rejects.toMatchObject({ kind: 'connection' });
+        expect(notices.connection).toHaveBeenCalledTimes(1);
     });
 
     it('rethrows a timeout as the manual path does', async () => {

@@ -45,15 +45,27 @@ vi.mock('../src/features/eventbase/eventbase-retrieval.js', async (importOrigina
 
 const postChatCompletionMock = vi.fn();
 const checkConnectionProfileMock = vi.fn();
-vi.mock('../src/features/llm-provider/index.js', async () => ({
-    postChatCompletion: (...args) => postChatCompletionMock(...args),
-    resolveModelParameterStyle: () => ({ sendTemperature: true, reasoningEffort: 'none' }),
-    resolveConnectionProfileId: (await import('../src/features/llm-provider/connection-profile-core.js')).resolveConnectionProfileId,
-    checkConnectionProfile: (...args) => checkConnectionProfileMock(...args),
-    LlmCallError: class LlmCallError extends Error {},
-}));
+// The real connection check reads the profile through this mock.
+vi.mock('../src/features/llm-provider/llm-provider-call.js', () => ({ checkConnectionProfile: (...args) => checkConnectionProfileMock(...args) }));
+vi.mock('../src/features/llm-provider/index.js', async () => {
+    const connection = await import('../src/features/llm-provider/llm-connection.js');
+    return {
+        postChatCompletion: (...args) => postChatCompletionMock(...args),
+        resolveModelParameterStyle: () => ({ sendTemperature: true, reasoningEffort: 'none' }),
+        resolveConnectionProfileId: (await import('../src/features/llm-provider/connection-profile-core.js')).resolveConnectionProfileId,
+        resolveLlmConnection: connection.resolveLlmConnection,
+        shownVllmUrl: connection.shownVllmUrl,
+        describeConnectionProblem: connection.describeConnectionProblem,
+        LlmCallError: class LlmCallError extends Error {},
+    };
+});
 
 const chatState = vi.hoisted(() => ({ chat: [] }));
+// How a search text is cut: whole unless a test sets its own split (tests/search-pieces-core.test.js covers the cutting).
+const pieceState = vi.hoisted(() => ({ split: null }));
+vi.mock('../src/features/embedding/index.js', () => ({
+    searchPieces: text => (pieceState.split ? pieceState.split(text) : (String(text ?? '').trim() ? [text] : [])),
+}));
 vi.mock('../src/sillytavern/chat.js', () => ({ getContext: () => ({ chat: chatState.chat }) }));
 vi.mock('../src/shared/api-keys.js', () => ({ getOpenRouterApiKey: () => 'key', getCustomApiKey: () => 'key' }));
 vi.mock('../src/shared/similharity-plugin.js', () => ({ checkPluginAvailable: vi.fn(async () => true) }));
@@ -120,7 +132,7 @@ const baseParams = {
     searchText: 'recent chat',
     chatLength: 3000,
     settings: { vector_backend: 'qdrant', story_arc_block_scale: 0.7 },
-    liveCollectionIds: [COLLECTION],
+    storyArcCollectionKey: COLLECTION,
     boundQuery: (promise) => promise,
 };
 
@@ -130,6 +142,7 @@ beforeEach(() => {
     listChunksMock.mockReset();
     listReturns([]);
     entityMerges = {};
+    pieceState.split = null;
 });
 
 describe('retrieveStoryRecipeEvents', () => {
@@ -159,13 +172,13 @@ describe('retrieveStoryRecipeEvents', () => {
         expect(starts(events)).not.toContain(1089);
     });
 
-    it('takes turns between searches, so no collection crowds out another', async () => {
-        const first = Array.from({ length: 90 }, (_, i) => event(1000 + i, `first ${i}`));
-        const second = Array.from({ length: 90 }, (_, i) => event(5000 + i, `second ${i}`));
-        queryCollectionMock.mockResolvedValueOnce({ hashes: starts(first), metadata: first });
-        queryCollectionMock.mockResolvedValueOnce({ hashes: starts(second), metadata: second });
-        const { events } = await retrieveStoryRecipeEvents({ shape: 'chain', subject: '' }, { ...baseParams, liveCollectionIds: [COLLECTION, 'qdrant:vf_eventbase_other'] });
-        expect(starts(events).filter(start => start >= 5000)).toHaveLength(20);
+    it('reads the collection in use alone, never another collection locked here', async () => {
+        queryReturns([event(100, 'in use')]);
+        await retrieveStoryRecipeEvents({ shape: 'chain', subject: '' }, { ...baseParams, liveCollectionIds: [COLLECTION, 'qdrant:vf_eventbase_other'] });
+        expect(queryCollectionMock).toHaveBeenCalledTimes(1);
+        expect(queryCollectionMock.mock.calls[0][0]).toBe(COLLECTION);
+        expect(listChunksMock).toHaveBeenCalledTimes(1);
+        expect(listChunksMock.mock.calls[0][0]).toBe(COLLECTION);
     });
 
     it('walks stored links once the chat has them, reaching events the search did not find', async () => {
@@ -261,21 +274,20 @@ describe('retrieveStoryRecipeEvents', () => {
         expect(starts(events)).toEqual([2990]);
     });
 
-    it('searches every live collection and adds archive hits, without repeats', async () => {
+    it('leaves out the hits of chat files locked here, whose links are another collection\'s', async () => {
         queryReturns([event(100, 'live', { score: 0.9 })]);
         const { events } = await retrieveStoryRecipeEvents({ shape: 'why', subject: '' }, {
             ...baseParams,
-            liveCollectionIds: [COLLECTION, 'qdrant:vf_eventbase_other'],
             additionalCandidates: [event(50, 'archive', { score: 0.5, event_id: 'archive50' })],
         });
-        expect(queryCollectionMock).toHaveBeenCalledTimes(2);
-        expect(starts(events)).toEqual([50, 100]);
+        expect(queryCollectionMock).toHaveBeenCalledTimes(1);
+        expect(starts(events)).toEqual([100]);
     });
 
     it('does nothing without a recipe, a collection or a query', async () => {
         for (const [route, params] of [
             [{ shape: 'scene', subject: '' }, baseParams],
-            [{ shape: 'chain', subject: '' }, { ...baseParams, liveCollectionIds: [] }],
+            [{ shape: 'chain', subject: '' }, { ...baseParams, storyArcCollectionKey: null }],
             [{ shape: 'chain', subject: '' }, { ...baseParams, skipLiveQuery: true }],
             [{ shape: 'chain', subject: '' }, { ...baseParams, keywordQuery: '', searchText: '' }],
         ]) {
@@ -363,6 +375,26 @@ describe('findStoryWebEvents', () => {
         expect(found.closestHashes).toEqual([20]);
         expect(found.reachedHashes.sort()).toEqual([10, 20]);
         expect(postChatCompletionMock).not.toHaveBeenCalled();
+    });
+});
+
+describe('a StoryArc search text over the embedding provider\'s piece size', () => {
+    it('searches each piece, merges their hits by place, and keeps each event once, at its best place', async () => {
+        pieceState.split = text => text.split(' | ');
+        const hitsByPiece = {
+            'Where did Nora go': [event(20, 'Nora two'), event(10, 'Oracle one')],
+            'what did Tom find': [event(30, 'Tom three'), event(20, 'Nora two')],
+        };
+        queryCollectionMock.mockImplementation(async (_collectionId, queryText) => {
+            const hits = hitsByPiece[queryText] ?? [];
+            return { hashes: hits.map(item => item.source_window_start), metadata: hits };
+        });
+        const stored = [10, 20, 30].map(start => ({ ...event(start), _hash: start, story_links: [] }));
+
+        const found = await findStoryWebEvents({ question: 'Where did Nora go | what did Tom find', collectionKey: COLLECTION, storedEvents: stored, merges: {}, settings: baseParams.settings });
+
+        expect(queryCollectionMock.mock.calls.map(call => call[1])).toEqual(['Where did Nora go', 'what did Tom find']);
+        expect(found.closestHashes).toEqual([20, 30, 10]);
     });
 });
 

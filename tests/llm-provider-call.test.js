@@ -26,6 +26,7 @@ vi.mock('../src/shared/model-config-notifier.js', () => ({
     isConnectionError: (...args) => mockIsConnectionError(...args),
     notifyConnectionError: (...args) => mockNotifyConnectionError(...args),
     notifyUpstreamRejection: (...args) => mockNotifyUpstreamRejection(...args),
+    describeUpstreamRejectionCauses: (isQuotaError) => (isQuotaError ? 'quota causes' : 'request causes'),
 }));
 
 vi.mock('../src/sillytavern/log.js', () => ({
@@ -100,6 +101,15 @@ describe('postChatCompletion — request body', () => {
         expect(body.messages).toEqual([{ role: 'user', content: 'hello' }]);
         expect(body.max_tokens).toBe(100);
         expect(body.temperature).toBe(0.3);
+    });
+
+    it("returns the prompt's tokens read from the provider's cache where it reports them, and null where it does not", async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => okResponse({
+            content: 'hi', usage: { prompt_tokens: 15070, completion_tokens: 40, total_tokens: 15110, prompt_tokens_details: { cached_tokens: 10141 } },
+        })));
+        expect((await postChatCompletion(baseArgs())).usage).toEqual({ prompt_tokens: 15070, completion_tokens: 40, total_tokens: 15110, cached_tokens: 10141 });
+        vi.stubGlobal('fetch', vi.fn(async () => okResponse({ content: 'hi', usage: { prompt_tokens: 12 } })));
+        expect((await postChatCompletion(baseArgs())).usage).toMatchObject({ prompt_tokens: 12, cached_tokens: null });
     });
 
     it('routes vLLM through the proxy with chat_completion_source=custom + custom_url', async () => {
@@ -371,6 +381,34 @@ describe('postChatCompletion — error classification', () => {
         expect(mockNotifyUpstreamRejection).not.toHaveBeenCalled();
     });
 
+    // EventBase extraction sends a rejected window again: a provider can reject a request and take the same one a moment later.
+    it('turns off only the rejection toast for a caller that sends the request again', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200, json: async () => ({ error: { message: 'Bad Request' } }),
+        })));
+        await expect(postChatCompletion(baseArgs({ shouldNotifyUpstreamRejection: false })))
+            .rejects.toMatchObject({ kind: 'upstream_error' });
+        expect(mockNotifyUpstreamRejection).not.toHaveBeenCalled();
+
+        mockIsConnectionError.mockReturnValue(true);
+        vi.stubGlobal('fetch', vi.fn(async () => errorResponse(502, 'ECONNREFUSED')));
+        await expect(postChatCompletion(baseArgs({ provider: 'vllm', vllmUrl: 'http://x', shouldNotifyUpstreamRejection: false })))
+            .rejects.toMatchObject({ kind: 'connection' });
+        expect(mockNotifyConnectionError).toHaveBeenCalledWith('TestFeature', 'http://x', 'ECONNREFUSED');
+    });
+
+    it('names a rejection\'s causes on its error, for a caller that reports it later', async () => {
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200, json: async () => ({ error: { message: 'Bad Request' }, quota_error: false }),
+        })));
+        await expect(postChatCompletion(baseArgs())).rejects.toMatchObject({ kind: 'upstream_error', rejectionCauses: 'request causes' });
+
+        vi.stubGlobal('fetch', vi.fn(async () => ({
+            ok: true, status: 200, json: async () => ({ error: { message: 'Too Many Requests' }, quota_error: true }),
+        })));
+        await expect(postChatCompletion(baseArgs())).rejects.toMatchObject({ kind: 'upstream_error', rejectionCauses: 'quota causes' });
+    });
+
     // A provider's own failure asks nothing of the user: the caller sends the window again.
     it('keeps a provider server error to the console', async () => {
         for (const message of ['Internal Server Error', 'Bad Gateway', 'Service Unavailable', 'Gateway Timeout', 'Too Many Requests']) {
@@ -381,6 +419,7 @@ describe('postChatCompletion — error classification', () => {
             await expect(postChatCompletion(baseArgs()), message).rejects.toMatchObject({
                 kind: 'upstream_error',
                 message: expect.stringContaining(`had a server error on model "test/model" — ${message}`),
+                rejectionCauses: null,
             });
         }
         expect(mockNotifyUpstreamRejection).not.toHaveBeenCalled();

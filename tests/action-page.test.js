@@ -3,8 +3,9 @@
  *
  * The settings panel's Action page (src/features/settings-panel/action-page.js), on its real markup: the master switch
  * saves, paints its pill and the other pages' notice, and redoes the startup work when it turns back on; each button
- * opens its tool; each debug switch saves its own domain or setting; Purge and Clean up delete nothing until the user
- * confirms, and a Purge whose delete fails resets nothing; the summarizer preview shows the block or why there is none.
+ * opens its tool; each debug switch saves its own domain or setting; Purge and Clean up corrupted delete nothing until
+ * the user confirms, and a Purge whose delete fails resets nothing; Clean up locks runs lock-cleanup.js
+ * (lock-cleanup.test.js); the summarizer preview shows the block or why there is none.
  */
 /* global document -- this file runs under the jsdom environment */
 
@@ -29,7 +30,7 @@ const host = vi.hoisted(() => ({
     buildSummarizerInjection: vi.fn(),
     refreshWorldInfoEntryDepthCache: vi.fn(),
     openTextCleaningDialog: vi.fn(),
-    clearLorebookPrompt: vi.fn(),
+    cleanUpLocks: vi.fn(),
 }));
 
 vi.mock('../src/sillytavern/settings.js', () => ({
@@ -39,13 +40,18 @@ vi.mock('../src/sillytavern/settings.js', () => ({
 vi.mock('../src/sillytavern/popup.js', () => ({ confirmPopup: host.confirmPopup, noticePopup: host.noticePopup }));
 vi.mock('../src/sillytavern/log.js', () => ({ log: { error: host.logError, warn: () => {}, lifecycle: () => {} } }));
 vi.mock('../src/shared/progress-tracker.js', () => ({ progressTracker: { reopen: host.reopenProgress } }));
-vi.mock('../src/features/chunkbase/index.js', () => ({ clearInterceptorPrompts: host.clearInterceptorPrompts, openContentVectorizer: host.openContentVectorizer, syncOpenChat: host.syncOpenChat }));
 vi.mock('../src/features/collections/index.js', () => ({ cleanupCorruptedCollections: host.cleanupCorruptedCollections, deleteVectorsFolder: host.deleteVectorsFolder }));
 vi.mock('../src/features/database-browser/index.js', () => ({ openDatabaseBrowser: host.openDatabaseBrowser }));
 vi.mock('../src/features/diagnostics/index.js', () => ({ openDiagnostics: host.openDiagnostics, refreshHealthPill: host.refreshHealthPill }));
-vi.mock('../src/features/eventbase/index.js', () => ({ buildSummarizerInjection: host.buildSummarizerInjection, refreshWorldInfoEntryDepthCache: host.refreshWorldInfoEntryDepthCache }));
+vi.mock('../src/features/eventbase/index.js', () => ({
+    buildSummarizerInjection: host.buildSummarizerInjection,
+    clearInterceptorPrompts: host.clearInterceptorPrompts,
+    openContentVectorizer: host.openContentVectorizer,
+    refreshWorldInfoEntryDepthCache: host.refreshWorldInfoEntryDepthCache,
+    syncOpenChat: host.syncOpenChat,
+}));
 vi.mock('../src/features/text-cleaning/index.js', () => ({ openTextCleaningDialog: host.openTextCleaningDialog }));
-vi.mock('../src/features/world-info/index.js', () => ({ clearLorebookPrompt: host.clearLorebookPrompt }));
+vi.mock('../src/features/settings-panel/lock-cleanup.js', () => ({ cleanUpLocks: host.cleanUpLocks }));
 
 const { ACTION_PAGE_ELEMENT_ID: ID, DEBUG_SWITCHES, actionPageMarkup, masterSwitchPillsMarkup } = await import('../src/features/settings-panel/action-page-markup.js');
 const { panelPageMarkup } = await import('../src/features/settings-panel/panel-shell-markup.js');
@@ -102,7 +108,6 @@ describe('Action page', () => {
         expect(host.extensionSettings.vectfox.enabled).toBe(false);
         expect(host.saveSettingsDebounced).toHaveBeenCalled();
         expect(host.clearInterceptorPrompts).toHaveBeenCalledWith(settings);
-        expect(host.clearLorebookPrompt).toHaveBeenCalledWith(settings);
         expect(actions.refreshAutoSyncCheckbox).toHaveBeenCalledWith(settings);
         expect(actions.runNetworkStartup).not.toHaveBeenCalled();
         expect(isShown(`#${ID.masterOffPill}`)).toBe(true);
@@ -229,6 +234,13 @@ describe('Action page', () => {
         host.cleanupCorruptedCollections.mockResolvedValue({ total: 2, corruption: 1, stFile: 1, purged: [{ ok: true }, { ok: false }] });
         $(`#${ID.cleanupCorrupted}`).trigger('click');
         await vi.waitFor(() => expect(toastr.warning).toHaveBeenCalledWith(expect.stringContaining('Purged 1/2'), 'Cleanup partial'));
+    });
+
+    it('runs Clean up locks from its button in the danger zone', () => {
+        wireActionPage(settings, actions);
+        expect($(`#${ID.cleanupLocks}`).closest('.vfx-danger-zone')).toHaveLength(1);
+        $(`#${ID.cleanupLocks}`).trigger('click');
+        expect(host.cleanUpLocks).toHaveBeenCalledTimes(1);
     });
 
     it('previews the summarizer block in a read-only box, and says when the injection is off', async () => {

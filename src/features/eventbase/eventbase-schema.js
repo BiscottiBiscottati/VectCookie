@@ -8,7 +8,8 @@
  * The LLM extraction prompt itself lives in src/features/eventbase/prompts-i18n.js
  * (`getEventBaseExtractionPrompt(mode)`), which has per-language variants
  * driven by the CJK Tokenizer Mode setting. buildExtractionPrompt() below
- * just selects the right variant and substitutes {{text}} / {{maxCount}}.
+ * just selects the right variant and substitutes {{text}} / {{maxCount}} /
+ * {{storyLanguageNotice}}.
  * ============================================================================
  */
 import { getEventBaseExtractionPrompt } from './prompts-i18n.js';
@@ -78,17 +79,20 @@ export function packTimelineSortKey(windowStart, eventOrder) {
 }
 
 /**
- * Non-fatal extraction parse error (per-window; caller should log + skip).
+ * Non-fatal extraction error (per-window; the run logs it and sends the window again).
  */
 export class EventBaseExtractionError extends Error {
     /**
      * @param {string} message
      * @param {number} [windowIndex]
+     * @param {string|null} [rejectionCauses] - For a request the provider rejected, what commonly causes that
+     *        (LlmCallError's rejectionCauses), named by the end-of-run notice if the window still fails
      */
-    constructor(message, windowIndex = -1) {
+    constructor(message, windowIndex = -1, rejectionCauses = null) {
         super(message);
         this.name = 'EventBaseExtractionError';
         this.windowIndex = windowIndex;
+        this.rejectionCauses = rejectionCauses;
     }
 }
 
@@ -319,10 +323,11 @@ export function parseEmbedText(text) {
  * Template selection (first non-empty wins):
  *   1. `customPrompt` — user-edited override from settings.eventbase_custom_prompt
  *   2. `getEventBaseExtractionPrompt(mode)` — built-in default localized to the
- *      user's CJK Tokenizer Mode (defaults to 'intl' / English when mode is
- *      unset or unrecognized)
+ *      user's CJK Tokenizer Mode; intl, others and an unset or unrecognized mode
+ *      get the one that writes in the excerpt's own language
  *
- * Then `{{text}}` and `{{maxCount}}` are substituted before returning.
+ * Then `{{maxCount}}`, `{{storyLanguageNotice}}` and `{{text}}` are substituted before returning; a custom prompt
+ * without `{{storyLanguageNotice}}` gets no notice after its excerpt.
  *
  * @param {string} text  - The chat excerpt (already joined messages)
  * @param {number} maxCount - Max events to return (eventbase_max_events_per_window)
@@ -330,13 +335,15 @@ export function parseEmbedText(text) {
  * @param {string} [mode] - CJK Tokenizer Mode (intl / jieba / jieba_tw /
  *                          tiny_segmenter / korean / others). Ignored when
  *                          customPrompt is provided.
+ * @param {string} [storyLanguageNotice] - STORY_LANGUAGE_NOTICE.afterExcerpt when the window gets it, else empty
  * @returns {string}
  */
-export function buildExtractionPrompt(text, maxCount, customPrompt = '', mode = 'intl') {
+export function buildExtractionPrompt(text, maxCount, customPrompt = '', mode = 'intl', storyLanguageNotice = '') {
     const template = (customPrompt && customPrompt.trim())
         ? customPrompt
         : getEventBaseExtractionPrompt(mode);
     return template
         .replace(/\{\{maxCount\}\}/g, String(maxCount))
+        .replace(/\{\{storyLanguageNotice\}\}/g, storyLanguageNotice ? `${storyLanguageNotice} ` : '')
         .replace(/\{\{text\}\}/g, text);
 }

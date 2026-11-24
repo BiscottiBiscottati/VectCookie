@@ -51,6 +51,7 @@ vi.mock('../src/features/vector-backend/index.js', async () => ({
     getBackend: vi.fn(),
     setInsertedCollectionRegistrar: vi.fn(),
     qdrantTarget: (await import('../src/features/vector-backend/qdrant-target.js')).qdrantTarget,
+    copiedPointId: (await import('../src/features/vector-backend/qdrant-target.js')).copiedPointId,
 }));
 
 import { extension_settings } from '../../../../extensions.js';
@@ -105,7 +106,7 @@ describe('a Database Browser export and import of a linked collection', () => {
 
     beforeEach(async () => {
         vi.clearAllMocks();
-        extension_settings.vectfox = { collections: {}, vectfox_collection_registry: [], chunk_metadata: {} };
+        extension_settings.vectfox = { collections: {}, vectfox_collection_registry: [] };
         vi.stubGlobal('fetch', fakePluginFetch);
         purgeVectorIndex.mockImplementation(async () => {
             storedItems = [];

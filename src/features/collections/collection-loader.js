@@ -23,24 +23,30 @@ import {
 import { log } from '../../sillytavern/log.js';
 // Import from collection-ids.js - single source of truth for collection ID operations
 import {
+    COLLECTION_PREFIXES,
     parseCollectionId,
     parseRegistryKey,
-    COLLECTION_PREFIXES,
     buildRegistryKey,
     sanitizeHandleId,
-    sanitizeNameSegment,
 } from '../../shared/collection-ids.js';
 import { checkPluginAvailable, isPluginDetected, resetPluginAvailableCache } from '../../shared/similharity-plugin.js';
 import { readErrorBody } from '../../shared/server-error-text.js';
 
+// getCollectionFilterReason's reason for LoreBase's vectors, which registerCollection skips too.
+const LOREBASE_VECTORS_REASON = 'lorebase-vectors';
+
 /**
  * Detect collection IDs that VECTFOX should NOT register or query.
- * Two categories:
- *   1. Prefix-stacked corruption — IDs that start with a known backend name without
+ * Four categories:
+ *   1. Internal system collections — IDs starting with "__vectfox_" (health checks, test indexes).
+ *   2. LoreBase's vectors — IDs starting with "vf_lorebase_": each lorebook's points and the account's own Qdrant
+ *      collection that holds them when "One shared collection" is off. LoreBase's tab keeps them; a collection of the
+ *      registry would show in the Database Browser with locks and a Delete that mean nothing to them.
+ *   3. Prefix-stacked corruption — IDs that start with a known backend name without
  *      a colon separator (e.g. "vectraopenrouterfile_xxx"). These come from a prior
  *      bug where the registry key was used as the on-disk collection name. The
  *      filesystem stripped colons, leaving folders that get re-discovered each load.
- *   2. ST-native file attachments — IDs starting with "file_<digits>". Created by
+ *   4. ST-native file attachments — IDs starting with "file_<digits>". Created by
  *      SillyTavern's built-in Vector Storage extension when files are attached to
  *      chat. VECTFOX can't usefully retrieve from them (different embedding model
  *      and lifecycle) and they pollute the query path.
@@ -56,13 +62,18 @@ export function getCollectionFilterReason(collectionId) {
         return 'internal-system';
     }
 
-    // (2) Stacked-prefix corruption. Real collection IDs never start with a backend
+    // (2) LoreBase's vectors, which its own tab keeps.
+    if (collectionId.startsWith(COLLECTION_PREFIXES.VECTFOX_LOREBASE)) {
+        return LOREBASE_VECTORS_REASON;
+    }
+
+    // (3) Stacked-prefix corruption. Real collection IDs never start with a backend
     // name; backend is only used in the registry key with colon separators.
     if (/^(vectra|qdrant|standard)(?![:_])/i.test(collectionId)) {
         return 'corrupted-prefix-stacked';
     }
 
-    // (3) ST-native file attachments — `file_` followed by digits.
+    // (4) ST-native file attachments — `file_` followed by digits.
     if (/^file_\d+$/.test(collectionId)) {
         return 'st-native-file';
     }
@@ -98,6 +109,8 @@ export function registerCollection(collectionId) {
         log.warn('VectFox: Attempted to register null/undefined collectionId, skipping');
         return;
     }
+    // LoreBase's vectors go through the same insert as every collection, which registers what it inserts into.
+    if (getCollectionFilterReason(parseRegistryKey(collectionId).collectionId) === LOREBASE_VECTORS_REASON) return;
     const registry = getCollectionRegistry();
     const isNew = !registry.includes(collectionId);
     if (isNew) {
@@ -219,8 +232,8 @@ export function unregisterCollection(collectionId) {
     }
 }
 
-// What deleteCollection() and importCollection() run last, to clear the per-chat state a feature
-// above this one keeps for a collection whose events are gone or replaced. index.js sets it at startup.
+// What deleteCollection() and importCollection() run last, to clear what a feature above this one
+// holds in memory of a collection whose events are gone or replaced. index.js sets it at startup.
 let deletedOrImportedCollectionCleanup = null;
 
 /**
@@ -232,9 +245,9 @@ export function setDeletedOrImportedCollectionCleanup(cleanup) {
 }
 
 /**
- * Clears the per-chat state kept for a collection that was deleted or imported (EventBase's
- * extraction caches). A failure is logged and goes no further: a cache clear never fails a delete
- * or an import.
+ * Clears what is held in memory of a collection that was deleted or imported (EventBase's tip), so
+ * the next read takes it from the collection's record. A failure is logged and goes no further: a
+ * cache clear never fails a delete or an import.
  * @param {string} collectionId - the collection's bare ID
  */
 export function clearStateOfDeletedOrImportedCollection(collectionId) {
@@ -242,7 +255,7 @@ export function clearStateOfDeletedOrImportedCollection(collectionId) {
         if (!deletedOrImportedCollectionCleanup) throw new Error('no cleanup set: index.js calls setDeletedOrImportedCollectionCleanup() at startup');
         deletedOrImportedCollectionCleanup(collectionId);
     } catch (error) {
-        log.warn(`VectFox: Failed to clear per-chat state for ${collectionId}:`, error);
+        log.warn(`VectFox: Failed to clear what is held in memory of ${collectionId}:`, error);
     }
 }
 
@@ -311,7 +324,7 @@ export async function deleteCollection(collectionId, settings, registryKey = nul
         log.warn(`VectFox: ✗ Failed to delete metadata for ${collectionId}:`, error.message);
     }
 
-    // Step 4: Clear the per-chat state kept for this collection.
+    // Step 4: Clear what is held in memory of this collection.
     clearStateOfDeletedOrImportedCollection(collectionId);
 
     const success = vectorsDeleted && registryDeleted && metadataDeleted;
@@ -430,14 +443,24 @@ export function cleanupTestCollections(isTestCollection) {
     return removed;
 }
 
-// parseCollectionId is now imported from collection-ids.js
+/**
+ * A registered collection's name as the Database Browser lists it: its record's name, else the one its ID and type give.
+ * @param {string} registryKey - Its registry key, "backend:id"
+ * @returns {string}
+ */
+export function collectionNameOf(registryKey) {
+    const { collectionId } = parseRegistryKey(registryKey);
+    const parsed = parseCollectionId(collectionId);
+    const type = getCollectionMeta(registryKey).contentType || parsed.type;
+    return getCollectionDisplayName(collectionId, registryKey, { type, rawId: parsed.rawId, chatUUID: parsed.chatUUID });
+}
 
 /**
  * Gets display name for a collection
  * @param {string} collectionId Bare collection identifier
  * @param {string} registryKey "backend:id" form — the key collection metadata
  *   (including a user-set displayName from Rename) is stored under
- * @param {object} metadata Parsed collection metadata
+ * @param {{type: string, rawId: string, chatUUID: string|null}} metadata Parsed collection metadata
  * @returns {string} Human-readable name
  */
 function getCollectionDisplayName(collectionId, registryKey, metadata) {
@@ -466,21 +489,17 @@ function getCollectionDisplayName(collectionId, registryKey, metadata) {
                 return `💬 Chat: ${character.name}`;
             }
 
-              // Fallback: extract character name from rawId if it follows pattern: charName_uuid
-            // Format: assistant_503c1099-b769-41e7-8e15-0d652cd6d1b4
-            const underscoreIndex = chatId.lastIndexOf('_');
-            if (underscoreIndex > 0) {
-                // Extract everything before the last underscore (the character name)
-                const charName = chatId.substring(0, underscoreIndex);
-                return `💬 Chat: ${charName}`;
+            // Fallback: the ID before the chat's UUID, "qdrant_rabbit_assistant" of
+            // "qdrant_rabbit_assistant_503c1099-b769-41e7-8e15-0d652cd6d1b4", the same for the chat's later collections,
+            // which end in the time each was made; with no chat UUID in the ID, the ID before its last underscore.
+            const nameEnd = metadata.chatUUID ? chatId.lastIndexOf(`_${metadata.chatUUID}`) : chatId.lastIndexOf('_');
+            if (nameEnd > 0) {
+                return `💬 Chat: ${chatId.substring(0, nameEnd)}`;
             }
 
             // Final fallback to just the ID
             return `💬 Chat #${chatId.substring(0, 8)}`;
         }
-
-        case 'file':
-            return `📄 File: ${metadata.rawId}`;
 
         case 'lorebook':
             return `📚 Lorebook: ${metadata.rawId}`;
@@ -638,10 +657,10 @@ async function discoverViaPlugin(settings) {
             // plugin actually reached. `qdrantScanned` is false when the Qdrant
             // health check failed — the scan then contains zero qdrant collections
             // not because they were deleted but because the server was unreachable.
-            // Pruning them here cascaded into cleanupOrphanedMeta() deleting their
+            // Pruning them here would cascade into cleanupOrphanedMeta() deleting their
             // metadata (chat/character locks, triggers, scope, names) on the next
-            // DB-browser refresh — a transient Qdrant hiccup permanently unlocked
-            // lorebooks (issue #11 "it stopped working out of the blue").
+            // DB-browser refresh, so a transient Qdrant hiccup would permanently
+            // unlock collections.
             // Older plugins don't report the flag at all (undefined); treat that as
             // not-scanned too — a lingering ghost registry entry is recoverable from
             // the DB browser, silently wiped locks are not.
@@ -649,7 +668,7 @@ async function discoverViaPlugin(settings) {
             // With "One shared collection" on, Qdrant's physical names say nothing about VectFox's collections: they
             // all live in vectfox_main. The plugin lists each of its tenants as a collection and says so with
             // qdrantTenantsScanned; without that (a plugin before 3.4.8, or a Qdrant before 1.12), no qdrant entry
-            // is pruned (issue #30: discovery pruned every lorebook, with its locks).
+            // is pruned, since that would drop every collection in it, with its locks.
             const qdrantVerified = data.qdrantScanned === true
                 && (!settings?.qdrant_multitenancy || data.qdrantTenantsScanned === true);
             const updatedRegistry = getCollectionRegistry();
@@ -901,25 +920,6 @@ async function discoverViaFallback(settings) {
         }
     }
 
-    // 3. Probe for character-based collections
-    for (const char of characters) {
-        if (!char.name) continue;
-
-        const sanitizedName = sanitizeNameSegment(char.name, 30);
-
-        // VECTFOX character collection format
-        const charCollectionId = `${COLLECTION_PREFIXES.VECTFOX_CHARACTER}${sanitizedName}`;
-        if (!probed.has(charCollectionId)) {
-            probed.add(charCollectionId);
-            const result = await probeCollection(charCollectionId, settings);
-            if (result.exists) {
-                registerCollection(charCollectionId);
-                discovered.push(charCollectionId);
-                log.verbose(`VectFox: Discovered character collection: ${charCollectionId} (${result.count} chunks)`);
-            }
-        }
-    }
-
     // Note: Without filesystem access, we can't discover collections with unknown IDs
     // The registry is our primary source of truth for non-current-chat collections
 
@@ -1005,6 +1005,7 @@ export async function loadAllCollections(settings, autoDiscover = true) {
                 type: storedMeta.contentType || parsedMeta.type,
                 scope: storedMeta.scope,
                 rawId: parsedMeta.rawId,
+                chatUUID: parsedMeta.chatUUID,
             };
             log.trace(`VectFox:   Type: ${metadata.type}, Scope: ${metadata.scope}${storedMeta.contentType ? ' (from stored meta)' : ' (parsed from ID)'}`);
 
@@ -1112,23 +1113,50 @@ export async function loadAllCollections(settings, autoDiscover = true) {
     if (collections.length === 0 && registry.length > 0) {
         log.trace(`⚠️ VectFox: ${registry.length} collections in registry but all are empty!`);
         log.trace(`   💡 Collections need to have vectorized chunks to appear in Database Browser`);
-        log.trace(`   💡 Try vectorizing your chat or content first`);
+        log.trace(`   💡 Try vectorizing your chat first`);
     } else if (collections.length === 0 && registry.length === 0) {
         log.trace(`ℹ️ VectFox: No collections registered yet`);
-        log.trace(`   💡 Collections are created when you vectorize chat messages or documents`);
+        log.trace(`   💡 Collections are created when you vectorize a chat`);
     }
 
     return collections;
 }
 
 /**
- * Returns true if the collection has 0 chunks according to the plugin discovery cache.
- * Used by retrieval to skip empty collections without querying them.
- * @param {string} registryKey - e.g. "vectra:vf_lorebook_story1_..."
- * @returns {boolean}
+ * Delete a collection where the last discovery found it, as the Database Browser does: on its backend and in every
+ * index discovery listed. A failure is logged under the caller's label.
+ *
+ * @param {{registryKey: string, collectionId: string, backend?: string|null}} collection
+ * @param {object} settings - VectFox settings
+ * @param {string} label - The feature the log names
+ * @returns {Promise<boolean>} Whether it is fully gone
  */
-export function isCollectionEmpty(registryKey) {
-    if (!pluginCollectionData) return false;
-    const cached = pluginCollectionData[registryKey];
-    return cached !== undefined && !cached.chunkCount;
+export async function deleteCollectionWhereDiscovered({ registryKey, collectionId, backend = null }, settings, label) {
+    const found = discoveredIndexesOf(registryKey);
+    const collectionSettings = {
+        ...settings,
+        vector_backend: found?.backend ?? backend ?? settings.vector_backend,
+        _discoveredSources: found?.sources ?? [],
+    };
+    try {
+        const result = await deleteCollection(collectionId, collectionSettings, registryKey);
+        if (!result.success) log.warn(`${label}: the collection ${collectionId} was only partly deleted:`, result.errors);
+        return result.success;
+    } catch (error) {
+        log.warn(`${label}: the collection ${collectionId} could not be deleted:`, error);
+        return false;
+    }
 }
+
+/**
+ * Where the plugin's last discovery found a collection: its backend and every {source, models} index holding it,
+ * which deleteCollection() purges, as the Database Browser passes them. Null before that discovery, without the
+ * plugin, or for a collection it did not find.
+ * @param {string} registryKey - "backend:id"
+ * @returns {{backend: string, sources: Array<{source: string, models: object[]}>}|null}
+ */
+export function discoveredIndexesOf(registryKey) {
+    const cached = pluginCollectionData?.[registryKey];
+    return cached ? { backend: cached.backend, sources: cached.sources || [] } : null;
+}
+

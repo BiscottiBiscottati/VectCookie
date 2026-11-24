@@ -5,8 +5,9 @@
  *
  * Pins the state after the dead-code cleanups in InternalProject/Vectfox/plans/executed/
  * (delete-dead-chunk-chat-and-temporal-decay.md, unwire-dead-chat-vectorize-options.md,
- * centralize-collection-listing.md): the removed code stays deleted, and the live code
- * beside it stays in place.
+ * centralize-collection-listing.md) and B7 and B29 of plans/lorebook-semantic-overhaul-
+ * passage-index.md, which deleted the old vectorized lorebook path and retired ChunkBase:
+ * the removed code stays deleted, and the live code beside it stays in place.
  *
  * Static analysis only: it reads source files and imports none of them, so it needs no
  * SillyTavern mocks and still runs when a module fails to resolve.
@@ -104,28 +105,6 @@ describe('Live code remains intact (regression guard)', () => {
         });
     });
 
-    describe('ChunkBase pipeline (lorebook / document / character / url / wiki / youtube)', () => {
-        it('src/features/chunkbase/chat-vectorization.js exists', () => {
-            expect(existsRel('src/features/chunkbase/chat-vectorization.js')).toBe(true);
-        });
-
-        it('rearrangeChat is exported (main retrieval entry)', () => {
-            expect(readRel('src/features/chunkbase/chat-vectorization.js'))
-                .toMatch(/export\s+(?:async\s+)?function\s+rearrangeChat/);
-        });
-
-        it('Stage 8.5 chunk groups and links stage is still wired', () => {
-            expect(readRel('src/features/chunkbase/chat-vectorization.js'))
-                .toMatch(/applyGroupsAndLinksStage\s*\(/);
-        });
-
-        it('Keyword extraction is still wired for non-chat content', () => {
-            // extractTextKeywords is what lorebook/document/character ingestion calls
-            expect(readRel('src/features/chunkbase/content-vectorization.js'))
-                .toMatch(/extractTextKeywords\s*\(/);
-        });
-    });
-
     describe('Centralized collection listing', () => {
         it('getCollectionListing is exported from collection-loader.js', () => {
             expect(readRel('src/features/collections/collection-loader.js'))
@@ -137,15 +116,9 @@ describe('Live code remains intact (regression guard)', () => {
                 .toMatch(/getCollectionListing/);
         });
 
-        it('eventbase-store.js consumes getCollectionListing', () => {
-            // The EventBase path resolves its active collection through the listing,
-            // inside resolveActiveEventBaseCollection.
-            expect(readRel('src/features/eventbase/eventbase-store.js'))
-                .toMatch(/getCollectionListing/);
-        });
-
-        it('settings-panel.js consumes getCollectionListing', () => {
-            expect(readRel('src/features/settings-panel/settings-panel.js'))
+        it('eventbase-chat-collections.js consumes getCollectionListing', () => {
+            // The one route to a chat's collection in use (collectionInUse) reads ownership from the listing.
+            expect(readRel('src/features/eventbase/eventbase-chat-collections.js'))
                 .toMatch(/getCollectionListing/);
         });
     });
@@ -154,13 +127,6 @@ describe('Live code remains intact (regression guard)', () => {
         it('keyword_scoring_method default is "hybrid"', () => {
             expect(readRel('src/index.js'))
                 .toMatch(/keyword_scoring_method:\s*['"]hybrid['"]/);
-        });
-
-        it('chat content type has keywordExtraction flag set to false', () => {
-            const src = readRel('src/features/chunkbase/content-types.js');
-            const chatIdx = src.indexOf("chat: {");
-            const block = src.slice(chatIdx, chatIdx + 800);
-            expect(block).toMatch(/keywordExtraction:\s*false/);
         });
     });
 
@@ -185,6 +151,52 @@ describe('Live code remains intact (regression guard)', () => {
 // ============================================================================
 
 describe('Dead code is removed (cleanup contract)', () => {
+    describe('E6 — one route to the collection a chat uses (D18 of vectfox-multi-collection-per-chat.md)', () => {
+        it('the helpers that each answered which collection a chat uses, by a rule of their own, are gone', () => {
+            const offenders = grepSourcesWithLines(/\b(?:resolveActiveEventBaseCollection|resolveEventBaseWriteTarget|_gatherLockedEventBaseCollections|_gatherArchiveEventCollections|isLockedTo|buildChatSearchPatterns|matchesPatterns)\b/);
+            expect(offenders, offenders.join('\n')).toEqual([]);
+        });
+
+        it('the yellow toast on opening a chat with none in use, its words and the pause of every collection of a chat are gone', () => {
+            const offenders = grepSourcesWithLines(/\b(?:warnOfAutoSyncNotInUse|autoSyncNotInUseText|NONE_IN_USE_TEXT|pauseAutoSyncForChat)\b/);
+            expect(offenders, offenders.join('\n')).toEqual([]);
+        });
+
+        it('a backend is named by one function', () => {
+            const offenders = grepSourcesWithLines(/\bBACKEND_NAMES\b/);
+            expect(offenders, offenders.join('\n')).toEqual([]);
+            expect(readRel('src/shared/collection-ids.js')).toMatch(/export\s+function\s+vectorBackendName\b/);
+        });
+    });
+
+    describe('LoreBase — one route per question (the user, 2026-11-21)', () => {
+        it('the near-copies that each answered a LoreBase question by a rule of their own are gone', () => {
+            const offenders = grepSourcesWithLines(/\b(?:uidsWithCurrentVectors|deleteAllVectors|recordedLoreBookNames|REMOVAL_OFF_QDRANT)\b/);
+            expect(offenders, offenders.join('\n')).toEqual([]);
+        });
+
+        it("no one reads a book's selection in use here but through selectionInUseHere", () => {
+            const offenders = grepSourcesWithLines(/selectionInUse\([^)]*lockTarget\(\)/);
+            expect(offenders, offenders.join('\n')).toEqual([]);
+        });
+
+        it('each question has its one route, defined once', () => {
+            const routes = [
+                ['src/features/lorebase/lorebase-reply-core.js', /export\s+function\s+(?:isDecidedEntry|undecidableReasonOf)\b/g, 2],
+                ['src/features/lorebase/lorebase-selection-core.js', /export\s+function\s+(?:isDecidedRow|canToggleRow)\b/g, 2],
+                ['src/features/lorebase/lorebase-readiness.js', /export\s+function\s+isEntryReady\b/g, 1],
+                ['src/features/lorebase/lorebase-setup.js', /export\s+function\s+(?:qdrantProblem|keyWritingProblem|vectorWritingProblem|writingProblem|replyModel)\b/g, 5],
+                ['src/features/lorebase/lorebase-books.js', /export\s+async\s+function\s+decidedCountOf\b/g, 1],
+                ['src/features/lorebase/lorebase-storage-core.js', /export\s+function\s+hasLoreBaseHoldings\b/g, 1],
+                ['src/features/lorebase/lorebase-chat-books.js', /export\s+function\s+(?:whereFor|selectionInUseHere)\b/g, 2],
+            ];
+            expect(routes.map(([file, pattern]) => [file, (readRel(file).match(pattern) ?? []).length])).toEqual(routes.map(([file, , count]) => [file, count]));
+            const copies = grepSourcesWithLines(/(?:const\s+isDecidedRow\s*=|function\s+keyWritingProblem\b|function\s+undecidableReasonOf\b|async\s+function\s+decidedCountOf\b)/)
+                .filter(line => !/lorebase-(?:selection-core|setup|reply-core|books)\.js/.test(line));
+            expect(copies, copies.join('\n')).toEqual([]);
+        });
+    });
+
     describe('Phase B — DEAD-CHUNK-CHAT', () => {
         it('No source file contains the DEAD-CHUNK-CHAT marker', () => {
             const offenders = grepSourcesWithLines(/DEAD-CHUNK-CHAT/);
@@ -299,13 +311,6 @@ describe('Dead code is removed (cleanup contract)', () => {
                 .toEqual([]);
         });
 
-        it('Pipeline no longer has Stage 7 temporal decay marker', () => {
-            const src = readRel('src/features/chunkbase/chat-vectorization.js');
-            // Match the comment block "STAGE 7: Temporal decay" or similar
-            expect(src).not.toMatch(/STAGE\s*7\s*:.*[Tt]emporal.*[Dd]ecay/);
-            expect(src).not.toMatch(/===\s*STAGE\s*7\s*:\s*Temporal\s*decay/);
-        });
-
         it('temporal_decay setting is gone from index.js defaults', () => {
             const src = readRel('src/index.js');
             expect(src).not.toMatch(/temporal_decay\s*:/);
@@ -336,16 +341,9 @@ describe('Dead code is removed (cleanup contract)', () => {
             expect(src).not.toMatch(/data\.temporallyBlind/);
         });
 
-        it('Vectorize Content modal no longer has Temporal Weighting block', () => {
-            const src = readRel('src/features/chunkbase/content-vectorizer.js');
-            expect(src).not.toMatch(/Temporal\s+Weighting/);
-        });
-
-        it('content-types.js no longer has temporalDecay feature flag', () => {
-            // The flag itself becomes meaningless once the subsystem is gone.
-            // It can be removed entirely from CONTENT_TYPES feature blocks.
-            const src = readRel('src/features/chunkbase/content-types.js');
-            expect(src).not.toMatch(/temporalDecay:\s*(true|false)/);
+        it('No source draws the Temporal Weighting block', () => {
+            const offenders = grepSourcesWithLines(/Temporal\s+Weighting/);
+            expect(offenders, offenders.join('\n')).toEqual([]);
         });
     });
 
@@ -365,14 +363,10 @@ describe('Dead code is removed (cleanup contract)', () => {
     });
 
     // ──────────────────────────────────────────────────────────────────────
-    // Phase D — the preview-only chunk-chat layer: prepareChatContent in
-    // content-vectorization.js, the dispatcher case that called it, cleanMessages
-    // in text-cleaning.js, and the chunkingStrategies / defaultStrategy / defaults
-    // fields of CONTENT_TYPES.chat.
-    //
-    // The defensive `case 'chat':` tripwire in generateCollectionId() is
-    // INTENTIONALLY kept — it throws if anyone tampers with source to
-    // bypass the production gates and route chat through the chunk pipeline.
+    // Phase D — the preview-only chunk-chat layer: prepareChatContent and
+    // cleanMessages in text-cleaning.js. The content pipeline that held the
+    // rest of it (the prepareContent dispatcher, generateCollectionId and
+    // CONTENT_TYPES) is gone with ChunkBase, which the B29 block pins.
     // ──────────────────────────────────────────────────────────────────────
     describe('Phase D — Preview-only chunk-chat zombie layer', () => {
         it('prepareChatContent function no longer exists', () => {
@@ -386,71 +380,84 @@ describe('Dead code is removed (cleanup contract)', () => {
             expect(offenders, `cleanMessages still defined in:\n${offenders.join('\n')}`)
                 .toEqual([]);
         });
+    });
 
-        it('No "chat" case remains in the prepareContent dispatcher', () => {
-            // The dispatcher lives in content-vectorization.js's
-            // prepareContent(contentType, ...) switch. We grep narrowly so
-            // we don't flag the unrelated tripwire in generateCollectionId
-            // (different function, intentional defense).
-            const src = readRel('src/features/chunkbase/content-vectorization.js');
-            const prepIdx = src.indexOf('function prepareContent(');
-            expect(prepIdx, 'prepareContent function not found').toBeGreaterThan(-1);
-            // Slice a generous window covering the whole switch.
-            const block = src.slice(prepIdx, prepIdx + 2000);
-            expect(block, 'case \'chat\': still present in prepareContent dispatcher')
-                .not.toMatch(/case\s+['"]chat['"]\s*:/);
+    describe('LoreBase B7 — the old vectorized lorebook path', () => {
+        it('features/world-info, its vector search and rename check, is gone', () => {
+            expect(existsRel('src/features/world-info')).toBe(false);
+            expect(existsRel('src/app/settings-migration-world-info-threshold.js')).toBe(false);
+            expect(existsRel('src/features/chunkbase/lorebook-content-preparer.js')).toBe(false);
         });
 
-        it('generateCollectionId tripwire for chat is preserved (intentional defense)', () => {
-            // Mirror of the above but inverted — we WANT this case to stay.
-            // It's the last line of defense if both UI gates are bypassed.
-            const src = readRel('src/features/chunkbase/content-vectorization.js');
-            const genIdx = src.indexOf('function generateCollectionId(');
-            expect(genIdx, 'generateCollectionId function not found').toBeGreaterThan(-1);
-            const block = src.slice(genIdx, genIdx + 1500);
-            expect(block, 'generateCollectionId tripwire removed — restore the case \'chat\': throw block')
-                .toMatch(/case\s+['"]chat['"]\s*:[\s\S]*throw\s+new\s+Error/);
+        it('no source reads its settings, but the migration that deletes them from saved settings', () => {
+            const migration = 'src/app/settings-migration-semantic-world-info-settings.js';
+            // SillyTavern's Vector Storage names its own World Info switch enabled_world_info too, in its settings.
+            const vectorStorage = 'src/sillytavern/vector-storage.js';
+            const offenders = grepSourcesWithLines(
+                /\b(enabled_world_info|world_info_threshold|world_info_top_k|world_info_query_depth|world_info_retrieval_popup|world_info_respect_entry_disable|lorebook_xml_tag)\b/,
+            ).filter(hit => !hit.startsWith(`${migration}:`) && !hit.startsWith(`${vectorStorage}:`));
+            expect(existsRel(migration)).toBe(true);
+            expect(offenders, offenders.join('\n')).toEqual([]);
+            // The one read there is Vector Storage's own setting, never one of VectFox's.
+            expect(grepSourcesWithLines(/\benabled_world_info\b/).filter(hit => hit.startsWith(`${vectorStorage}:`)).every(hit => hit.includes('vectors?.enabled_world_info'))).toBe(true);
         });
 
-        it('CONTENT_TYPES.chat no longer declares chunkingStrategies', () => {
-            const src = readRel('src/features/chunkbase/content-types.js');
-            const chatIdx = src.indexOf('chat: {');
-            expect(chatIdx, 'CONTENT_TYPES.chat entry not found').toBeGreaterThan(-1);
-            const block = src.slice(chatIdx, chatIdx + 800);
-            expect(block, 'chat entry still declares chunkingStrategies')
-                .not.toMatch(/chunkingStrategies\s*:/);
+        it('no source sends the <VectFoxLorebook> block or offers its dry run', () => {
+            const offenders = grepSourcesWithLines(/VectFoxLorebook|LOREBOOK_PROMPT_TAG|clearLorebookPrompt|runLorebookWIDryRun|VectFox_WorldInfo/);
+            expect(offenders, offenders.join('\n')).toEqual([]);
         });
 
-        it('CONTENT_TYPES.chat no longer declares defaultStrategy', () => {
-            const src = readRel('src/features/chunkbase/content-types.js');
-            const chatIdx = src.indexOf('chat: {');
-            expect(chatIdx, 'CONTENT_TYPES.chat entry not found').toBeGreaterThan(-1);
-            const block = src.slice(chatIdx, chatIdx + 800);
-            expect(block, 'chat entry still declares defaultStrategy')
-                .not.toMatch(/defaultStrategy\s*:/);
+        it('Vectorize Content no longer vectorizes a lorebook', () => {
+            const offenders = grepSourcesWithLines(/prepareLorebookContent|extractLorebookKeywords|buildLorebookCollectionId|parseLorebookFile|lorebookStats/);
+            expect(offenders, offenders.join('\n')).toEqual([]);
+        });
+    });
+
+    describe('ChunkBase retired (B29)', () => {
+        it('features/chunkbase, its content pipeline, chunk retrieval and Auto-Reformat, is gone, and no source imports from it', () => {
+            expect(existsRel('src/features/chunkbase')).toBe(false);
+            const offenders = grepSourcesWithLines(/\bfrom\s+['"][^'"]*\/chunkbase\/|\bimport\(\s*['"][^'"]*\/chunkbase\//);
+            expect(offenders, offenders.join('\n')).toEqual([]);
         });
 
-        it('CONTENT_TYPES.chat keeps defaults as an EMPTY object (defensive shim) or omits it', () => {
-            // Two acceptable shapes:
-            //   (a) `defaults: {}` — defensive shim against TypeError from
-            //       readers like `type.defaults.chunkSize` at
-            //       content-vectorization.js:98 that don't use optional
-            //       chaining. The UI's `isChatType` toggle hides the
-            //       chunking section so those readers never fire for chat,
-            //       but the shim is cheap insurance.
-            //   (b) No `defaults` field at all — also acceptable if every
-            //       reader has been updated to use optional chaining.
-            //
-            // What we MUST NOT see: `defaults: { chunkSize: ..., batchSize: ... }`
-            // with legacy chunking config still wired up.
-            const src = readRel('src/features/chunkbase/content-types.js');
-            const chatIdx = src.indexOf('chat: {');
-            expect(chatIdx, 'CONTENT_TYPES.chat entry not found').toBeGreaterThan(-1);
-            const block = src.slice(chatIdx, chatIdx + 800);
-            expect(block, 'chat entry still declares chunkSize in defaults')
-                .not.toMatch(/defaults\s*:\s*\{[^}]*chunkSize/);
-            expect(block, 'chat entry still declares batchSize in defaults')
-                .not.toMatch(/defaults\s*:\s*\{[^}]*batchSize/);
+        it('no source module of Auto-Reformat, the glossary, chunking, content types or the content pipeline remains', () => {
+            const retiredModule = /^(reformat-[\w-]+|glossary-extractor|chunking|content-types|content-vectorization)\.js$/;
+            const remaining = [...walkSourceFiles()]
+                .map(file => path.relative(ROOT, file).replace(/\\/g, '/'))
+                .filter(file => retiredModule.test(path.posix.basename(file)));
+            expect(remaining).toEqual([]);
+            for (const file of ['src/features/settings-panel/chunkbase-page-markup.js', 'src/features/keyword-search/keyword-extraction.js', 'src/features/diagnostics/activation-tests.js']) {
+                expect(existsRel(file), file).toBe(false);
+            }
+        });
+
+        it('conditional-activation.js is gone, and no source gates a collection by triggers or conditions', () => {
+            expect(existsRel('src/features/collections/conditional-activation.js')).toBe(false);
+            const offenders = grepSourcesWithLines(
+                /conditional-activation|\b(checkTriggers|shouldCollectionActivate|filterActiveCollections|getCollectionTriggers|getCollectionActivationSummary|getCollectionConditions|setCollectionConditions)\b/,
+            );
+            expect(offenders, offenders.join('\n')).toEqual([]);
+        });
+
+        it('no source reads per-chunk metadata, but the migration that deletes it from saved settings', () => {
+            const migration = 'src/app/settings-migration-chunkbase-settings.js';
+            const offenders = grepSourcesWithLines(/vectfox_chunk_meta_|\b(?:get|save|delete)ChunkMetadata\b|\bgetAllChunkMetadata\b/)
+                .filter(hit => !hit.startsWith(`${migration}:`));
+            expect(existsRel(migration)).toBe(true);
+            expect(readRel(migration)).toContain("'vectfox_chunk_meta_'");
+            expect(offenders, offenders.join('\n')).toEqual([]);
+        });
+
+        it('the generation interceptor runs EventBase\'s reply step, and nothing of rearrangeChat is left but the window global', () => {
+            const replyStep = 'src/features/eventbase/eventbase-reply.js';
+            expect(existsRel(replyStep)).toBe(true);
+            expect(readRel(replyStep)).toMatch(/export\s+async\s+function\s+runEventBaseReplyStep\b/);
+            expect(readRel('src/index.js')).toMatch(/\brunEventBaseReplyStep\(chat, settings, type\)/);
+            // SillyTavern calls the interceptor by the global the manifest names.
+            expect(JSON.parse(readRel('manifest.json')).generate_interceptor).toBe('vectfox_rearrangeChat');
+            expect(readRel('src/index.js')).toMatch(/window\[['"]vectfox_rearrangeChat['"]\]\s*=/);
+            const offenders = grepSourcesWithLines(/\brearrangeChat\b/);
+            expect(offenders, offenders.join('\n')).toEqual([]);
         });
     });
 });

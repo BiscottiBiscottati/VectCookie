@@ -1,10 +1,11 @@
 // connection-profiles.js — SillyTavern's Connection Manager profiles, for a chat call or embedding that runs on one:
 // whether the Connection Manager is on, the profiles a Profile dropdown offers and when that list changes, a profile by
 // ID, whether SillyTavern can send a request on it and of which kind, the request itself through SillyTavern's
-// ConnectionManagerRequestService, and its reply as text; for embedding, the provider a profile's API is, the server URL
-// it names and the ID of its key. The only file that touches that service or a profile's key ID or URL (connection plan
-// §6, credential invariant 4). SillyTavern's server, or Similharity on it, resolves the key from the ID; no key value
-// ever reaches VectFox.
+// ConnectionManagerRequestService, and its reply as text; the source a profile's API is; for embedding, the server URL
+// it names and the ID of its key; for LoreBase's Fast and Cheap [Jev] choice, the fields of a decisions request to Jev
+// on an OpenRouter or Custom profile. The only file that touches that service or a profile's key ID or URL (connection
+// plan §6, credential invariant 4). SillyTavern's server, or Similharity on it, resolves the key from the ID; no key
+// value ever reaches VectFox.
 //
 // SillyTavern's context comes from its page global, read at each call, so importing this file loads nothing of
 // SillyTavern's and the chat-call modules that import it stay loadable on their own.
@@ -58,7 +59,7 @@ export function listConnectionProfileChoices() {
             id: String(profile.id),
             name: String(profile.name ?? ''),
             isSupported: isConnectionProfileSupported(profile),
-            embeddingProvider: connectionProfileEmbeddingProvider(profile),
+            embeddingProvider: connectionProfileSource(profile),
         }));
 }
 
@@ -111,13 +112,14 @@ export function connectionProfileApi(profile) {
 }
 
 /**
- * The embedding provider a profile's API is, as SillyTavern maps it: a Text Completion type such as `ollama`, or a
- * Chat Completion source such as `custom`. null for an API SillyTavern does not know.
+ * The source a profile's API is, as SillyTavern maps it: a Text Completion type such as `ollama`, or a Chat Completion
+ * source such as `custom`. Embedding reads it as its provider, and a chat call to know a Custom source. null for an API
+ * SillyTavern does not know.
  *
  * @param {object} profile
  * @returns {string|null}
  */
-export function connectionProfileEmbeddingProvider(profile) {
+export function connectionProfileSource(profile) {
     const api = getContext().CONNECT_API_MAP?.[profile?.api];
     return api?.type ?? api?.source ?? null;
 }
@@ -133,14 +135,37 @@ export function connectionProfileServerUrl(profile) {
 }
 
 /**
- * The key field of an embedding request on a llama.cpp, KoboldCPP or Custom profile: the ID of the key the profile
- * stores, which Similharity reads on SillyTavern's server. Empty with no stored key, and Similharity then sends none.
+ * The key field of a request Similharity sends on a profile (an embedding on a llama.cpp, KoboldCPP or Custom profile,
+ * or a decisions request to Jev): the ID of the key the profile stores, which Similharity reads on SillyTavern's
+ * server. Empty with no stored key, and Similharity then sends none.
  *
  * @param {object} profile
  * @returns {{secret_id?: string}}
  */
-export function connectionProfileEmbeddingKeyField(profile) {
+export function connectionProfileKeyIdField(profile) {
     return connectionProfileStoresKey(profile) ? { secret_id: String(profile['secret-id']) } : {};
+}
+
+// The profiles Jev runs on: SillyTavern's Chat Completion sources whose key Similharity sends only where SillyTavern
+// does, OpenRouter's to OpenRouter and Custom's to the profile's own URL.
+const DECISIONS_SOURCES = new Set(['openrouter', 'custom']);
+
+/**
+ * The fields of a decisions request to Jev on a profile, for LoreBase's Fast and Cheap [Jev] choice: its source, its
+ * URL for a Custom source, its model and the ID of its key. null on a profile of another API.
+ *
+ * @param {object} profile
+ * @returns {{source: string, model: string, apiUrl?: string, secret_id?: string}|null}
+ */
+export function connectionProfileDecisionsFields(profile) {
+    const source = connectionProfileSource(profile);
+    if (!DECISIONS_SOURCES.has(source)) return null;
+    return {
+        source,
+        model: String(profile?.model ?? '').trim(),
+        ...(source === 'custom' ? { apiUrl: connectionProfileServerUrl(profile) } : {}),
+        ...connectionProfileKeyIdField(profile),
+    };
 }
 
 /**

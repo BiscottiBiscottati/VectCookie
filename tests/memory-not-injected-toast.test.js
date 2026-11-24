@@ -22,9 +22,19 @@ vi.mock('../src/shared/collection-ids.js', () => ({
     getChatUUID: () => 'lost-memory-uuid', parseRegistryKey: (k) => ({ collectionId: k }),
     COLLECTION_PREFIXES: { VECTFOX_ARCHIVE_EVENT: 'vf_archiveevent_', VECTFOX_EVENTBASE: 'vf_eventbase_' },
     buildRegistryKey: (id) => `qdrant:${id}`, buildEventBaseCollectionId: () => 'vf_eventbase_lost', getRegistryBackend: () => 'qdrant',
-    buildChatSearchPatterns: () => [], matchesPatterns: () => false,
 }));
 vi.mock('../src/features/collections/collection-loader.js', () => ({ getCollectionRegistry: () => ['vf_eventbase_lost'], registerCollection: vi.fn(), getCollectionListing: vi.fn() }));
+// The chat's collection in use, from the one route (collectionInUse); nothing locked in beside it.
+vi.mock('../src/features/eventbase/eventbase-chat-collections.js', () => {
+    const collection = { registryKey: 'qdrant:vf_eventbase_lost', collectionId: 'vf_eventbase_lost', isPaused: false };
+    return {
+        collectionInUse: () => ({ collection, reason: null, collections: [collection], lockedElsewhere: [] }),
+        noCollectionInUseText: () => null,
+        resolveEventBaseRunTarget: () => collection,
+        sharedCollectionsLockedHere: () => ({ otherChats: [], archives: [] }),
+        useChatCollection: vi.fn(),
+    };
+});
 vi.mock('../src/features/collections/collection-metadata.js', () => ({
     isCollectionEnabled: () => true, isCollectionActiveForContextAnyKey: () => true,
     setCollectionLock: vi.fn(), setCollectionMeta: vi.fn(), getChatLockedCollections: () => [],
@@ -39,7 +49,7 @@ vi.mock('../src/features/eventbase/eventbase-schema.js', () => ({
 }));
 vi.mock('../src/features/eventbase/eventbase-extractor.js', () => ({ extractEvents: vi.fn() }));
 vi.mock('../src/features/eventbase/generation-rate-limiter.js', () => ({ generationRateLimiter: { execute: (run) => run() }, generationRateLimitSettings: () => ({}) }));
-vi.mock('../src/features/eventbase/eventbase-retrieval.js', () => ({ retrieveEvents: vi.fn() }));
+vi.mock('../src/features/eventbase/eventbase-retrieval.js', () => ({ retrieveEvents: vi.fn(), searchArchiveEvents: vi.fn(async () => []) }));
 vi.mock('../src/features/eventbase/agentic-retrieval.js', () => ({ retrieveEventsForTurn: vi.fn(async () => state.turn) }));
 vi.mock('../src/features/eventbase/eventbase-injection.js', () => ({
     formatEventsForInjectionDetailed: vi.fn(() => ({ text: '- the duel at the mill', includedCount: 1 })),

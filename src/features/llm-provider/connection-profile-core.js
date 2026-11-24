@@ -16,22 +16,23 @@ const textOf = value => String(value ?? '').trim();
 
 /**
  * The keys a profile request may override, by the kind of request (plan §2). Closed: SillyTavern spreads the override
- * last, so any other key could replace the profile's URL or API and send its key to another host. Text Completion gets
- * temperature and the two token-limit names SillyTavern's own main reply sends every Text Completion server, and
- * nothing else, as SillyTavern forwards its body to most servers as it is. The wrapper adds one more key, for a profile
- * that stores no key: the ID that matches none.
+ * last, so any other key could replace the profile's URL or API and send its key to another host. Chat Completion's
+ * custom_include_body holds the reasoning effort alone, for a Custom source: SillyTavern merges it into the body it
+ * sends upstream, never the URL or headers. Text Completion gets temperature and the two token-limit names SillyTavern's
+ * own main reply sends every Text Completion server, and nothing else, as SillyTavern forwards its body to most servers
+ * as it is. The wrapper adds one more key, for a profile that stores no key: the ID that matches none.
  */
 export const CONNECTION_PROFILE_OVERRIDE_KEYS = Object.freeze({
-    chat: Object.freeze(['temperature', 'max_completion_tokens', 'reasoning_effort', 'response_format']),
+    chat: Object.freeze(['temperature', 'max_completion_tokens', 'reasoning_effort', 'custom_include_body', 'response_format']),
     text: Object.freeze(['temperature', 'num_predict', 'n_predict']),
 });
 
 /**
- * The profile a chat consumer runs on, or '' when it runs on a manual provider. Agent Mode and Auto-Reformat take it
- * through resolveInheritedConnection, so on Same as EventBase model they use the EventBase model's profile.
+ * The profile a chat consumer runs on, or '' when it runs on a manual provider. Agent Mode takes it through
+ * resolveInheritedConnection, so on Same as EventBase model it uses the EventBase model's profile.
  *
  * @param {object} settings - VectFox settings
- * @param {'eventbase'|'agent'|'reformat'|'storyarc'} consumer
+ * @param {'eventbase'|'agent'|'storyarc'|'lorebase'} consumer
  * @returns {string}
  */
 export function resolveConnectionProfileId(settings, consumer) {
@@ -41,12 +42,12 @@ export function resolveConnectionProfileId(settings, consumer) {
         case 'storyarc':
             return textOf(settings?.story_arc_link_provider) === CONNECTION_PROFILE_PROVIDER
                 ? textOf(settings?.story_arc_link_connection_profile_id) : '';
-        case 'agent':
-        case 'reformat': {
-            const prefix = consumer === 'agent' ? 'agent' : 'reformat';
+        case 'lorebase':
+            return textOf(settings?.lorebase_provider) === CONNECTION_PROFILE_PROVIDER ? textOf(settings?.lorebase_connection_profile_id) : '';
+        case 'agent': {
             const connection = resolveInheritedConnection({
-                provider: settings?.[`${prefix}_provider`],
-                connectionProfileId: settings?.[`${prefix}_connection_profile_id`],
+                provider: settings?.agent_provider,
+                connectionProfileId: settings?.agent_connection_profile_id,
             }, settings);
             return connection.provider === CONNECTION_PROFILE_PROVIDER ? connection.connectionProfileId : '';
         }
@@ -58,7 +59,10 @@ export function resolveConnectionProfileId(settings, consumer) {
 /**
  * The request's max-token argument and override keys, from the same switches the manual path reads
  * (resolveModelParameterStyle). Chat Completion: temperature when it is sent, max_completion_tokens in place of the
- * max-token argument when chosen, reasoning_effort and response_format when given. Text Completion: temperature when
+ * max-token argument when chosen, reasoning_effort and response_format when given. On a Custom source the reasoning
+ * effort goes again as custom_include_body, as on the manual Custom route: SillyTavern forwards the top-level field
+ * there only for the models on its own list, so a gateway ID such as `openai/gpt-6-luna` would keep thinking with the
+ * switch off, and it merges custom_include_body into the upstream body for any model. Text Completion: temperature when
  * it is sent, and the max tokens again as num_predict and n_predict, as SillyTavern's own main reply sends them:
  * SillyTavern's request service sends the max-token argument only as max_tokens, its server passes Ollama only
  * Ollama's own option names, so Ollama reads num_predict, and llama.cpp's /completion documents only n_predict.
@@ -66,6 +70,7 @@ export function resolveConnectionProfileId(settings, consumer) {
  *
  * @param {object} request
  * @param {'chat'|'text'} request.api - From the wrapper's connectionProfileApi
+ * @param {string|null} [request.source] - From the wrapper's connectionProfileSource: `custom` for a Custom source
  * @param {number} request.maxTokens
  * @param {number} request.temperature
  * @param {boolean} request.sendTemperature
@@ -74,13 +79,14 @@ export function resolveConnectionProfileId(settings, consumer) {
  * @param {object|null} request.responseFormat
  * @returns {{maxTokens: number|undefined, overridePayload: object}}
  */
-export function connectionProfileRequestShape({ api, maxTokens, temperature, sendTemperature, tokenLimitParameter, reasoningEffort, responseFormat }) {
+export function connectionProfileRequestShape({ api, source = null, maxTokens, temperature, sendTemperature, tokenLimitParameter, reasoningEffort, responseFormat }) {
     const isCompletionTokenLimit = api === 'chat' && tokenLimitParameter === 'max_completion_tokens';
     const wanted = {
         ...(sendTemperature ? { temperature } : {}),
         ...(isCompletionTokenLimit ? { max_completion_tokens: maxTokens } : {}),
         ...(api === 'text' ? { num_predict: maxTokens, n_predict: maxTokens } : {}),
         ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+        ...(reasoningEffort && source === 'custom' ? { custom_include_body: JSON.stringify({ reasoning_effort: reasoningEffort }) } : {}),
         ...(responseFormat ? { response_format: responseFormat } : {}),
     };
     const allowed = CONNECTION_PROFILE_OVERRIDE_KEYS[api] ?? [];
@@ -121,6 +127,19 @@ export function connectionProfileProblem({ feature, page, profileId, isManagerAv
 const NOT_AN_API_REPLY = /is not valid JSON|in JSON at position|Unexpected end of JSON input|invalid json response body/i;
 
 /**
+ * Whether an upstream status names the provider's own failure rather than a fault in the request, on either route
+ * (the manual path reads it from the reply's body, a profile from what SillyTavern threw). Nothing the user changes
+ * fixes it, and a later send usually gets through, so it stays in the console. 'Too Many Requests' is one too: a
+ * quota error only the manual path can tell apart, by SillyTavern's quota_error flag, which a profile request loses.
+ *
+ * @param {string} detail - The upstream status text
+ * @returns {boolean}
+ */
+export function isProviderServerFailure(detail) {
+    return /^(internal server error|bad gateway|service unavailable|gateway time-?out|too many requests|provider returned error)/i.test(detail);
+}
+
+/**
  * What a failed profile request means (plan §4), first match wins:
  *   1. Not SillyTavern's 'API request failed' (Connection Manager off, profile gone, unknown API): model_config.
  *   2. A timeout or abort: rethrow its cause, as the manual path does.
@@ -131,12 +150,15 @@ const NOT_AN_API_REPLY = /is not valid JSON|in JSON at position|Unexpected end o
  *      the URL.
  *   6. A model or configuration error: model_config.
  *   7. A connection failure: connection.
- *   8. Anything else, a moderation block on one window included: upstream_error.
+ *   8. The provider's own server error (isProviderServerFailure): upstream_error with isServerFailure, which the
+ *      caller keeps to the console, as the manual path does.
+ *   9. Anything else, a moderation block on one window included: upstream_error, a rejection.
  * model_config is the kind that raises the sticky toast and pauses auto-sync; an auth kind would fail in silence.
  *
  * @param {Error} error - What sendRequest threw
  * @param {{feature: string, profileName: string, model: string, storesKey: boolean}} context
- * @returns {{kind: 'model_config'|'connection'|'upstream_error', message: string, detail: string}|{kind: 'rethrow', cause: Error}}
+ * @returns {{kind: 'model_config'|'connection', message: string, detail: string}
+ *   |{kind: 'upstream_error', isServerFailure: boolean, message: string, detail: string}|{kind: 'rethrow', cause: Error}}
  */
 export function classifyConnectionProfileFailure(error, { feature, profileName, model, storesKey }) {
     const cause = error?.cause;
@@ -173,5 +195,13 @@ export function classifyConnectionProfileFailure(error, { feature, profileName, 
     if (isConnectionError(detail)) {
         return { kind: 'connection', detail, message: `${feature}: couldn't reach the server of profile "${profileName}" — ${detail}` };
     }
-    return { kind: 'upstream_error', detail, message: `${feature}: profile "${profileName}" rejected the request — ${detail}` };
+    if (isProviderServerFailure(detail)) {
+        return {
+            kind: 'upstream_error',
+            isServerFailure: true,
+            detail,
+            message: `${feature}: the provider of profile "${profileName}" had a server error on model "${model}" — ${detail}`,
+        };
+    }
+    return { kind: 'upstream_error', isServerFailure: false, detail, message: `${feature}: profile "${profileName}" rejected the request — ${detail}` };
 }

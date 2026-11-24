@@ -3,10 +3,10 @@
  * EVENTBASE SEARCH
  * ============================================================================
  * How every EventBase search queries an event collection: with EventBase's own
- * keyword scoring and similarity threshold, never ChunkBase's. Standard applies
- * the threshold inside its query. Qdrant's query keeps every score, so the events
- * it returns below the threshold are dropped here, by the same similarity the
- * re-rank's cosine weight reads.
+ * keyword scoring and similarity threshold. Standard applies the threshold inside
+ * its query. Qdrant's query keeps every score, so the events it returns below the
+ * threshold are dropped here, by the same similarity the re-rank's cosine weight
+ * reads.
  * ============================================================================
  */
 
@@ -16,10 +16,10 @@ import { log } from '../../sillytavern/log.js';
 
 /**
  * The settings an EventBase search runs with: EventBase's keyword scoring and
- * similarity threshold in place of ChunkBase's.
+ * similarity threshold.
  *
  * @param {object} settings - VectFox settings
- * @param {number} [threshold] - The similarity threshold, the EventBase page's when absent
+ * @param {number} [threshold] - The similarity threshold, the ChatHistory page's when absent
  * @returns {object}
  */
 export function eventSearchSettings(settings, threshold = settings.eventbase_score_threshold ?? 0) {
@@ -56,7 +56,7 @@ function shouldApplyThresholdAfterSearch(collectionId, settings) {
  * @param {object} settings - VectFox settings
  * @param {object} [options]
  * @param {number[]|null} [options.queryVector] - The query's embedding, when the caller has it
- * @param {number} [options.threshold] - The similarity threshold, the EventBase page's when absent
+ * @param {number} [options.threshold] - The similarity threshold, the ChatHistory page's when absent
  * @returns {Promise<{hashes: number[], metadata: object[]}>}
  */
 export async function searchEventCollection(collectionId, queryText, topK, settings, { queryVector = null, threshold } = {}) {

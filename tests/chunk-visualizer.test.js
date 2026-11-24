@@ -2,16 +2,19 @@
  * @vitest-environment jsdom
  *
  * The Chunk Visualizer's wiring (src/features/database-browser/chunk-visualizer.js), driven as a user would while it is
- * open: it loads and lists a collection's chunks; one Save writes a chunk's fields, or, for a changed text, embeds the
- * new text before the old chunk goes and points its summaries at it; a failed embedding loses nothing; leaving or
- * closing with unsaved edits asks; the bulk bar acts only on ticked chunks the list shows.
+ * open: it loads and lists a collection's chunks; one Save writes a changed name, or, for a changed text, embeds the
+ * new text before the old chunk goes, an event of a chat or of a chat file keeping its own ID; a failed embedding loses
+ * nothing; a collection made with another CJK tokenizer locks the text; leaving or closing with unsaved edits asks; the
+ * bulk bar deletes only ticked chunks the list shows; a lorebook's LoreBase parts open read only, in their entries'
+ * order, from the collection that holds them, and Edit entry, where the browser gives an entry editor, waits for it and
+ * reads the list again after a save, the same part open.
  */
 /* global document, toastr -- this file runs under the jsdom environment; toastr is stubbed per test */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import $ from 'jquery';
 
-const host = vi.hoisted(() => ({ answer: true, canClose: null, stored: {}, calls: [], items: [] }));
+const host = vi.hoisted(() => ({ answer: true, canClose: null, calls: [], items: [] }));
 
 const backend = vi.hoisted(() => ({
     insertVectorItems: vi.fn(),
@@ -24,11 +27,6 @@ vi.mock('../src/features/vector-backend/index.js', async () => ({
     textWithoutKeywordSuffix: (await import('../src/features/vector-backend/stored-chunk.js')).textWithoutKeywordSuffix,
     describeEmbeddingFailure: (await import('../src/features/vector-backend/embedding-failure.js')).describeEmbeddingFailure,
     qdrantTarget: (await import('../src/features/vector-backend/qdrant-target.js')).qdrantTarget,
-}));
-vi.mock('../src/features/collections/index.js', () => ({
-    getChunkMetadata: hash => host.stored[String(hash)] ?? null,
-    saveChunkMetadata: (hash, metadata) => { host.stored[String(hash)] = { ...metadata }; },
-    deleteChunkMetadata: (hash) => { delete host.stored[String(hash)]; },
 }));
 vi.mock('../src/features/eventbase/index.js', () => ({
     packTimelineSortKey: (message, order) => message * 1000 + order,
@@ -60,6 +58,7 @@ const SETTINGS = { vector_backend: 'standard' };
 const $id = id => document.getElementById(id);
 const actionButton = (name, scope = document) => scope.querySelector(`[data-chunk-action="${name}"]`);
 const rowKeys = () => [...document.querySelectorAll('[data-chunk-entry]')].map(entry => entry.dataset.chunkEntry);
+const saveState = () => document.querySelector('[data-chunk-save-state]').textContent;
 const type = (element, value) => {
     element.value = value;
     element.dispatchEvent(new Event('input', { bubbles: true }));
@@ -88,12 +87,11 @@ beforeEach(() => {
     vi.stubGlobal('$', $);
     vi.stubGlobal('toastr', { error: vi.fn() });
     host.answer = true;
-    host.stored = { 1001: { summaries: ['High water'] } };
     host.calls = [];
     host.items = [
         { hash: 1000, index: 0, text: 'The gate stood open.', metadata: { keywords: [{ text: 'gate', weight: 1.5 }] } },
         { hash: 1001, index: 1, text: 'The tide came in.', metadata: { name: 'Tide' } },
-        { hash: 1002, index: 2, text: 'Gulls over the harbor.', metadata: { enabled: false } },
+        { hash: 1002, index: 2, text: 'Gulls over the harbor.', metadata: {} },
     ];
     for (const [name, mock] of Object.entries(backend)) {
         mock.mockReset();
@@ -114,34 +112,28 @@ describe('loading', () => {
 });
 
 describe('saving a chunk', () => {
-    it('writes only the fields that changed, without embedding again', async () => {
+    it('writes a changed name alone, without embedding again', async () => {
         await openHarbor();
         await openChunk('1');
         expect(actionButton('save').disabled).toBe(true);
         type($id('vectfox_chunk_name'), 'High tide');
-        change($id('vectfox_chunk_position'), '1');
-        type($id('vectfox_chunk_depth'), '0');
         expect(actionButton('save').disabled).toBe(false);
         actionButton('save').click();
         await vi.waitFor(() => expect(backend.updateChunkMetadata).toHaveBeenCalledTimes(1));
-        expect(backend.updateChunkMetadata.mock.calls[0].slice(1, 3)).toEqual([1001, { name: 'High tide', position: 1, depth: 0 }]);
+        expect(backend.updateChunkMetadata.mock.calls[0].slice(1, 3)).toEqual([1001, { name: 'High tide' }]);
         expect(backend.insertVectorItems).not.toHaveBeenCalled();
-        await vi.waitFor(() => expect(document.querySelector('[data-chunk-save-state]').textContent).toBe('No changes.'));
+        await vi.waitFor(() => expect(saveState()).toBe('No changes.'));
     });
 
-    it('embeds a changed text before the old chunk goes, and points its summaries at the new one', async () => {
+    it('embeds a changed text before the old chunk goes, and nothing else', async () => {
         await openHarbor();
         await openChunk('1');
         type($id('vectfox_chunk_text'), 'The tide went out.');
         actionButton('save').click();
-        const newHash = getStringHash('The tide went out.');
-        await vi.waitFor(() => expect(host.calls.length).toBe(4));
-        expect(host.calls.map(([name]) => name)).toEqual(['insertVectorItems', 'deleteVectorItems', 'deleteVectorItems', 'insertVectorItems']);
-        expect(host.calls[0][1][0]).toMatchObject({ hash: newHash, text: 'The tide went out.', index: 1, metadata: { name: 'Tide' } });
+        await vi.waitFor(() => expect(saveState()).toBe('No changes.'));
+        expect(host.calls.map(([name]) => name)).toEqual(['insertVectorItems', 'deleteVectorItems']);
+        expect(host.calls[0][1]).toEqual([{ hash: getStringHash('The tide went out.'), text: 'The tide went out.', index: 1, metadata: { name: 'Tide' } }]);
         expect(host.calls[1][1]).toEqual([1001]);
-        expect(host.calls[2][1]).toEqual([getStringHash('High water')]);
-        expect(host.calls[3][1][0]).toMatchObject({ text: 'High water', metadata: { isSummary: true, parentHash: newHash } });
-        expect(host.stored).toEqual({ [newHash]: { summaries: ['High water'] } });
     });
 
     it('shows a Qdrant chunk\'s text without the keyword suffix, and stores the edit with its keywords and importance', async () => {
@@ -186,56 +178,29 @@ describe('saving a chunk', () => {
         await vi.waitFor(() => expect(toastr.error).toHaveBeenCalledTimes(1));
         expect(backend.deleteVectorItems).not.toHaveBeenCalled();
         expect($id('vectfox_chunk_text').value).toBe('The tide went out.');
-        expect(document.querySelector('[data-chunk-save-state]').textContent).toBe('Unsaved changes.');
-        expect(host.stored[1001]).toEqual({ summaries: ['High water'] });
-    });
-
-    it('stores a Qdrant chunk again under its hash when its keywords change, and a new summary beside it', async () => {
-        await openHarbor();
-        await openChunk('1');
-        type($id('vectfox_chunk_keyword_new'), 'tide');
-        actionButton('add-keyword').click();
-        type($id('vectfox_chunk_summary_new'), 'Water rising');
-        actionButton('add-summary').click();
-        actionButton('save').click();
-        await vi.waitFor(() => expect(backend.insertVectorItems).toHaveBeenCalledTimes(2));
-        expect(backend.insertVectorItems.mock.calls[0][1]).toEqual([{ hash: 1001, text: 'The tide came in.', index: 1, metadata: { name: 'Tide', keywords: [{ text: 'tide' }] } }]);
-        expect(backend.insertVectorItems.mock.calls[1][1][0]).toMatchObject({ text: 'Water rising', metadata: { parentHash: 1001 } });
-        expect(backend.updateChunkMetadata).not.toHaveBeenCalled();
-        expect(backend.deleteVectorItems).not.toHaveBeenCalled();
-        expect(host.stored[1001].summaries).toEqual(['High water', 'Water rising']);
-    });
-
-    it('writes a keyword change on Standard storage into the payload alone', async () => {
-        await openHarbor(SETTINGS, { ...COLLECTION, backend: 'vectra' });
-        await openChunk('1');
-        type($id('vectfox_chunk_keyword_new'), 'tide');
-        actionButton('add-keyword').click();
-        actionButton('save').click();
-        await vi.waitFor(() => expect(backend.updateChunkMetadata).toHaveBeenCalledTimes(1));
-        expect(backend.updateChunkMetadata.mock.calls[0][2]).toEqual({ keywords: [{ text: 'tide' }] });
-        expect(backend.insertVectorItems).not.toHaveBeenCalled();
+        expect(saveState()).toBe('Unsaved changes.');
     });
 });
 
-describe('editing an EventBase event', () => {
+describe('editing an event', () => {
     const EVENTS = { id: 'vf_eventbase_qdrant_harbor', name: 'Harbor chat', type: 'chat', backend: 'qdrant', chunkCount: 1 };
+    const ARCHIVED_EVENTS = { id: 'vf_archiveevent_qdrant_harbor', name: 'Harbor chat file', type: 'chat', backend: 'qdrant', chunkCount: 1 };
     const pointHashOf = id => 7_000_000 + [...String(id)].reduce((hash, character) => (hash * 31 + character.charCodeAt(0)) % 1000003, 3);
     const eventItem = hash => ({ hash, index: 4, text: 'Orrin hid the key. [KEYWORDS: orrin key]', metadata: { event_id: 'evt-harbor-1', keywords: ['orrin', 'key'], importance: 6 } });
 
-    it('stores the new text under the event\'s own ID, replacing it in place', async () => {
+    it.each([['a chat', EVENTS], ['a chat file', ARCHIVED_EVENTS]])('stores the new text of %s\'s event under the event\'s own ID, replacing it in place', async (_source, collection) => {
         host.items = [eventItem(pointHashOf('evt-harbor-1'))];
-        await openHarbor(SETTINGS, EVENTS);
+        await openHarbor(SETTINGS, collection);
         await openChunk('0');
         expect($id('vectfox_chunk_text').value).toBe('Orrin hid the key.');
         // The form drew to its end: its last step counts the text.
         expect(document.querySelector('[data-chunk-text-count]').textContent).toBe('18 characters.');
         type($id('vectfox_chunk_text'), 'Orrin hid the brass key.');
         actionButton('save').click();
-        await vi.waitFor(() => expect(backend.insertVectorItems).toHaveBeenCalledTimes(1));
+        await vi.waitFor(() => expect(saveState()).toBe('No changes.'));
+        expect(backend.insertVectorItems).toHaveBeenCalledTimes(1);
         const [stored] = backend.insertVectorItems.mock.calls[0][1];
         expect(stored).toMatchObject({ hash: pointHashOf('evt-harbor-1'), text: 'Orrin hid the brass key.', metadata: { event_id: 'evt-harbor-1', keywords: ['orrin', 'key'], importance: 6 } });
-        await new Promise(resolve => setTimeout(resolve, 50));
         expect(backend.deleteVectorItems).not.toHaveBeenCalled();
     });
 
@@ -252,14 +217,14 @@ describe('editing an EventBase event', () => {
 });
 
 describe('a collection made with another CJK tokenizer than VectFox is set to', () => {
-    // Similharity refuses any new vector in such a collection, so a changed text or a new summary cannot be saved.
+    // Similharity refuses any new vector in such a collection, so a changed text cannot be saved.
     const QDRANT_SETTINGS = { vector_backend: 'qdrant', cjk_tokenizer_mode: 'jieba_tw' };
     const isRecordRequest = url => String(url).endsWith('/chunks/collection-metadata');
     const answer = body => ({ ok: true, json: async () => body });
     const chunksAnswer = () => answer({ items: host.items, total: 3 });
     const tokenizerNotice = () => document.querySelector('[data-chunk-tokenizer-notice]');
 
-    it('says so on the open chunk, locks its text and new summaries, and still saves its other fields', async () => {
+    it('says so on the open chunk, locks its text, and still saves its name', async () => {
         fetch.mockImplementation(async url => (isRecordRequest(url) ? answer({ payload: { cjk_tokenizer_mode: 'intl' } }) : chunksAnswer()));
         await openHarbor(QDRANT_SETTINGS);
         await openChunk('1');
@@ -267,10 +232,6 @@ describe('a collection made with another CJK tokenizer than VectFox is set to', 
         expect(tokenizerNotice().textContent).toContain('Intl.Segmenter (English / Latin)');
         expect(tokenizerNotice().textContent).toContain('Traditional Chinese (Jieba WASM)');
         expect($id('vectfox_chunk_text').readOnly).toBe(true);
-        expect($id('vectfox_chunk_summary_new').disabled).toBe(true);
-        expect(actionButton('add-summary').disabled).toBe(true);
-        expect($id('vectfox_chunk_keyword_new').disabled).toBe(true);
-        expect(actionButton('add-keyword').disabled).toBe(true);
         expect(document.querySelector('#vectfox_chunk_record').textContent).toContain('Intl.Segmenter (English / Latin)');
 
         type($id('vectfox_chunk_name'), 'High tide');
@@ -292,7 +253,7 @@ describe('a collection made with another CJK tokenizer than VectFox is set to', 
 
         sendRecord();
         await vi.waitFor(() => expect(actionButton('save').disabled).toBe(true));
-        expect(document.querySelector('[data-chunk-save-state]').textContent).toBe('A changed text, a keyword change or a new summary can\'t be saved here: see above.');
+        expect(saveState()).toBe('A changed text can\'t be saved here: see above.');
         expect(backend.insertVectorItems).not.toHaveBeenCalled();
     });
 
@@ -303,7 +264,6 @@ describe('a collection made with another CJK tokenizer than VectFox is set to', 
         await vi.waitFor(() => expect(document.querySelector('#vectfox_chunk_record').hidden).toBe(false));
         expect(tokenizerNotice().hidden).toBe(true);
         expect($id('vectfox_chunk_text').readOnly).toBe(false);
-        expect($id('vectfox_chunk_summary_new').disabled).toBe(false);
     });
 });
 
@@ -334,23 +294,17 @@ describe('unsaved edits', () => {
 describe('the bulk bar', () => {
     it('ticks only the chunks the filter shows, and a filter that hides a ticked chunk unticks it', async () => {
         await openHarbor();
-        change($id('vectfox_chunk_filter'), 'enabled');
+        change($id('vectfox_chunk_filter'), 'keywords');
         change($id('vectfox_chunk_select_all'), true);
-        expect(document.querySelector('[data-chunk-bulk-count]').textContent).toBe('2 selected');
+        expect(document.querySelector('[data-chunk-bulk-count]').textContent).toBe('1 selected');
+        change($id('vectfox_chunk_filter'), 'all');
+        change($id('vectfox_chunk_select_all'), true);
+        expect(document.querySelector('[data-chunk-bulk-count]').textContent).toBe('3 selected');
         change($id('vectfox_chunk_filter'), 'keywords');
         expect(document.querySelector('[data-chunk-bulk-count]').textContent).toBe('1 selected');
     });
 
-    it('disables only the ticked chunks that are enabled, at once', async () => {
-        await openHarbor();
-        change(document.querySelector('[data-chunk-tick="1"]'), true);
-        change(document.querySelector('[data-chunk-tick="2"]'), true);
-        actionButton('bulk-disable').click();
-        await vi.waitFor(() => expect(document.querySelectorAll('[data-chunk-entry] .vfx-pill.is-warning').length).toBe(2));
-        expect(backend.updateChunkMetadata.mock.calls.map(call => call.slice(1, 3))).toEqual([[1001, { enabled: false }]]);
-    });
-
-    it('deletes the ticked chunks and their summaries after one question', async () => {
+    it('deletes the ticked chunks after one question', async () => {
         await openHarbor();
         await openChunk('1');
         change(document.querySelector('[data-chunk-tick="1"]'), true);
@@ -359,8 +313,8 @@ describe('the bulk bar', () => {
         await vi.waitFor(() => expect(rowKeys()).toEqual(['0']));
         expect(confirmPopup).toHaveBeenCalledTimes(1);
         expect(confirmPopup.mock.calls[0][1]).toMatchObject({ okButton: 'Delete', isDestructive: true });
-        expect(backend.deleteVectorItems.mock.calls[0][1]).toEqual([1001, getStringHash('High water'), 1002]);
-        expect(host.stored).toEqual({});
+        expect(backend.deleteVectorItems).toHaveBeenCalledTimes(1);
+        expect(backend.deleteVectorItems.mock.calls[0][1]).toEqual([1001, 1002]);
         expect(document.querySelector('#vectfox_chunk_pane .vfx-empty')).not.toBeNull();
         expect(document.querySelector('[data-chunk-count]').textContent).toBe('1 of 3 chunks loaded');
     });
@@ -373,5 +327,96 @@ describe('the bulk bar', () => {
         await vi.waitFor(() => expect(confirmPopup).toHaveBeenCalledTimes(1));
         expect(backend.deleteVectorItems).not.toHaveBeenCalled();
         expect(rowKeys()).toEqual(['0', '1', '2']);
+    });
+});
+
+describe("a lorebook's LoreBase parts", () => {
+    const TENANT = 'vf_lorebase_qdrant_rook_harbor_atlas_19qag9zxydm';
+    const PARTS = { id: TENANT, name: 'Harbor Atlas', type: 'lorebook', backend: 'qdrant', source: 'openrouter', model: 'baai/bge-m3', chunkCount: 3 };
+    // The settings tenantChunkSource gives for a tenant of the account's own LoreBase collection.
+    const IN_ACCOUNT_COLLECTION = { vector_backend: 'qdrant', qdrant_multitenancy: true, qdrant_shared_collection: 'vf_lorebase_rook' };
+
+    beforeEach(() => {
+        host.items = [
+            { hash: 501, text: 'Lighthouse\nIts keeper.', metadata: { lorebookName: 'Harbor Atlas', entryUid: '12', partNumber: 2 } },
+            { hash: 502, text: 'Gate\nThe harbor gate.', metadata: { lorebookName: 'Harbor Atlas', entryUid: '3', partNumber: 1 } },
+            { hash: 503, text: 'Lighthouse\nIts history.', metadata: { lorebookName: 'Harbor Atlas', entryUid: '12', partNumber: 1 } },
+        ];
+    });
+
+    async function openParts(editEntry = null) {
+        void openChunkVisualizer(PARTS, IN_ACCOUNT_COLLECTION, { isLoreBaseParts: true, editEntry });
+        change($id('vectfox_chunk_sort'), 'index');
+        await vi.waitFor(() => expect(rowKeys().length).toBe(host.items.length));
+    }
+
+    it("reads the tenant's parts in the collection holding them, and lists them by entry and part under each entry's title", async () => {
+        await openParts();
+        expect(JSON.parse(fetch.mock.calls[0][1].body)).toMatchObject({ backend: 'qdrant', collectionId: 'vf_lorebase_rook', filters: { content_type: TENANT } });
+        // Only the parts are read, not the Qdrant collection's own record, which every lorebook there shares.
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(rowKeys()).toEqual(['1', '2', '0']);
+        expect([...document.querySelectorAll('[data-chunk-entry] .vfx-row-name')].map(name => name.textContent)).toEqual(['Gate', 'Lighthouse', 'Lighthouse']);
+        expect([...document.querySelectorAll('[data-chunk-entry] .vfx-row-sub')].map(line => line.textContent))
+            .toEqual(['Entry: 3, part 1', 'Entry: 12, part 1', 'Entry: 12, part 2']);
+        expect(document.querySelector('[data-chunk-tick]')).toBeNull();
+    });
+
+    it('opens a part read only: its text takes no typing, nothing saves or deletes it, and another opens without a question', async () => {
+        await openParts();
+        await openChunk('0');
+        expect($id('vectfox_chunk_text').readOnly).toBe(true);
+        expect(document.querySelector('[data-chunk-text-count]').textContent).toBe('22 characters.');
+        expect(document.querySelector('[data-chunk-action="save"], [data-chunk-action="delete"], [data-chunk-action="bulk-delete"]')).toBeNull();
+        // No entry editor was given, as for a leftover's parts.
+        expect(actionButton('edit-entry')).toBeNull();
+        await openChunk('2');
+        expect(confirmPopup).not.toHaveBeenCalled();
+        expect(Object.values(backend).every(mock => mock.mock.calls.length === 0)).toBe(true);
+    });
+
+    it('opens the entry editor on the open part, waiting meanwhile, and after a save reads the list again with the same part open', async () => {
+        let finishEdit;
+        const editEntry = vi.fn(() => new Promise(resolve => { finishEdit = resolve; }));
+        await openParts(editEntry);
+        await openChunk('0');
+        actionButton('edit-entry').click();
+        expect(editEntry).toHaveBeenCalledTimes(1);
+        expect(editEntry.mock.calls[0][0]).toMatchObject({ hash: 501, metadata: { entryUid: '12', partNumber: 2 } });
+        expect(actionButton('edit-entry').disabled).toBe(true);
+
+        // The edit changed the part's text, so LoreBase wrote it again under a new ID.
+        host.items = [{ hash: 601, text: 'Lighthouse\nIts keeper, now retired.', metadata: { lorebookName: 'Harbor Atlas', entryUid: '12', partNumber: 2 } }, ...host.items.slice(1)];
+        finishEdit(true);
+        await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+        await vi.waitFor(() => expect($id('vectfox_chunk_text').value).toBe('Lighthouse\nIts keeper, now retired.'));
+        expect(document.querySelector('[data-chunk-entry].is-open').dataset.chunkEntry).toBe('0');
+        expect(actionButton('edit-entry').disabled).toBe(false);
+    });
+
+    it('reads nothing again when the editor saves nothing', async () => {
+        const editEntry = vi.fn(async () => false);
+        await openParts(editEntry);
+        await openChunk('2');
+        actionButton('edit-entry').click();
+        await vi.waitFor(() => expect(actionButton('edit-entry').disabled).toBe(false));
+        expect(editEntry).toHaveBeenCalledTimes(1);
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(document.querySelector('[data-chunk-entry].is-open').dataset.chunkEntry).toBe('2');
+    });
+
+    it("keeps a collection's order for the next one when the parts do not offer it, and the parts list in entry order", async () => {
+        await openHarbor();
+        change($id('vectfox_chunk_sort'), 'keywords');
+        document.body.innerHTML = '';
+        void openChunkVisualizer(PARTS, IN_ACCOUNT_COLLECTION, { isLoreBaseParts: true });
+        await vi.waitFor(() => expect(rowKeys().length).toBe(host.items.length));
+        expect($id('vectfox_chunk_sort').value).toBe('index');
+        expect(rowKeys()).toEqual(['1', '2', '0']);
+
+        document.body.innerHTML = '';
+        void openChunkVisualizer(COLLECTION, SETTINGS);
+        await vi.waitFor(() => expect(rowKeys().length).toBe(host.items.length));
+        expect($id('vectfox_chunk_sort').value).toBe('keywords');
     });
 });

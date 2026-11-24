@@ -16,9 +16,6 @@
 /** Extension prompt tag for SillyTavern's prompt system */
 export const EXTENSION_PROMPT_TAG = '3_vectfox';
 
-/** Extension prompt tag for lorebook semantic WI injection */
-export const LOREBOOK_PROMPT_TAG = '3_vectfox_lorebook';
-
 /** Extension prompt tag for EventBase semantic-retrieval injection */
 export const EVENTBASE_PROMPT_TAG = `${EXTENSION_PROMPT_TAG}_eventbase`;
 
@@ -29,9 +26,6 @@ export const SUMMARIZER_PROMPT_TAG = `${EXTENSION_PROMPT_TAG}_summarizer`;
 // PERFORMANCE & RATE LIMITING
 // =============================================================================
 
-/** LRU cache size for hash computations */
-export const HASH_CACHE_SIZE = 10000;
-
 /** Maximum items to fetch when listing vectors (for hash comparison) */
 export const VECTOR_LIST_LIMIT = 10000;
 
@@ -41,12 +35,13 @@ export const VECTOR_LIST_LIMIT = 10000;
  * effective value. Always read the effective budget through
  * resolveRetrievalTimeoutMs() in src/shared/retrieval-budget.js.
  *
- * Bounds every retrieval during generation -- chunks, the summarizer and
- * Lorebook WI; EventBase adds its Agent Mode budget on top -- so a hung
+ * Bounds every retrieval during generation -- EventBase's and the summarizer's;
+ * EventBase adds its Agent Mode budget on top -- so a hung
  * embedding/query cannot freeze the whole conversation. On timeout the turn
  * proceeds WITHOUT that memory: runBoundedRetrieval() (src/features/vector-backend/bounded-retrieval.js)
- * races the retrieval softly, and the orphaned fetch is reaped later by ST's
- * server-side timeout (read fetches carry no client AbortSignal). Matches the
+ * races the retrieval softly, the retrieval publishes nothing when it settles
+ * later, and the orphaned fetch is reaped by ST's server-side timeout (read
+ * fetches carry no client AbortSignal). Matches the
  * write-side hedge threshold (vector_hedge_after_ms = 15000) for one consistent
  * "too slow" number. Unlike the write path, a stalled read is neither hedged
  * nor retried -- it fails soft (one turn without memory, self-corrects next
@@ -92,31 +87,13 @@ export const AGENTIC_MAX_TOKENS_DEFAULT = 2000;
 export const AGENTIC_MAX_TOKENS_MIN = 256;
 export const AGENTIC_MAX_TOKENS_MAX = 32000;
 
-/**
- * Default ChunkBase similarity threshold, `score_threshold` (ChunkBase page, Retrieval): chunks scoring below it are
- * dropped. Shared by the settings defaults in index.js, the slider's binding in
- * src/features/settings-panel/settings-panel.js and Diagnostics' "ChunkBase Similarity Threshold" check, which names
- * it. EventBase keeps its own, `eventbase_score_threshold`.
- */
-export const CHUNKBASE_SIMILARITY_THRESHOLD_DEFAULT = 0.25;
-
-/**
- * Most messages one ghosting batch may span (`eventbase_ghost_step`). Ghosting snaps
- * its wipe boundary DOWN to a multiple of the batch size, so this is also the slider's
- * ceiling: a hand-edited settings.json can never put the boundary on a grid the slider
- * cannot show. Shared by the clamp in summarizer-injection.js and the slider on the
- * AutoSync page's Ghosting card, so the wipe, the display and the range attribute
- * cannot drift apart.
- */
-export const GHOST_STEP_MAX = 100;
-
 // =============================================================================
 // CHAT PROVIDERS
 // =============================================================================
 
 /**
  * The provider value of a chat consumer that runs on a SillyTavern connection profile, beside 'openrouter' and 'vllm':
- * EventBase extraction, Agent Mode, Auto-Reformat and StoryArc store it, and keyword boost reads it.
+ * EventBase extraction, Agent Mode, StoryArc and LoreBase store it.
  */
 export const CONNECTION_PROFILE_PROVIDER = 'connection_profile';
 
@@ -140,16 +117,6 @@ export const RETRY_MAX_DELAY_MS = 8000;
 
 /** Backoff multiplier for exponential retry */
 export const RETRY_BACKOFF_MULTIPLIER = 2;
-
-// =============================================================================
-// CHUNKING DEFAULTS
-// =============================================================================
-
-/** Default chunk size in characters */
-export const DEFAULT_CHUNK_SIZE = 500;
-
-/** Default overlap between chunks in characters */
-export const DEFAULT_CHUNK_OVERLAP = 50;
 
 // =============================================================================
 // UI DEFAULTS
