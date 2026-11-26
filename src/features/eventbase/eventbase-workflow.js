@@ -12,7 +12,8 @@
  */
 
 import { setExtensionPrompt, extension_prompts } from '../../sillytavern/prompt-injection.js';
-import { getCurrentChatId, substituteParams, getContext } from '../../sillytavern/chat.js';
+import { getCurrentChatId, substituteParams } from '../../sillytavern/chat.js';
+import { storyMessages } from '../../shared/chat-messages.js';
 import { getChatUUID, COLLECTION_PREFIXES, buildRegistryKey } from '../../shared/collection-ids.js';
 import { isCollectionEnabled } from '../collections/index.js';
 import { getSavedHashes, UNBOUNDED_RUN } from '../vector-backend/index.js';
@@ -173,7 +174,7 @@ export function notifyUnfinishedWindows(result, nextStep = 'Resume in Vectorize 
  * been read, in a window of any size (isWindowAlreadyExtracted), unless the run reads a stretch again
  * (isReadingAgain): then every window from the one holding startFromMessage to the one holding
  * endAtMessage is read, and one whose new read finds no event loses its earlier events too
- * (InternalProject/Vectfox/plans/eventbase-read-range-again.md).
+ * (InternalProject/Vectfox/plans/executed/eventbase-read-range-again.md).
  *
  * @param {object} params
  * @param {object[]} params.messages - The chat's messages from its first: message numbers count in this list
@@ -1220,7 +1221,8 @@ export async function runEventBaseRetrieval({ chat, searchText, settings, chatUU
     const { events, debug, storyArcShape, storyArcEntityNames } = await retrieveEventsForTurn({
         searchText: effectiveSearchText,
         keywordQuery,
-        chatLength: getContext().chat?.length || chat?.length || 0,
+        // The story's length, in the message numbers the events' windows hold, for recency and "already in context".
+        chatLength: storyMessages().length,
         settings,
         // Canonical routing (Doc/collection_helper.md): the registry-key form
         // ("backend:id") searches each locked collection on the backend it was
@@ -1408,8 +1410,8 @@ export function isChatFullyVectorized(messages, settings, registryKey, windowSiz
  *                                                                       chat's end: messages were deleted, a summary
  *                                                                       replaced some, or the events came from a longer
  *                                                                       copy of the chat. Auto-sync goes on with new
- *                                                                       messages; ghosting blanks nothing until the chat
- *                                                                       passes the tip
+ *                                                                       messages; ghosting takes nothing out until the
+ *                                                                       chat passes the tip
  *   { state: 'partial',          collectionId, registryKey,
  *     chatMessageCount, commitBoundary, unfinishedWindowCount,
  *     markerValue?, vectorizationTip? }                                — collection exists, last window not extracted or
@@ -1440,10 +1442,7 @@ export async function getChatAutoSyncStatus(settings, { shouldProbeBackend = tru
         return { state: 'none-locked', collections: inUse.collections, noneInUseText };
     }
 
-    const ctx = getContext();
-    const messages = Array.isArray(ctx?.chat)
-        ? ctx.chat.filter(m => m.mes && m.mes.trim().length > 0)
-        : [];
+    const messages = storyMessages();
     const chatMessageCount = messages.length;
 
     // The auto-sync marker (the collection's message-index threshold): the count the page shows while no tip is known.

@@ -23,14 +23,18 @@ LoreBase only decides books your chat loads. If the book you want isn't in the *
 
 Pick the book, then one of the 2 buttons:
 
-- **Add to this chat** makes it this chat's Chat Lorebook, the one SillyTavern's Chat Lore button sets. It loads in this chat only, and LoreBase locks it to this chat.
+- **Add to this chat** adds it to this chat only. You can add as many books as you like this way, and LoreBase locks each one to this chat.
 - **Add to this character** puts it in the character's Additional Lorebooks. It loads in every chat with this character, and LoreBase locks it to the character.
 
-A chat has only 1 Chat Lorebook. If yours already has one, **Add to this chat** names it and adds nothing, so the one you set never gets swapped out behind your back. Add the book to the character instead, or take the other one off first.
+A book you add to this chat belongs to LoreBase, not to SillyTavern. So it only loads while **Use LoreBase** is on. Turn LoreBase off, and nothing from it goes into your prompt. Whatever you set up in SillyTavern itself keeps working exactly like before, LoreBase on or off.
 
-Both use SillyTavern's own places, so SillyTavern shows the book there too. To take it out again, press **Unlink**, the broken-link button on the book's row. After asking, it takes the book back out of where it went AND deletes what LoreBase keeps for it. Taking it out in SillyTavern works too, like any other book, but then LoreBase keeps what it had for the book.
+Why not SillyTavern's Chat Lorebook? Because a chat only gets 1 of those, and a lot of you already use it. I didn't want **Add to this chat** to kick your book out of that slot, or to leave you stuck at 1 book. And it doesn't use **Active World(s) for all chats** either. That one loads a book in EVERY chat, so a book for this story would show up in all your other stories too.
 
-Right after, this screen opens on the new book, with nothing turned on. You pick its entries like any other book's.
+To take a book out again, press **Unlink**, the broken-link button on the book's row. After asking, it takes the book back out of where it went AND deletes what LoreBase keeps for it. A book you added to the character can also be taken out in SillyTavern, like any other book, but then LoreBase keeps what it had for the book.
+
+If you rename or delete a book in SillyTavern after adding it to this chat, its row says **Missing from SillyTavern**, and it sends nothing. Press **Unlink** on it to clear it out, then add the book again under its new name.
+
+Right after you add a book, this screen opens on it, with nothing turned on. You pick its entries like any other book's.
 
 A group chat has no one character, so it only gets **Add to this chat**.
 
@@ -298,12 +302,12 @@ On High Accuracy, the LoreBase model does 2 jobs. It picks the entries, and then
    ```
    12. Lighthouse of Vell (lighthouse, Vell, keeper)
    ```
-   Next to the scene, it picks the entries the next reply needs, most needed first, at most 6, or none. For each one it says why, and what in it the reply needs.
-2. **The cache.** The list sits at the very end of the pick's system prompt, and it's the exact same text every reply, until your selection, a title or the keys change. So after the first reply, a provider that caches reads it from its cache, which costs way less. The **LoreBase tester** shows how much, like `Pick read from the cache: 10,141 of the pick's 15,070 prompt tokens`.
+   Next to the scene, it picks the entries the next reply needs, most needed first, or none. It picks at most the **Pick limit** on the model card, which shows on High Accuracy only: 6 entries by default, and it takes 1 to 12. For each one it says why, and what in it the reply needs.
+2. **The cache.** The list sits at the very end of the pick's system prompt, and it's the exact same text every reply, until your selection, a title or the keys change. So after the first reply, a provider that caches reads it from its cache, which costs way less. The Pick limit isn't in that part, so changing it keeps the cache. The **LoreBase tester** shows how much it saves, like `Pick read from the cache: 10,141 of the pick's 15,070 prompt tokens`.
 3. **The reviews.** Then the LoreBase model reads each picked entry, 1 call per entry, all at the same time. It gets the entry cut into numbered parts: by the author's own headings first, and into pieces of about 300 tokens where a section is still too long. It says how much of the entry the reply will use, "most", "some" or "none", and which parts are of no use right now. An entry of only 1 part, or one with template code, skips its review and goes in whole.
 4. **What it sends.** Every part the review didn't leave out, in the entry's own order, plus every part of a pinned section. An entry the review says the reply uses none of sends nothing.
 
-So a reply on High Accuracy is 1 pick and up to 6 reviews, all at low reasoning effort.
+So a reply on High Accuracy is 1 pick and at most 1 review per pick, so up to 6 reviews at the default Pick limit, all at low reasoning effort. A higher limit can send more lore, but each extra pick of more than 1 part costs 1 more review call.
 
 High Accuracy never searches, so it never uses the vectors. Every entry still needs them, though, so you can switch between the 2 any time and no entry drops out.
 
@@ -315,7 +319,7 @@ When something fails, the reply goes on without that lore, and a toast tells you
 
 ### Which one to choose
 
-On my test book of 313 entries, Fast and Cheap cost about $0.0004 a reply, and the whole step took about 1.8 seconds. The search was 1.3 seconds of that. High Accuracy cost about $0.0018 a reply once the cache kicked in, and the reply waited about 7 seconds for its pick and reviews.
+On my test book of 313 entries, Fast and Cheap cost about $0.0004 a reply, and the whole step took about 1.8 seconds. The search was 1.3 seconds of that. High Accuracy, at its default Pick limit of 6, cost about $0.0018 a reply once the cache kicked in, and the reply waited about 7 seconds for its pick and reviews.
 
 But High Accuracy sends way less, since it cuts entries down to what the reply needs. On that book it sent about 1,400 lore tokens a reply, where Fast and Cheap sent about 3,000 lore tokens. Your chat model reads every one of those tokens. So with a chat model of $1 per million input tokens or more, High Accuracy came out the cheaper one in all.
 

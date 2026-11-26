@@ -8,7 +8,8 @@
 // followCollectionInUse); the Database Browser tells them of the events it deletes (announceEventsRemoved); src/app/
 // runs ensureEventBaseIndexes at startup. The settings panel opens
 // Vectorize Content and runs Sync chat and the auto-sync catch-up. The Database Browser runs a collection's StoryArc
-// link actions and Compact collection here.
+// link actions and Compact collection here. The public API answers which chat is open and the collection it uses from
+// openChatCollectionInUse, and reads a collection's events and removals after a change number from readEventFeed.
 //
 // Re-exports only. Code outside this folder imports the feature here, never its files (.dependency-cruiser.cjs).
 export { testAgentModeConnection, testStoryArcConnection } from './agentic-retrieval.js';
@@ -16,12 +17,13 @@ export { backfillCurrentChatWithProgress, openContentVectorizer, syncOpenChat } 
 export { announceEventsRemoved, setEventBaseListeners } from './eventbase-announcements.js';
 export {
     askWhichChatCollection, chatOwnCollections, collectionInUse, followCollectionInUse, lockCollectionToOpenChat,
-    showNoCollectionInUse, useChatCollection,
+    openChatCollectionInUse, showNoCollectionInUse, useChatCollection,
 } from './eventbase-chat-collections.js';
 export { describeCompaction } from './eventbase-compaction-core.js';
 export { compactCollection, planCollectionCompaction } from './eventbase-compaction.js';
 export { synchronizeChat } from './eventbase-chat-sync.js';
 export { testEventBaseConnection } from './eventbase-extractor.js';
+export { readEventFeed } from './eventbase-feed.js';
 export { findEventBaseForkSource, forkEventBaseFromSource } from './eventbase-fork.js';
 export { clearInterceptorPrompts, runEventBaseReplyStep } from './eventbase-reply.js';
 export { packTimelineSortKey } from './eventbase-schema.js';
@@ -40,14 +42,20 @@ export {
     getChatAutoSyncStatus,
     runEventBaseRetrieval,
 } from './eventbase-workflow.js';
-export { getEventBaseExtractionPrompt } from './prompts-i18n.js';
-export { STORY_LINKS_FILE_TYPE, describeStoryLinkCoverage, describeStoryLinksImport, linkParallelCallsOf } from './story-arc-links-core.js';
+export { formatStoryLine } from './eventbase-injection.js';
+export { chineseScriptNameOf, getEventBaseExtractionPrompt } from './prompts-i18n.js';
+export { isStoryArcActive } from './story-arc-core.js';
+export { readEntityMerges } from './story-arc-entities.js';
+export { buildEntityNameWriter, eventsNamingEntity, filterEntities, holdsName, listEntities, withKeptEntityNames } from './story-arc-entity-core.js';
+export { readStoryLanguage } from './story-language.js';
+export { STORY_LINKS_FILE_TYPE, describeStoryLinkCoverage, describeStoryLinksImport, inTimelineOrder, linkParallelCallsOf } from './story-arc-links-core.js';
 export {
     buildCollectionLinksFile,
     deleteStoryLinks,
     describeStoryLinkPass,
     planStoryLinksDelete,
     planStoryLinksImport,
+    readChatStoryEvents,
     readCollectionLinkCoverage,
     readStoryLinkCoverage,
     runStoryLinkPass,

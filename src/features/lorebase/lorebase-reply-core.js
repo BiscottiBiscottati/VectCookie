@@ -48,14 +48,17 @@ export function isReplyGeneration(type, lastGeneration) {
 }
 
 /**
- * The books SillyTavern's scan loads for a generation, each once, in the order it loads them (world-info.js,
- * getSortedEntries): the global books, the character's own and extra books, the chat's book, then the persona's. A
- * character's book that is also the chat's or the persona's loads as that one, and the chat's or the persona's book
- * that is also global loads as global.
- * @param {{globalBooks: string[], characterBooks: string[], chatBook: string|null, personaBook: string|null}} sources
+ * The books a scan loads for a generation, each once, in the order they load (world-info.js, getSortedEntries): the
+ * global books, the character's own and extra books, the chat's book, then the persona's, as SillyTavern loads them;
+ * then the books added to the chat through LoreBase's Add to this chat, which LoreBase adds to the scan after
+ * SillyTavern loaded its own (lorebase-delivery.js). A character's book that is also the chat's or the persona's loads
+ * as that one, the chat's or the persona's book that is also global loads as global, and an added book SillyTavern
+ * loads already loads as SillyTavern's.
+ * @param {{globalBooks: string[], characterBooks: string[], chatBook: string|null, personaBook: string|null,
+ *   addedBooks?: string[]}} sources
  * @returns {string[]}
  */
-export function activeBookNames({ globalBooks, characterBooks, chatBook, personaBook }) {
+export function activeBookNames({ globalBooks, characterBooks, chatBook, personaBook, addedBooks = [] }) {
     const isGlobal = name => globalBooks.includes(name);
     const names = [...globalBooks];
     for (const name of characterBooks) {
@@ -63,6 +66,7 @@ export function activeBookNames({ globalBooks, characterBooks, chatBook, persona
     }
     if (chatBook && !isGlobal(chatBook)) names.push(chatBook);
     if (personaBook && personaBook !== chatBook && !isGlobal(personaBook)) names.push(personaBook);
+    names.push(...addedBooks);
     return [...new Set(names.filter(Boolean))];
 }
 
@@ -195,10 +199,10 @@ async function reviewPick(pick, { scene, books, ask }) {
  */
 
 /**
- * The lore for one reply on High Accuracy: the pick over the table of contents of the books taking part, then one
- * review per pick of more than one part, all sent at once, each at low reasoning effort, a one-part pick or one with
- * template code sent whole with no review. A failed pick leaves every selected entry out, and a failed review leaves
- * out only its own entry (D14).
+ * The lore for one reply on High Accuracy: the pick of at most `pickLimit` entries over the table of contents of the
+ * books taking part, then one review per pick of more than one part, all sent at once, each at low reasoning effort, a
+ * one-part pick or one with template code sent whole with no review. A failed pick leaves every selected entry out,
+ * and a failed review leaves out only its own entry (D14).
  * @param {object} turn
  * @param {string} turn.scene - From sceneText
  * @param {Array<{bookName: string, entries: object[], pinnedSections: string[], keysByUid?: Record<string, string[]>}>} turn.books -
@@ -206,9 +210,10 @@ async function reviewPick(pick, { scene, books, ask }) {
  * @param {(messages: Array<{role: string, content: string}>, request: {maxTokens: number, reasoningEffort: string,
  *   identKeys: string[]}) => Promise<unknown[]>} turn.ask - Sends one call and returns its answer's entries, as
  *   parseJsonArrayFromLlm reads them; throws when the call fails
+ * @param {number} turn.pickLimit - The most entries the pick names, from pickLimitOf
  * @returns {Promise<ReplyLore>}
  */
-export async function loreForReply({ scene, books, ask }) {
+export async function loreForReply({ scene, books, ask, pickLimit }) {
     const contents = tableOfContents(books);
     let picked;
     let pickTokens = null;
@@ -217,8 +222,8 @@ export async function loreForReply({ scene, books, ask }) {
     };
     const pickStartedAt = performance.now();
     try {
-        const items = await ask(pickMessages(scene, contents), { maxTokens: PICK_MAX_TOKENS, reasoningEffort: REASONING_EFFORT, identKeys: ['number'], onUsage });
-        picked = readPicks(items, contents);
+        const items = await ask(pickMessages(scene, contents, pickLimit), { maxTokens: PICK_MAX_TOKENS, reasoningEffort: REASONING_EFFORT, identKeys: ['number'], onUsage });
+        picked = readPicks(items, contents, pickLimit);
     } catch (error) {
         return {
             contentCount: contents.length, picks: [], unreadItemCount: 0, pickSeconds: secondsSince(pickStartedAt), pickTokens,

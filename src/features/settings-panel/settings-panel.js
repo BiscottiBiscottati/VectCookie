@@ -10,9 +10,10 @@
  */
 
 import { saveSettingsDebounced, extension_settings } from '../../sillytavern/settings.js';
-import { getCurrentChatId, getContext } from '../../sillytavern/chat.js';
+import { getCurrentChatId } from '../../sillytavern/chat.js';
 import { eventSource, event_types } from '../../sillytavern/events.js';
 import { getRequestHeaders } from '../../sillytavern/requests.js';
+import { storyMessages } from '../../shared/chat-messages.js';
 import { clearKeyBox, OPENROUTER_KEY_BOX, QDRANT_KEY_BOX, VLLM_KEY_BOX, wireKeyBox } from './api-key-boxes.js';
 import {
     getOpenRouterApiKey,
@@ -26,7 +27,7 @@ import {
     showNoCollectionInUse, showStoryArcPage, storyArcPageMarkup, storyLinkPill, storyLinkStatusMarkup, wireStoryArcPage,
 } from '../eventbase/index.js';
 import { getHealthPillHtml, refreshHealthPill } from '../diagnostics/index.js';
-import { keyCallsAtOnceOf, loreBaseAccuracyOf, loreBudgetOf } from '../lorebase/index.js';
+import { keyCallsAtOnceOf, loreBaseAccuracyOf, loreBudgetOf, pickLimitOf } from '../lorebase/index.js';
 import { PANEL_TABS, panelNavMarkup, panelPageMarkup, vectfoxOffNoticeMarkup } from './panel-shell-markup.js';
 import { wireSettingsPanel } from './panel-shell.js';
 import { drawerLauncherMarkup } from './drawer-launcher-markup.js';
@@ -36,7 +37,9 @@ import { bindCollectionInUse } from './autosync-collection-in-use.js';
 import { autoSyncCollectionMarkup, autoSyncPageMarkup, autoSyncStatusMarkup } from './autosync-page-markup.js';
 import { corePageMarkup } from './core-page-markup.js';
 import { chatHistoryPageMarkup } from './chathistory-page-markup.js';
+import { publicApiPageMarkup } from './publicapi-page-markup.js';
 import { ragPageMarkup } from './rag-page-markup.js';
+import { bindEntityLoreCard, refreshEntityLoreCard } from './entity-lore-card.js';
 import { bindLoreBaseBooksCard, refreshLoreBaseBooks } from './lorebase-books-card.js';
 import { bindLoreBaseModelCard, refreshLoreBaseModelCard } from './lorebase-model-card.js';
 import { bindLoreBaseTester, refreshLoreBaseTester } from './lorebase-tester-card.js';
@@ -84,6 +87,7 @@ function panelMarkup() {
         panelPageMarkup('chathistory', chatHistoryPageMarkup()),
         storyArcPageMarkup({ notice: vectfoxOffNoticeMarkup() }),
         panelPageMarkup('agentmode', agentModePageMarkup()),
+        panelPageMarkup('publicapi', publicApiPageMarkup()),
     ];
     return `<div id="VectFox_settings" class="vfx-ui vfx-shell">${panelNavMarkup()}<main class="vfx-main">${pages.join('')}</main></div>`;
 }
@@ -127,6 +131,7 @@ function panelTabsWithHooks() {
                 refreshLoreBaseBooks();
                 refreshLoreBaseModelCard();
                 refreshLoreBaseTester();
+                refreshEntityLoreCard();
             },
         },
         storyarc: {
@@ -453,7 +458,7 @@ function bindSettingsEvents(settings, callbacks) {
                     const { FAR_BEHIND_WINDOW_COUNT, countWindowsBehind, getAutoSyncWindowSize, getVectorizationTip } = await import('../eventbase/index.js');
                     const chatMsgCount = typeof status.chatMessageCount === 'number'
                         ? status.chatMessageCount
-                        : (getContext()?.chat || []).filter(m => m.mes && m.mes.trim().length > 0).length;
+                        : storyMessages().length;
                     const tip = getVectorizationTip(lockKey) ?? 0;
                     const windowSize = Math.max(1, getAutoSyncWindowSize(settings));
                     // Clamp the backlog to the commit boundary — the active last turn is
@@ -791,6 +796,16 @@ function bindSettingsEvents(settings, callbacks) {
             refreshStoryLinkStatus(settings);
         }
     });
+
+    // ─── PublicAPI page ────────────────────────────────────────────────────
+    // The public API marks the signal of each LLM call's request while this is on (public-api.js).
+    $('#VectFox_own_request_mark_enabled')
+        .prop('checked', settings.own_request_mark_enabled === true)
+        .on('change', function() {
+            settings.own_request_mark_enabled = $(this).prop('checked');
+            Object.assign(extension_settings.vectfox, settings);
+            saveSettingsDebounced();
+        });
 
     $('#VectFox_agentic_model')
         .val(settings.agent_model || '')
@@ -1253,21 +1268,21 @@ function bindSettingsEvents(settings, callbacks) {
             return;
         }
         const g = window.VectFox_LastGhost;
-        if (!g || typeof g.wiped !== 'number') {
+        if (!g || typeof g.takenOutCount !== 'number') {
             $el.text('Last turn: no reply yet.');
             return;
         }
         const batchNote = typeof g.keptVerbatimCount === 'number'
-            ? ` In batches of ${_messageCount(g.batchSize)}: ${_messageCount(g.keptVerbatimCount)} kept verbatim, ${_messageCount(g.messagesUntilNextBatch)} until the next batch is blanked.`
+            ? ` In batches of ${_messageCount(g.batchSize)}: ${_messageCount(g.keptVerbatimCount)} kept verbatim, ${_messageCount(g.messagesUntilNextBatch)} until the next batch is taken out.`
             : '';
-        if (g.wiped === 0) {
-            $el.text(`Last turn: nothing blanked, as no vectorized message is older than those kept.${batchNote}`);
+        if (g.takenOutCount === 0) {
+            $el.text(`Last turn: nothing taken out, as no vectorized message is older than those kept.${batchNote}`);
         } else {
-            $el.html(`Last turn: <strong>${_messageCount(g.wiped)}</strong> blanked, about <strong>${g.approxTokens.toLocaleString()} tokens</strong> (${g.charsRemoved.toLocaleString()} characters) saved.${batchNote}`);
+            $el.html(`Last turn: <strong>${_messageCount(g.takenOutCount)}</strong> taken out, about <strong>${g.approxTokens.toLocaleString()} tokens</strong> (${g.charsRemoved.toLocaleString()} characters) saved.${batchNote}`);
         }
     };
 
-    // Ghosting needs Summarizer Injection on (the wipe checks it too): its controls are
+    // Ghosting needs Summarizer Injection on (applyGhosting checks it too): its controls are
     // disabled while it is off, and the Ghosting card says why.
     const _applyGhostAvailability = () => {
         const isSummarizerOn = !!settings.summarizer_injection_enabled;
@@ -1335,7 +1350,7 @@ function bindSettingsEvents(settings, callbacks) {
                     $autosync.prop('checked', true).trigger('input');
                 }
 
-                // Ghosting is the summarizer's main payoff — the wiped turns rely on
+                // Ghosting is the summarizer's main payoff — the turns it takes out rely on
                 // its injection for recall — so default it ON when the summarizer is
                 // enabled. Soft default, NOT a hard lock (unlike the 1-turn window):
                 // the ghost checkbox stays editable so the user can uncheck it. Reuses
@@ -1407,13 +1422,16 @@ function bindSettingsEvents(settings, callbacks) {
             saveSettingsDebounced();
         });
 
-    // LoreBase books and tester (WorldInfo page): drawn for the open chat, again on each chat change and as the page opens.
+    // LoreBase books and tester, and Entity-Lore's card (WorldInfo page): drawn for the open chat, again on each chat change
+    // and as the page opens.
     bindLoreBaseBooksCard(settings);
     refreshLoreBaseBooks();
     eventSource.on(event_types.CHAT_CHANGED, refreshLoreBaseBooks);
     bindLoreBaseTester(settings);
     refreshLoreBaseTester();
     eventSource.on(event_types.CHAT_CHANGED, refreshLoreBaseTester);
+    bindEntityLoreCard(settings);
+    eventSource.on(event_types.CHAT_CHANGED, refreshEntityLoreCard);
     // LoreBase's Entries at once: how many entries' keys are written at once, read by each call as it starts.
     bindNumberSetting(settings, { id: 'VectFox_lorebase_key_calls_at_once', key: 'lorebase_key_calls_at_once', initial: keyCallsAtOnceOf(settings.lorebase_key_calls_at_once), isInteger: true });
 
@@ -1436,6 +1454,8 @@ function bindSettingsEvents(settings, callbacks) {
         });
     // Fast and Cheap [Jev]'s Lore budget: the most tokens Jev's picks send a reply, read by each reply as it starts.
     bindNumberSetting(settings, { id: 'VectFox_lorebase_lore_budget_tokens', key: 'lorebase_lore_budget_tokens', initial: loreBudgetOf(settings.lorebase_lore_budget_tokens), isInteger: true });
+    // High Accuracy's Pick limit: the most entries the pick names, read by each reply as it starts.
+    bindNumberSetting(settings, { id: 'VectFox_lorebase_pick_limit', key: 'lorebase_pick_limit', initial: pickLimitOf(settings.lorebase_pick_limit), isInteger: true });
     // The model card's setup notice and Vectors line, drawn again as its controls change and as the page opens.
     bindLoreBaseModelCard(settings);
 

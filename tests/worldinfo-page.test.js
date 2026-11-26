@@ -1,22 +1,27 @@
 /**
  * @vitest-environment jsdom
  *
- * The settings panel's WorldInfo page on GUI-DNA (src/features/settings-panel/worldinfo-page-markup.js): LoreBase's
- * three cards, its switch first, and nothing of the old vector search; every control keeps the id its wiring uses; the
- * page is drawn from GUI-DNA alone with none of the old debug tools; the LoreBase book list says what each book of
- * the open chat has selected and where it is locked, then Add a lorebook with the books it does not load; and the
- * tester's report says what LoreBase did on a reply (§5.10).
+ * The settings panel's WorldInfo page on GUI-DNA (src/features/settings-panel/worldinfo-page-markup.js): three tabs on
+ * the Sub-tabs gene, opening on Main, which holds LoreBase's books and model cards, LoreBase's switch first, then
+ * Entity-Lore, whose card holds its switch, its two counts, Run now and the character list, and LoreBase tester; nothing
+ * of the old vector search; every
+ * control keeps the id its wiring uses; the page is drawn from GUI-DNA alone with none of the old debug tools; the
+ * LoreBase book list says what each book of the open chat has selected and where it is locked, then Add a lorebook
+ * with the books it does not load; and the tester's report says what LoreBase did on a reply (§5.10).
  */
 /* global document, Node -- this file runs under the jsdom environment */
 
 import { beforeEach, describe, expect, it } from 'vitest';
 
 const {
-    loreBaseBooksMarkup, loreBaseReportMarkup, loreBaseReportOptions, loreBaseSetupNoticeMarkup, loreBaseVectorsLineText, worldInfoPageMarkup,
+    ENTITY_LORE_ELEMENT_ID, WORLDINFO_TAB, WORLDINFO_TABS_ID, loreBaseBooksMarkup, loreBaseReportMarkup, loreBaseReportOptions, loreBaseSetupNoticeMarkup,
+    loreBaseVectorsLineText, worldInfoPageMarkup,
 } = await import('../src/features/settings-panel/worldinfo-page-markup.js');
 const { KEY_CALLS_AT_ONCE_MAX } = await import('../src/features/lorebase/lorebase-keys-core.js');
 const { FAST_AND_CHEAP, loreBaseAccuracyOf } = await import('../src/features/lorebase/lorebase-reply-core.js');
 const { LORE_BUDGET_MAX, LORE_BUDGET_MIN } = await import('../src/features/lorebase/lorebase-jev-core.js');
+const { PICK_LIMIT_MAX, PICK_LIMIT_MIN } = await import('../src/features/lorebase/lorebase-pick-core.js');
+const { REWRITE_EVERY_EVENTS, WRITE_AT_EVENTS } = await import('../src/features/entity-lore/entity-lore-core.js');
 
 // The ids settings-panel.js, lorebase-books-card.js and lorebase-tester-card.js wire on the WorldInfo page.
 const WIRED_IDS = [
@@ -26,7 +31,7 @@ const WIRED_IDS = [
     'VectFox_lorebase_model_card', 'VectFox_lorebase_model', 'VectFox_lorebase_accuracy',
     'VectFox_lorebase_jev_connection_profile_rows', 'VectFox_lorebase_jev_connection_profile', 'VectFox_lorebase_jev_connection_profile_readout',
     'VectFox_lorebase_jev_group', 'VectFox_lorebase_jev_test_connection', 'VectFox_lorebase_lore_budget_tokens', 'VectFox_lorebase_role_picks',
-    'VectFox_lorebase_role_keys', 'VectFox_lorebase_setup_notice', 'VectFox_lorebase_vectors_model', 'VectFox_lorebase_vectors_link',
+    'VectFox_lorebase_role_keys', 'VectFox_lorebase_pick_limit_group', 'VectFox_lorebase_pick_limit', 'VectFox_lorebase_setup_notice', 'VectFox_lorebase_vectors_model', 'VectFox_lorebase_vectors_link',
     'VectFox_lorebase_tester_card', 'VectFox_lorebase_try_pick', 'VectFox_lorebase_report_field', 'VectFox_lorebase_report', 'VectFox_lorebase_report_body',
 ];
 // The old vector search's controls, deleted with it.
@@ -81,8 +86,8 @@ describe('WorldInfo page markup', () => {
         expect(new Set(ids).size).toBe(ids.length);
     });
 
-    it("holds LoreBase's three cards, its books always shown, with the list empty and the door to the selection screen", () => {
-        expect([...document.querySelectorAll('.vfx-card-title')].map(title => title.textContent)).toEqual(['LoreBase books', 'LoreBase model', 'LoreBase tester']);
+    it("holds its four cards in their tabs' order, LoreBase's books always shown, with the list empty and the door to the selection screen", () => {
+        expect([...document.querySelectorAll('.vfx-card-title')].map(title => title.textContent)).toEqual(['LoreBase books', 'LoreBase model', 'Entity-Lore', 'LoreBase tester']);
         const books = document.getElementById('VectFox_lorebase_books_card');
         expect(books.style.display).toBe('');
         expect(document.getElementById('VectFox_lorebase_books').innerHTML).toBe('');
@@ -121,6 +126,17 @@ describe('WorldInfo page markup', () => {
         expect(document.getElementById('VectFox_lorebase_jev_test_connection').compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
 
+    it("offers High Accuracy's Pick limit after the own model's Test connection, outside Jev's group, from the least to the most the pick reads", () => {
+        const box = document.getElementById('VectFox_lorebase_pick_limit');
+        const slider = document.querySelector('.vfx-range[data-vfx-slider-for="VectFox_lorebase_pick_limit"]');
+        expect([box.type, box.min, box.max, box.step]).toEqual(['number', String(PICK_LIMIT_MIN), String(PICK_LIMIT_MAX), '1']);
+        expect([slider.min, slider.max, slider.title]).toEqual([String(PICK_LIMIT_MIN), String(PICK_LIMIT_MAX), 'Entries']);
+        expect(document.querySelector('label[for="VectFox_lorebase_pick_limit"]').textContent).toBe('Pick limit');
+        expect(document.getElementById('VectFox_lorebase_pick_limit_group').contains(box)).toBe(true);
+        expect(document.getElementById('VectFox_lorebase_jev_group').contains(box)).toBe(false);
+        expect(document.getElementById('VectFox_lorebase_test_connection').compareDocumentPosition(box) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
     it('offers Generate keys, Generate vectors, Generate all and Delete all in that order', () => {
         const buttons = [...document.querySelector('#VectFox_lorebase_delete_all').parentElement.querySelectorAll('button')];
         expect(buttons.map(button => button.textContent.trim())).toEqual(['Generate keys', 'Generate vectors', 'Generate all', 'Delete all']);
@@ -136,6 +152,51 @@ describe('WorldInfo page markup', () => {
         for (const id of ['VectFox_wi_test_input', 'VectFox_wi_test_btn', 'VectFox_wi_dump_registry', 'VectFox_wi_apply_first', 'VectFox_enabled_for_all', 'VectFox_max_entries']) {
             expect(document.getElementById(id), id).toBeNull();
         }
+    });
+});
+
+describe('WorldInfo page tabs (§2.2 of entity-lore.md)', () => {
+    beforeEach(() => {
+        document.body.innerHTML = `<div id="VectFox_settings">${worldInfoPageMarkup()}</div>`;
+    });
+    const cardsOn = tab => [...document.querySelectorAll(`[data-vfx-subtab-panel="${tab}"] > .vfx-card`)].map(card => card.id);
+
+    it('are Main, Entity-Lore and LoreBase tester on the Sub-tabs gene, each with its icon, opening on Main', () => {
+        const gene = document.querySelector(`[data-vfx-subtabs="${WORLDINFO_TABS_ID}"]`);
+        expect([...gene.querySelectorAll('[data-vfx-subtab]')].map(tab => [tab.dataset.vfxSubtab, tab.textContent.trim(), tab.querySelector('i').className])).toEqual([
+            [WORLDINFO_TAB.main, 'Main', 'fa-solid fa-sliders'],
+            [WORLDINFO_TAB.entityLore, 'Entity-Lore', 'fa-solid fa-users-viewfinder'],
+            [WORLDINFO_TAB.tester, 'LoreBase tester', 'fa-solid fa-flask'],
+        ]);
+        expect([...gene.querySelectorAll('[data-vfx-subtab-panel]')].filter(panel => !panel.hidden).map(panel => panel.dataset.vfxSubtabPanel)).toEqual([WORLDINFO_TAB.main]);
+    });
+
+    it("hold LoreBase's books and model cards on Main, Entity-Lore's card on its tab and the tester on its own", () => {
+        expect(cardsOn(WORLDINFO_TAB.main)).toEqual(['VectFox_lorebase_books_card', 'VectFox_lorebase_model_card']);
+        expect(cardsOn(WORLDINFO_TAB.entityLore)).toEqual(['VectFox_entity_lore_card']);
+        expect(cardsOn(WORLDINFO_TAB.tester)).toEqual(['VectFox_lorebase_tester_card']);
+    });
+
+    it("hold on Entity-Lore's card its switch, Write at and Rewrite every in their ranges, Run now and the character list (§3)", () => {
+        const card = document.getElementById(ENTITY_LORE_ELEMENT_ID.card);
+        expect(card.querySelector('.vfx-card-desc').textContent).toBe('Writes a lorebook entry for each named character StoryArc counts often.');
+        for (const id of Object.values(ENTITY_LORE_ELEMENT_ID)) expect(document.getElementById(id), id).not.toBeNull();
+        const toggle = document.getElementById(ENTITY_LORE_ELEMENT_ID.enabled);
+        expect(toggle.closest('.vfx-switch-row').textContent).toBe('Use Entity-LoreOff by default. Needs StoryArc mode and Use LoreBase.');
+        const range = id => {
+            const box = document.getElementById(id);
+            return { min: Number(box.min), max: Number(box.max), slider: card.querySelector(`[data-vfx-slider-for="${id}"]`).title };
+        };
+        expect(range(ENTITY_LORE_ELEMENT_ID.writeAt)).toEqual({ min: WRITE_AT_EVENTS.min, max: WRITE_AT_EVENTS.max, slider: 'Events' });
+        expect(range(ENTITY_LORE_ELEMENT_ID.rewriteEvery)).toEqual({ min: REWRITE_EVERY_EVENTS.min, max: REWRITE_EVERY_EVENTS.max, slider: 'Events' });
+        expect([...card.querySelectorAll('.vfx-hint')].map(each => each.textContent).filter(Boolean)).toEqual([
+            'A named character gets an entry once this many events name them.',
+            'Their entry is written again from their whole story after this many more events.',
+            'Writes every entry due now. Asks first, naming how many.',
+        ]);
+        expect(document.getElementById(ENTITY_LORE_ELEMENT_ID.runNow).textContent).toBe('Run now');
+        expect(document.getElementById(ENTITY_LORE_ELEMENT_ID.book).hidden).toBe(true);
+        expect(document.getElementById(ENTITY_LORE_ELEMENT_ID.status).hidden).toBe(true);
     });
 });
 
@@ -210,6 +271,40 @@ describe('loreBaseBooksMarkup', () => {
         expect(unlinkers[0].classList.contains('vfx-btn-danger')).toBe(true);
         expect(unlinkers[0].querySelector('.fa-link-slash')).not.toBeNull();
         expect(unlinkers[0].nextElementSibling.dataset.lorebaseRemove).toBe('Harbor Atlas');
+    });
+
+    // The books added to the chat through LoreBase's Add to this chat (L1 of InternalProject/Vectfox/plans/entity-lore.md).
+    it("says on a book only the chat's added books load that it loads while LoreBase is on alone, under what is selected", () => {
+        document.body.innerHTML = loreBaseBooksMarkup({
+            hasChat: true,
+            books: [
+                listedBook({ bookName: 'Coral Index', selectedCount: 3, isLockedToChat: true, isLockedToCharacter: false, canUnlink: true, isAddedToChat: true }),
+                listedBook({ bookName: 'Tide Tables', selectedCount: 0, isLockedToChat: false, isLockedToCharacter: false, canUnlink: true }),
+            ],
+        });
+        const subsOf = row => [...row.querySelectorAll('.vfx-row-sub')].map(sub => sub.textContent);
+        const [coral, tide] = document.querySelectorAll('.vfx-row');
+        expect(subsOf(coral)).toEqual(['3 selected', 'Added to this chat: loads only while LoreBase is on']);
+        expect(subsOf(tide)).toEqual(['Nothing selected']);
+        expect(coral.querySelector('[data-lorebase-unlink]').dataset.lorebaseUnlink).toBe('Coral Index');
+    });
+
+    it('draws a book added here that SillyTavern no longer has as missing, its one action Unlink', () => {
+        document.body.innerHTML = loreBaseBooksMarkup({
+            hasChat: true,
+            books: [listedBook({
+                bookName: 'Lost <b>Charts</b>', selectedCount: 0, isLockedToChat: false, isLockedToCharacter: false, canUnlink: true, isAddedToChat: true,
+                isMissing: true, canRemove: true,
+            })],
+        });
+        const row = document.querySelector('.vfx-row');
+        expect(row.querySelector('.vfx-row-name').textContent).toBe('Lost <b>Charts</b>');
+        expect(row.querySelector('.vfx-row-sub').textContent).toBe('Added to this chat, but SillyTavern no longer has it, so it sends nothing');
+        expect([...row.querySelectorAll('.vfx-pill')].map(pill => [pill.textContent.trim(), pill.classList.contains('is-warning')]))
+            .toEqual([['Missing from SillyTavern', true]]);
+        const actions = [...row.querySelectorAll('.vfx-row-actions button, .vfx-row-actions select')];
+        expect(actions.map(action => [action.title, action.dataset.lorebaseUnlink])).toEqual([['Unlink from this chat, and remove from LoreBase', 'Lost <b>Charts</b>']]);
+        expect(document.querySelector('.vfx-row b')).toBeNull();
     });
 
     it('gives the trash of a book with 2 or more selections the one in use here to delete, its dropdown showing it; else Remove from LoreBase', () => {
@@ -357,12 +452,12 @@ describe('loreBaseBooksMarkup', () => {
             label: 'Add a lorebook',
             options: [['', 'Choose a lorebook'], ['Tide Tables', 'Tide Tables'], ['The <b>Old</b> "Keep"', 'The <b>Old</b> "Keep"']],
             buttons: [['chat', 'Add to this chat'], ['character', 'Add to this character']],
-            hint: 'This chat: as its Chat Lorebook, locked here. This character: its chats, locked to it.',
+            hint: 'This chat: here only, while LoreBase is on, locked here. This character: its chats, locked to it.',
         });
         expect(document.body.textContent).toContain('This chat loads no lorebook.');
         expect(addRow({ bookNames: ['Tide Tables'], canAddToCharacter: false })).toMatchObject({
             buttons: [['chat', 'Add to this chat']],
-            hint: 'A group chat has no one character, so a book goes to this chat, locked here.',
+            hint: 'A group chat has no one character, so a book goes to this chat only, while LoreBase is on, locked here.',
         });
         expect(addRow({ bookNames: [], canAddToCharacter: true })).toEqual({ label: null, options: null, buttons: [], hint: 'This chat loads every lorebook you have.' });
     });

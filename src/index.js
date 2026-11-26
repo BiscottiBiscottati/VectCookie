@@ -25,7 +25,7 @@ import {
     clearCachesForDeletedOrImportedCollection, followCollectionInUse, refreshWorldInfoEntryDepthCache, runEventBaseReplyStep,
     setEventBaseListeners, synchronizeChat,
 } from './features/eventbase/index.js';
-import { setLlmCallFinishedListener } from './features/llm-provider/index.js';
+import { setLlmCallFinishedListener, setOwnRequestMarker } from './features/llm-provider/index.js';
 import { setInsertedCollectionRegistrar, setPurgedCollectionListener } from './features/vector-backend/index.js';
 import { migrateLegacyApiKeys } from './shared/api-keys.js';
 import { migration_setting_name_for_connection } from './app/settings-migration-connection-setting-names.js';
@@ -44,6 +44,7 @@ import {
     AGENTIC_MAX_TOKENS_DEFAULT,
     STORY_ARC_MAX_TOKENS_DEFAULT,
 } from './shared/constants.js';
+import { setMessageSource } from './shared/chat-messages.js';
 import { isVectFoxEnabled } from './shared/feature-gate.js';
 import { followGenerations } from './shared/last-generation.js';
 import { runNetworkStartup } from './app/network-startup.js';
@@ -51,25 +52,37 @@ import { runNetworkStartup } from './app/network-startup.js';
 // VectFox modules - UI
 import { mountSettingsPanel, mountWandMenu, refreshAutoSyncCheckbox, scheduleManualConnectionNotice } from './features/settings-panel/index.js';
 import { initializeDatabaseBrowser } from './features/database-browser/index.js';
-import { KEY_CALLS_AT_ONCE_DEFAULT, LORE_BUDGET_DEFAULT, initializeLoreBase, prepareLoreBesideRetrieval } from './features/lorebase/index.js';
+import { KEY_CALLS_AT_ONCE_DEFAULT, LORE_BUDGET_DEFAULT, PICK_LIMIT_DEFAULT, initializeLoreBase, prepareLoreBesideRetrieval } from './features/lorebase/index.js';
 import { initializeReplyLore } from './features/reply-lore/index.js';
+import { ENTITY_LORE_SETTING, REWRITE_EVERY_EVENTS, WRITE_AT_EVENTS, onEventBaseRunEnded } from './features/entity-lore/index.js';
 import {
     announceCollectionInUseChanged, announceEventBaseEventsRemoved, announceEventBaseRunEnded, announceLlmCallFinished,
-    announcePublicApiReady, announcePurgedCollection, publishPublicApi,
+    announcePublicApiReady, announcePurgedCollection, askMessageSources, markOwnRequestWhenSwitchedOn, publishPublicApi,
 } from './features/public-api/index.js';
 import { CJK_TOKENIZER_MODES, setCjkTokenizerMode, ensureJiebaTokenizerLoaded, ensureJiebaTwLoaded } from './features/keyword-search/index.js';
 
 // Calls a lower layer makes into a higher one, wired here before anything can delete or insert.
 setDeletedOrImportedCollectionCleanup(clearCachesForDeletedOrImportedCollection);
 setInsertedCollectionRegistrar(registerCollection);
-// What EventBase, the vector backend and the LLM calls tell the public API, which sends it on as vectfox_* events.
+// What EventBase, the vector backend and the LLM calls tell the public API, which sends it on as vectfox_* events, the
+// public API's mark on the signal of each LLM call's request, written while the PublicAPI page's switch is on, and the
+// message sources other extensions register, which story order asks about each message it reads. An EventBase run that
+// ends is told to Entity-Lore too, which writes the entries it made due, the public API's failure leaving it told.
 setEventBaseListeners({
-    onRunEnded: announceEventBaseRunEnded,
+    onRunEnded: (run) => {
+        try {
+            announceEventBaseRunEnded(run);
+        } finally {
+            onEventBaseRunEnded(run);
+        }
+    },
     onEventsRemoved: announceEventBaseEventsRemoved,
     onCollectionInUseChanged: announceCollectionInUseChanged,
 });
 setPurgedCollectionListener(announcePurgedCollection);
 setLlmCallFinishedListener(announceLlmCallFinished);
+setOwnRequestMarker(markOwnRequestWhenSwitchedOn);
+setMessageSource(askMessageSources);
 
 // Default settings
 const defaultSettings = {
@@ -226,8 +239,14 @@ const defaultSettings = {
     lorebase_accuracy: 'fast',              // 'fast', Fast and Cheap [Jev], asks Jev (plan D16); 'high', High Accuracy, is Luna's pick and reviews
     lorebase_jev_connection_profile_id: '', // Jev's SillyTavern profile, read only on 'fast'
     lorebase_lore_budget_tokens: LORE_BUDGET_DEFAULT, // Lore budget on the WorldInfo page: the most tokens Jev's picks send a reply, read only on 'fast'
+    lorebase_pick_limit: PICK_LIMIT_DEFAULT, // Pick limit on the WorldInfo page: the most entries the pick names a reply, 1 to 12, read only on 'high'
     lorebase_enabled: false,                // LoreBase's switch on the WorldInfo page: off until the user turns it on
     lorebase_key_calls_at_once: KEY_CALLS_AT_ONCE_DEFAULT, // Entries at once on the WorldInfo page: entries keyed at once, 1 to 8
+
+    // Entity-Lore (entity-lore plan §8): its switch on the WorldInfo page's Entity-Lore tab, off until the user turns it on, and its two counts
+    [ENTITY_LORE_SETTING.enabled]: false,
+    [ENTITY_LORE_SETTING.writeAtEvents]: WRITE_AT_EVENTS.default,           // Write at: a named character's entry is written at this many events, 3 to 50
+    [ENTITY_LORE_SETTING.rewriteEveryEvents]: REWRITE_EVERY_EVENTS.default, // Rewrite every: written again after this many more events, 10 to 100
 
     // How text splits into words for BM25
     cjk_tokenizer_mode: CJK_TOKENIZER_MODES.intl, // intl | jieba | jieba_tw | tiny_segmenter
@@ -275,19 +294,19 @@ const defaultSettings = {
     // OLDEST overflow is dropped (most-recent always kept); the latest event is always
     // included even if it alone exceeds the cap. 0 = no cap. Default ~4-6.5k tokens.
     summarizer_injection_max_chars: 10000,
-    // Ghosting (ephemeral prompt wipe): when enabled AND Summarizer Injection is on,
-    // keep the most recent N messages verbatim and blank ALL older already-vectorized
-    // messages from the OUTGOING prompt only. The chat file + UI are untouched and the
-    // effect resets every generation (nothing to undo, branch-safe — mirrors the proven
-    // interceptor-wipe pattern). Trades raw old context for token savings, leaning on
-    // EventBase memory (summarizer injection + semantic retrieval) for the wiped span.
-    // "Keep last N" auto-scales to any chat length (wipe count = tip − N), so a 50-reply
-    // and a 5000-reply chat use the same setting. Gated to Summarizer Injection because
-    // that forces auto-sync window=1, guaranteeing every message below the vectorization
-    // tip is extracted before it could be wiped.
+    // Ghosting: when enabled AND Summarizer Injection is on, keep the most recent N
+    // messages verbatim and take the older already-vectorized messages out of the
+    // OUTGOING prompt only, every summary kept. The chat file + UI are untouched and the
+    // effect resets every generation (nothing to undo, branch-safe). Trades raw old
+    // context for token savings, leaning on EventBase memory (summarizer injection +
+    // semantic retrieval) for the messages taken out. "Keep last N" auto-scales to any
+    // chat length (the count taken out is tip − N), so a 50-reply and a 5000-reply chat
+    // use the same setting. Gated to Summarizer Injection because that forces auto-sync
+    // window=1, guaranteeing every message below the vectorization tip is extracted
+    // before it could be taken out.
     eventbase_ghost_enabled: false,
-    eventbase_ghost_keep_recent: 1,               // recent messages kept verbatim; everything older that's vectorized is wiped. range 1-50 (Summarizer Injection's recent events cover the wiped span)
-    eventbase_ghost_batch_size: 1,                // messages the wipe boundary moves by: 1 moves it every turn; above 1 it waits for a whole batch, so the prompt's opening stays the same for a provider's prompt cache. range 1-100
+    eventbase_ghost_keep_recent: 1,               // recent messages kept verbatim; everything older that's vectorized is taken out. range 1-50 (Summarizer Injection's recent events cover the messages taken out)
+    eventbase_ghost_batch_size: 1,                // messages the take-out boundary moves by: 1 moves it every turn; above 1 it waits for a whole batch, so the prompt's opening stays the same for a provider's prompt cache. range 1-100
     eventbase_min_importance_store: 3,            // Drop events below this importance before storing
     eventbase_max_events_per_window: 3,           // Hard cap on events returned per LLM call
     eventbase_retrieval_top_k: 10,                // Events to retrieve per generation
@@ -391,6 +410,11 @@ const defaultSettings = {
     // it writes any JSON, so too low = truncated output = agent mode silently
     // falls back to pre-search. UI: AgentMode tab.
     agentic_retrieval_max_tokens: AGENTIC_MAX_TOKENS_DEFAULT,
+
+    // ─── PublicAPI (Development) ────────────────────────────────────────
+    // VectFox's mark on the signal of each LLM call's request, which a usage tracker reads. Off until the user turns
+    // it on: nothing else reads it (src/features/public-api/public-api.js).
+    own_request_mark_enabled: false,
 
     // ─── Hidden / Power-User ────────────────────────────────────────────
     // SUPERADMIN MODE — no GUI toggle. Set to true by hand-editing settings.json
@@ -656,7 +680,7 @@ jQuery(async () => {
 
     // Keep the ghosting WI-scan floor accurate: refresh the cached deepest per-entry World
     // Info scanDepth whenever the active books or WI settings change (off the hot path, so
-    // applyGhosting never blanks a message a deep-scanning WI entry still needs to read).
+    // applyGhosting never takes out a message a deep-scanning WI entry still needs to read).
     // Debounced — WORLDINFO_UPDATED can fire in bursts while editing, and each refresh loads
     // lore. Initial call is direct so the floor is correct before the first generation.
     // The refresh does nothing while the master switch is OFF; switching ON re-runs it.
@@ -667,8 +691,8 @@ jQuery(async () => {
     eventSource.on(event_types.WORLDINFO_UPDATED, refreshWiDepthDebounced);
     eventSource.on(event_types.WORLDINFO_SETTINGS_UPDATED, refreshWiDepthDebounced);
 
-    // Last: VectFox.isReady() turns true and vectfox_ready goes out once
-    announcePublicApiReady();
+    // Last: VectFox.isReady() turns true, the public calls answer from the settings, and vectfox_ready goes out once
+    announcePublicApiReady(settings);
 
     log.lifecycle('VectFox: ✅ Initialized successfully');
 });
